@@ -14166,10 +14166,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise RuntimeError("Gateway is shutting down; executor unavailable")
             executor = getattr(self, "_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
+                max_workers = 10
+                try:
+                    from hermes_cli.config import load_config_readonly
+
+                    cfg = load_config_readonly()
+                    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+                    raw_workers = None
+                    if isinstance(gateway_cfg, dict):
+                        raw_workers = gateway_cfg.get("max_concurrent_runs")
+                        if raw_workers is None:
+                            api_server_cfg = gateway_cfg.get("api_server", {})
+                            if isinstance(api_server_cfg, dict):
+                                raw_workers = api_server_cfg.get("max_concurrent_runs")
+                    if raw_workers is not None:
+                        parsed_workers = int(raw_workers)
+                        if parsed_workers > 0:
+                            max_workers = parsed_workers
+                except Exception as exc:
+                    logger.debug("gateway executor max_workers config ignored: %s", exc)
+
                 executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10,
+                    max_workers=max_workers,
                     thread_name_prefix="hermes-gateway",
                 )
+                logger.info("Gateway executor started (max_workers=%s)", max_workers)
                 self._executor = executor
             return executor
 

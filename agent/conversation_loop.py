@@ -955,6 +955,95 @@ def run_conversation(
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
         )
+
+        # The turn-start preflight compressor can be invalidated by large tool
+        # results later in the same turn (browser snapshots, file reads, etc.).
+        # Re-check immediately before every provider call so Codex/OAuth and
+        # other fragile long-context routes do not receive a freshly bloated
+        # prompt after tools run.
+        _compressor = getattr(agent, "context_compressor", None)
+        if agent.compression_enabled and _compressor is not None:
+            _compression_cooldown = getattr(
+                _compressor,
+                "get_active_compression_failure_cooldown",
+                lambda: None,
+            )()
+            _defer_compression = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )(approx_request_tokens)
+            _force_spike_compression = False
+            if _defer_compression:
+                # awaiting_real_usage is useful right after compression: the
+                # rough estimator can over-count, so we wait for one real API
+                # usage sample before compacting again. But a large tool output
+                # can arrive in the same turn and blow the prompt back up before
+                # that sample. Do not let the defer state pass an obviously
+                # oversized request through to Codex/OAuth backends.
+                _spike_floor = max(
+                    int(_compressor.threshold_tokens * 1.5),
+                    int(_compressor.context_length * 0.40),
+                )
+                _force_spike_compression = approx_request_tokens >= _spike_floor
+                if _force_spike_compression:
+                    logger.info(
+                        "Mid-turn compression defer overridden: ~%s tokens >= %s spike floor",
+                        f"{approx_request_tokens:,}",
+                        f"{_spike_floor:,}",
+                    )
+            if (
+                not _compression_cooldown
+                and (not _defer_compression or _force_spike_compression)
+                and (
+                    _force_spike_compression
+                    or _compressor.should_compress(approx_request_tokens)
+                )
+            ):
+                logger.info(
+                    "Mid-turn compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{approx_request_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                agent._emit_status(
+                    f"📦 Mid-turn compression: ~{approx_request_tokens:,} tokens "
+                    f">= {_compressor.threshold_tokens:,} threshold. "
+                    "This may take a moment."
+                )
+                _orig_len = len(messages)
+                _orig_tokens = approx_request_tokens
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=approx_request_tokens,
+                    task_id=effective_task_id,
+                )
+                conversation_history = conversation_history_after_compression(
+                    agent, messages
+                )
+                _new_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+                if len(messages) < _orig_len or _new_tokens < _orig_tokens * 0.95:
+                    logger.info(
+                        "Mid-turn compression done: messages=%s->%s tokens=~%s->~%s; rebuilding request",
+                        _orig_len,
+                        len(messages),
+                        f"{_orig_tokens:,}",
+                        f"{_new_tokens:,}",
+                    )
+                    continue
+                logger.info(
+                    "Mid-turn compression made insufficient progress: messages=%s->%s tokens=~%s->~%s; sending request",
+                    _orig_len,
+                    len(messages),
+                    f"{_orig_tokens:,}",
+                    f"{_new_tokens:,}",
+                )
         if _runtime_context_error:
             final_response = _runtime_context_error
             failed = True
