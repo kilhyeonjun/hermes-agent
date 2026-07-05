@@ -39,6 +39,16 @@ def mock_args():
     return SimpleNamespace()
 
 
+def test_resolve_update_target_defaults_to_latest_release_tag(monkeypatch):
+    import hermes_cli.main as hm
+
+    monkeypatch.setattr(hm, "_latest_release_tag_for_update", lambda: "v2026.7.1")
+
+    assert hm._resolve_update_branch(SimpleNamespace(branch=None)) == "v2026.7.1"
+    assert hm._resolve_update_branch(SimpleNamespace(branch="")) == "v2026.7.1"
+    assert hm._resolve_update_branch(SimpleNamespace(branch="main")) == "main"
+
+
 # ---------------------------------------------------------------------------
 # Managed-uv compatibility for tests that patch shutil.which
 # ---------------------------------------------------------------------------
@@ -780,15 +790,48 @@ class TestCmdUpdateCheckBranchFlag:
         assert not any("rev-list" in c for c in commands), commands
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.main._latest_release_tag_for_update", return_value="v2026.7.1")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_release_tag_ignores_main(
+        self, mock_run, _mock_latest_tag, _mock_method, capsys
+    ):
+        """No --branch checks the latest release tag, not origin/main."""
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in joined and "--is-shallow-repository" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+            if "fetch --tags --prune origin" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if joined.endswith("rev-parse HEAD"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="local-sha\n", stderr="")
+            if joined.endswith("rev-parse v2026.7.1^{commit}"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="tag-sha\n", stderr="")
+            raise AssertionError(f"unexpected command: {cmd!r}")
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(check=True, branch=None)
+
+        cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert any("fetch --tags --prune origin" in c for c in commands), commands
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        assert not any("rev-list" in c for c in commands), commands
+        out = capsys.readouterr().out
+        assert "target release tag v2026.7.1" in out
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_branch_main_still_prefers_upstream(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """Explicit --branch main preserves the upstream-then-origin probe."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
-        args = SimpleNamespace(check=True, branch=None)
+        args = SimpleNamespace(check=True, branch="main")
 
         cmd_update(args)
 

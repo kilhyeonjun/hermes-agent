@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
@@ -122,6 +123,7 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 UPDATE_AVAILABLE_NO_COUNT = -1
 
 _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+_GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 
@@ -171,6 +173,70 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
+def _release_tag_sort_key(tag: str) -> tuple[int, int, int, int, str]:
+    import re
+
+    m = re.match(r"^v(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\.(\d+))?$", tag or "")
+    if not m:
+        return (0, 0, 0, 0, tag or "")
+    return tuple(int(part or 0) for part in m.groups()) + (tag,)
+
+
+def _latest_release_tag_for_update(repo_dir: Path) -> Optional[str]:
+    try:
+        req = urllib.request.Request(
+            _GITHUB_API_LATEST_RELEASE,
+            headers={"User-Agent": "hermes-update-check"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        tag = str(data.get("tag_name") or "").strip()
+        if tag:
+            return tag
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags", "--refs", "origin", "v20*"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    tags = []
+    for line in (result.stdout or "").splitlines():
+        if "refs/tags/" in line:
+            tags.append(line.rsplit("refs/tags/", 1)[-1].strip())
+    return sorted(tags, key=_release_tag_sort_key)[-1] if tags else None
+
+
+def _remote_release_commit(tag: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", _UPSTREAM_REPO_URL, f"refs/tags/{tag}^{{}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return result.stdout.split()[0]
+
+
+def _release_commit(repo_dir: Path, tag: str) -> Optional[str]:
+    return (
+        _git_stdout(["rev-parse", f"{tag}^{{commit}}"], cwd=repo_dir)
+        or _remote_release_commit(tag)
+    )
+
+
 def _check_via_rev(local_rev: str) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote.
 
@@ -193,63 +259,16 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+    """Check whether HEAD matches the latest published GitHub Release tag."""
+    latest_tag = _latest_release_tag_for_update(repo_dir)
+    if not latest_tag:
+        return None
 
-    # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
-    # clone the history stops at a single commit, so a plain `git fetch` would
-    # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
-    shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
-    is_shallow = shallow == "true"
-
-    try:
-        fetch_args = ["git", "fetch", "origin"]
-        if is_shallow:
-            fetch_args += ["--depth", "1"]
-        fetch_args.append("--quiet")
-        subprocess.run(
-            fetch_args,
-            capture_output=True, timeout=10,
-            cwd=str(repo_dir),
-        )
-    except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
-
-    if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        target_rev = (
-            _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
-        )
-        if not head_rev or not target_rev:
-            return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
-
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, timeout=5,
-            cwd=str(repo_dir),
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
-    except Exception:
-        pass
-    return None
+    head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+    target_rev = _release_commit(repo_dir, latest_tag)
+    if not head_rev or not target_rev:
+        return None
+    return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -299,7 +318,8 @@ def check_for_updates() -> Optional[int]:
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
     it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    git checkout and compare HEAD against the latest published GitHub Release
+    tag.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -427,7 +447,12 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    latest_tag = _latest_release_tag_for_update(repo_dir)
+    upstream = (
+        _git_short_hash(repo_dir, f"{latest_tag}^{{commit}}")
+        if latest_tag
+        else _git_short_hash(repo_dir, "origin/main")
+    )
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
@@ -444,7 +469,9 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{latest_tag}^{{commit}}..HEAD"]
+            if latest_tag
+            else ["git", "rev-list", "--count", "origin/main..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -463,12 +490,7 @@ _latest_release_cache: Optional[tuple] = None  # (tag, url) once resolved
 
 
 def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
-    """Return ``(tag, release_url)`` for the latest git tag, or None.
-
-    Local-only — runs ``git describe --tags --abbrev=0`` against the
-    Hermes checkout. Cached per-process. Release URL always points at the
-    canonical NousResearch/hermes-agent repo (forks don't get a link).
-    """
+    """Return ``(tag, release_url)`` for the latest GitHub Release tag, or None."""
     global _latest_release_cache
     if _latest_release_cache is not None:
         return _latest_release_cache or None
@@ -478,23 +500,7 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
         _latest_release_cache = ()  # falsy sentinel — skip future lookups
         return None
 
-    try:
-        result = subprocess.run(
-            ["git", "describe", "--tags", "--abbrev=0"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            cwd=str(repo_dir),
-        )
-    except Exception:
-        _latest_release_cache = ()
-        return None
-
-    if result.returncode != 0:
-        _latest_release_cache = ()
-        return None
-
-    tag = (result.stdout or "").strip()
+    tag = _latest_release_tag_for_update(repo_dir)
     if not tag:
         _latest_release_cache = ()
         return None

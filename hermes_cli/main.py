@@ -8351,15 +8351,75 @@ def _finalize_update_output(state):
             pass
 
 
-def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` into a non-empty branch name.
+def _latest_release_tag_for_update() -> str | None:
+    """Return the newest GitHub Release tag for release-pinned updates.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    Hermes git installs used to default ``hermes update`` to ``origin/main``.
+    For operator stability we prefer the latest published release tag.  The
+    GitHub API is the source of truth; ``git ls-remote`` is an offline-ish
+    fallback that still avoids following main-only commits.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
+            headers={"User-Agent": "hermes-update"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        tag = str(data.get("tag_name") or "").strip()
+        if tag:
+            return tag
+    except Exception as exc:
+        logger.debug("Could not query latest Hermes release tag: %s", exc)
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags", "--refs", "origin", "v20*"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        tags = []
+        for line in (result.stdout or "").splitlines():
+            if "refs/tags/" in line:
+                tags.append(line.rsplit("refs/tags/", 1)[-1].strip())
+        if tags:
+            def _key(t: str):
+                import re
+
+                m = re.match(r"^v(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\.(\d+))?$", t)
+                if not m:
+                    return (0, 0, 0, 0, t)
+                return tuple(int(x or 0) for x in m.groups()) + (t,)
+
+            return sorted(tags, key=_key)[-1]
+    except Exception as exc:
+        logger.debug("Could not query release tags from origin: %s", exc)
+    return None
+
+
+def _is_release_update_target(ref: str) -> bool:
+    import re
+
+    return bool(re.match(r"^v20\d{2}\.\d{1,2}\.\d{1,2}(?:\.\d+)?$", ref or ""))
+
+
+def _resolve_update_branch(args) -> str:
+    """Normalize ``args.branch`` into a non-empty update target.
+
+    Explicit ``--branch`` keeps the historical branch behavior.  Without an
+    explicit branch, git installs update to the latest published release tag
+    instead of following ``origin/main``.  If release discovery fails, fall back
+    to ``main`` so offline/manual installs remain recoverable.
+    """
+    explicit = (getattr(args, "branch", None) or "").strip()
+    if explicit:
+        return explicit
+    return _latest_release_tag_for_update() or "main"
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
@@ -8431,7 +8491,17 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
 
-    if branch == "main":
+    if _is_release_update_target(branch):
+        print("→ Fetching release tags from origin...")
+        fetch_result = subprocess.run(
+            git_cmd + ["fetch", "--tags", "--prune", "origin"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        upstream_exists = False
+        compare_branch = branch
+    elif branch == "main":
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch"] + depth_args + ["upstream", branch],
@@ -8488,8 +8558,28 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         text=True,
     )
     if verify_result.returncode != 0:
-        print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
+        kind = "Release tag" if _is_release_update_target(branch) else "Branch"
+        location = "local tags/origin" if _is_release_update_target(branch) else compare_branch.split('/', 1)[0]
+        print(f"✗ {kind} '{branch}' not found on {location}.")
         sys.exit(1)
+
+    if _is_release_update_target(branch):
+        head_sha = subprocess.run(
+            git_cmd + ["rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        ).stdout.strip()
+        target_sha = subprocess.run(
+            git_cmd + ["rev-parse", f"{branch}^{{commit}}"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        ).stdout.strip()
+        if head_sha and target_sha and head_sha == target_sha:
+            print(f"✓ Already on latest release tag {branch}.")
+        else:
+            print(f"⚕ Update available: target release tag {branch}.")
+            from hermes_cli.config import recommended_update_command
+
+            print(f"  Run '{recommended_update_command()}' to install.")
+        return
 
     if is_shallow:
         # No history to count across the shallow boundary. Compare tip SHAs and
@@ -9312,10 +9402,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _resolve_update_branch(args)
+        target_is_release = _is_release_update_target(branch)
 
         print("→ Fetching updates...")
+        fetch_args = ["fetch", "--tags", "--prune", "origin"] if target_is_release else ["fetch", "origin", branch]
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + fetch_args,
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9346,6 +9438,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        pre_checkout_sha = subprocess.run(
+            git_cmd + ["rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -9403,14 +9502,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
 
         # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        if target_is_release:
+            target_sha = subprocess.run(
+                git_cmd + ["rev-parse", f"{branch}^{{commit}}"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            commit_count = 0 if pre_checkout_sha == target_sha else 1
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -9468,33 +9577,46 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            if target_is_release:
+                pull_result = subprocess.run(
+                    git_cmd + ["checkout", "--detach", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
+                if pull_result.returncode != 0:
+                    print(f"✗ Failed to check out release tag {branch}.")
+                    if pull_result.stderr.strip():
+                        print(f"  {pull_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
+            else:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if pull_result.returncode != 0:
+                    # ff-only failed — local and remote have diverged (e.g. upstream
+                    # force-pushed or rebase).  Since local changes are already
+                    # stashed, reset to match the remote exactly.
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
