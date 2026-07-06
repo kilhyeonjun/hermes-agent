@@ -234,7 +234,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("upgrade",)),
     CommandDef("topup", "Show your Nous balance and manage billing on the portal", "Info"),
     CommandDef("codex-usage", "Show current OpenAI Codex quota usage by credential", "Info",
-               aliases=("codex_usage",), args_hint="[--compact]"),
+               aliases=("codex_usage",), args_hint="[--compact|--verbose]"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
