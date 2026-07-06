@@ -1029,6 +1029,10 @@ def run_conversation(
                     tools=agent.tools or None,
                 )
                 if len(messages) < _orig_len or _new_tokens < _orig_tokens * 0.95:
+                    _saved_pct = (
+                        ((_orig_tokens - _new_tokens) / _orig_tokens) * 100
+                        if _orig_tokens > 0 else 0.0
+                    )
                     logger.info(
                         "Mid-turn compression done: messages=%s->%s tokens=~%s->~%s; rebuilding request",
                         _orig_len,
@@ -1036,6 +1040,25 @@ def run_conversation(
                         f"{_orig_tokens:,}",
                         f"{_new_tokens:,}",
                     )
+                    if _saved_pct < 15.0:
+                        logger.warning(
+                            "Mid-turn compression saved only %.1f%% (messages=%s->%s tokens=~%s->~%s); "
+                            "recent protected tool output or tool schemas may dominate context",
+                            _saved_pct,
+                            _orig_len,
+                            len(messages),
+                            f"{_orig_tokens:,}",
+                            f"{_new_tokens:,}",
+                        )
+                    elif _saved_pct < 20.0:
+                        logger.info(
+                            "Mid-turn compression low savings %.1f%% (messages=%s->%s tokens=~%s->~%s)",
+                            _saved_pct,
+                            _orig_len,
+                            len(messages),
+                            f"{_orig_tokens:,}",
+                            f"{_new_tokens:,}",
+                        )
                     continue
                 logger.info(
                     "Mid-turn compression made insufficient progress: messages=%s->%s tokens=~%s->~%s; sending request",
@@ -1186,6 +1209,13 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                try:
+                    from agent.chat_completion_helpers import estimate_request_context_tokens as _estimate_payload_context_tokens
+                    _request_context_estimate = _estimate_payload_context_tokens(api_kwargs)
+                except Exception:
+                    _request_context_estimate = approx_request_tokens
+                agent._last_request_context_estimate_tokens = _request_context_estimate
 
                 try:
                     from hermes_cli.plugins import (
@@ -2122,6 +2152,15 @@ def run_conversation(
                         prompt_tokens, completion_tokens, total_tokens,
                         api_duration, _cache_pct,
                     )
+                    if agent.api_mode == "codex_responses" or agent.provider == "openai-codex":
+                        _est = int(getattr(agent, "_last_request_context_estimate_tokens", 0) or 0)
+                        if _est > 0 and prompt_tokens > 0:
+                            logger.info(
+                                "Codex request estimate vs actual: estimate=~%s actual_prompt=%s ratio=%.2fx",
+                                f"{_est:,}",
+                                f"{prompt_tokens:,}",
+                                _est / max(prompt_tokens, 1),
+                            )
 
                     # On the MoA path, agent.model/provider are the virtual
                     # preset name ("closed") and "moa", which have no pricing

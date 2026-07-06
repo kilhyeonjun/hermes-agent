@@ -169,6 +169,15 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
 
+    _request_estimate = int(getattr(agent, "_last_request_context_estimate_tokens", 0) or 0)
+    if _request_estimate > 0 and prompt_tokens > 0:
+        logger.info(
+            "Codex request estimate vs actual: estimate=~%s actual_prompt=%s ratio=%.2fx",
+            f"{_request_estimate:,}",
+            f"{prompt_tokens:,}",
+            _request_estimate / max(prompt_tokens, 1),
+        )
+
     agent.session_prompt_tokens += prompt_tokens
     agent.session_completion_tokens += completion_tokens
     agent.session_total_tokens += total_tokens

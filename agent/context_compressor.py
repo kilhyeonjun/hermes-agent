@@ -187,6 +187,16 @@ _AUTO_FOCUS_MAX_CHARS = 700
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
 
+# Protected-tail tool results are deliberately kept verbatim so the active
+# task survives compaction. Very large recent tool outputs (browser snapshots,
+# giant file reads, MCP dumps) can dominate that tail, though, making a compact
+# save only ~10–15% and immediately re-trigger. Keep head+tail evidence for
+# recent tools, but cap any single protected tool result to a bounded text
+# envelope so one fresh dump cannot pin the whole context window.
+_PROTECTED_TAIL_TOOL_RESULT_MAX_CHARS = 24_000
+_PROTECTED_TAIL_TOOL_RESULT_HEAD_CHARS = 16_000
+_PROTECTED_TAIL_TOOL_RESULT_TAIL_CHARS = 6_000
+
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 
@@ -275,6 +285,28 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
         if isinstance(tc, dict):
             tokens += len(str(tc)) // _CHARS_PER_TOKEN
     return tokens
+
+
+def _cap_protected_tail_tool_result(content: str) -> str:
+    """Bound one oversized protected-tail tool result with head/tail evidence.
+
+    This is intentionally less aggressive than old-tool pruning: recent tool
+    output may be needed for the active answer, so preserve a large prefix and
+    suffix rather than replacing it with a one-line summary.
+    """
+    if len(content) <= _PROTECTED_TAIL_TOOL_RESULT_MAX_CHARS:
+        return content
+    omitted = len(content) - (
+        _PROTECTED_TAIL_TOOL_RESULT_HEAD_CHARS
+        + _PROTECTED_TAIL_TOOL_RESULT_TAIL_CHARS
+    )
+    return (
+        content[:_PROTECTED_TAIL_TOOL_RESULT_HEAD_CHARS]
+        + "\n\n[Protected recent tool output truncated to reduce context: "
+        + f"{omitted:,} chars omitted; kept head+tail]\n\n"
+        + content[-_PROTECTED_TAIL_TOOL_RESULT_TAIL_CHARS:]
+    )
+
 
 
 def _content_text_for_contains(content: Any) -> str:
@@ -1268,6 +1300,23 @@ class ContextCompressor(ContextEngine):
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
                 summary = _summarize_tool_result(tool_name, tool_args, content)
                 result[i] = {**msg, "content": summary}
+                pruned += 1
+
+        # Pass 2b: Bound oversized tool outputs that remain in the protected
+        # recent tail.  The tail is kept because it may contain active-task
+        # evidence, but one huge browser/file/MCP dump should not pin the whole
+        # context window after compaction.  Use head+tail truncation (not a
+        # one-line summary) so the model still sees concrete recent evidence.
+        for i in range(max(prune_boundary, 0), len(result)):
+            msg = result[i]
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content:
+                continue
+            capped = _cap_protected_tail_tool_result(content)
+            if capped != content:
+                result[i] = {**msg, "content": capped}
                 pruned += 1
 
         # Pass 3: Truncate large tool_call arguments in assistant messages

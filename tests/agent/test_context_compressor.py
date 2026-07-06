@@ -9,6 +9,7 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _PROTECTED_TAIL_TOOL_RESULT_MAX_CHARS,
 )
 from hermes_state import SessionDB
 
@@ -136,6 +137,37 @@ class TestCompress:
         # Abort flag must NOT fire under the default config.
         assert compressor._last_compress_aborted is False
         assert compressor._last_summary_fallback_used is True
+
+    def test_protected_tail_large_tool_result_is_capped(self, compressor):
+        """Recent tool output should not pin the whole context window.
+
+        Old-tool pruning intentionally skips the protected tail, but an enormous
+        just-read file/browser dump there can make the next compaction save only
+        a few percent.  The protected-tail pass keeps concrete head+tail
+        evidence while bounding a single oversized recent tool result.
+        """
+        huge = "HEAD" + ("x" * (_PROTECTED_TAIL_TOOL_RESULT_MAX_CHARS + 10_000)) + "TAIL"
+        msgs = [
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": '{"path":"big.log"}'}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": huge},
+            {"role": "user", "content": "use that output"},
+        ]
+
+        pruned, count = compressor._prune_old_tool_results(
+            msgs, protect_tail_count=3, protect_tail_tokens=None,
+        )
+
+        capped = pruned[2]["content"]
+        assert count == 1
+        assert len(capped) < len(huge)
+        assert len(capped) <= _PROTECTED_TAIL_TOOL_RESULT_MAX_CHARS
+        assert "Protected recent tool output truncated" in capped
+        assert capped.startswith("HEAD")
+        assert capped.endswith("TAIL")
 
     def test_summary_failure_uses_deterministic_fallback_with_recovered_context(self):
         """Regression: failed LLM summaries should not emit a content-free marker.
