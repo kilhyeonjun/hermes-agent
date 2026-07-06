@@ -15707,6 +15707,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "topup":
             return await self._handle_topup_command(event)
 
+        if canonical == "codex-usage":
+            return await self._handle_codex_usage_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
