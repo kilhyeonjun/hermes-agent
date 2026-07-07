@@ -31,6 +31,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
+from agent.network_circuit_breaker import get_global_network_breaker
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
@@ -517,11 +518,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    breaker = get_global_network_breaker()
+    breaker.before_request("provider")
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        try:
+            response = direct_api_call(agent, api_kwargs)
+        except Exception as exc:
+            breaker.record_failure(exc, surface="provider")
+            raise
+        breaker.record_success(surface="provider")
+        return response
 
     result = {"response": None, "error": None}
 
@@ -972,11 +982,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 pass
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        breaker.record_failure(result["error"], surface="provider")
         raise result["error"]
-    # Success — clear the circuit breaker (#58962): the provider proved
-    # responsive.  See the canonical comment block above ``_stale_streak()``.
+    # Success — clear both stale-call guards: the provider proved responsive.
+    # See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+    breaker.record_success(surface="provider")
     return result["response"]
 
 
@@ -2271,6 +2283,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         finally:
             agent._codex_on_first_delta = None
 
+    breaker = get_global_network_breaker()
+    breaker.before_request("provider")
+
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.
     if agent.api_mode == "bedrock_converse":
@@ -2444,12 +2459,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
         if result["error"] is not None:
+            breaker.record_failure(result["error"], surface="provider")
             raise result["error"]
         # Success — clear the cross-turn breaker (#58962): Bedrock proved
         # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
         # recovered provider doesn't carry a stale streak into later turns.
         if result["response"] is not None:
             _reset_stale_streak(agent)
+        breaker.record_success(surface="provider")
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -3735,6 +3752,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        breaker.record_failure(result["error"], surface="provider")
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
@@ -3821,12 +3839,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            breaker.record_success(surface="provider")
             return _stub
         raise result["error"]
-    # Success — clear the circuit breaker (#58962): the provider proved
-    # responsive.  See the canonical comment block above ``_stale_streak()``.
+    # Success — clear both stale-call guards: the provider proved responsive.
+    # See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+    breaker.record_success(surface="provider")
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────
