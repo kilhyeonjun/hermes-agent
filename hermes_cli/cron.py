@@ -163,6 +163,9 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        reasoning_effort = job.get("reasoning_effort")
+        if reasoning_effort:
+            print(f"    Effort:    {reasoning_effort} (job override)")
 
         # Execution history
         last_status = job.get("last_status")
@@ -335,6 +338,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -386,6 +390,12 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    reasoning_effort = (
+        ""
+        if getattr(args, "clear_reasoning_effort", False)
+        else getattr(args, "reasoning_effort", None)
+    )
+
     result = _cron_api(
         action="update",
         job_id=args.job_id,
@@ -398,6 +408,7 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        reasoning_effort=reasoning_effort,
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

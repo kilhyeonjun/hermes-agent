@@ -2656,6 +2656,24 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _resolve_cron_reasoning_config(job: dict, config: Any, model: str = ""):
+    """Resolve reasoning config with job override taking precedence over profile."""
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    job_effort = job.get("reasoning_effort")
+    if isinstance(job_effort, str) and job_effort.strip():
+        parsed = parse_reasoning_effort(job_effort)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "Job '%s' has invalid reasoning_effort=%r; falling back to profile config",
+            job.get("id", "?"),
+            job_effort,
+        )
+
+    return resolve_reasoning_config(config if isinstance(config, dict) else {}, model)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3113,7 +3131,6 @@ def run_job(
 
         # Reasoning config is resolved after provider authentication so an auth
         # fallback can first replace the primary model with its configured model.
-        from hermes_constants import resolve_reasoning_config
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
@@ -3238,9 +3255,9 @@ def run_job(
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
-        )
+        # Per-job override wins; otherwise inherit the resolved model/profile
+        # reasoning policy after provider authentication and fallback.
+        reasoning_config = _resolve_cron_reasoning_config(job, _cfg, str(model))
 
         # Provider/model-drift fail-closed guard (#44585).
         #

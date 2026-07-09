@@ -40,6 +40,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        help="Per-job reasoning effort. Omit to inherit the active profile.",
+    )
+    cron_create.add_argument(
         "--skill",
         dest="skills",
         action="append",
@@ -81,6 +86,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
+    cron_edit.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        help="Set a per-job reasoning effort override.",
+    )
+    cron_edit.add_argument(
+        "--clear-reasoning-effort",
+        action="store_true",
+        help="Clear the per-job override and inherit the active profile.",
+    )
     cron_edit.add_argument(
         "--skill",
         dest="skills",

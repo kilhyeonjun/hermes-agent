@@ -1014,6 +1014,25 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_job_reasoning_effort(value: Any) -> Optional[str]:
+    """Normalize and validate an optional per-job reasoning effort override."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Cron job reasoning effort must be a string or null")
+
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    normalized = value.strip().lower()
+    valid = ("none", *VALID_REASONING_EFFORTS)
+    if normalized not in valid:
+        raise ValueError(
+            "Invalid cron job reasoning effort "
+            f"{value!r}; expected one of: {', '.join(valid)}"
+        )
+    return normalized
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1081,6 +1100,7 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -1104,6 +1124,8 @@ def create_job(
         model: Optional per-job model override
         provider: Optional per-job provider override
         base_url: Optional per-job base URL override
+        reasoning_effort: Optional per-job reasoning effort override. When unset,
+                          the profile's ``agent.reasoning_effort`` is used.
         script: Optional path to a script whose stdout feeds the job. With
                 ``no_agent=True`` the script IS the job — its stdout is
                 delivered verbatim. Without ``no_agent``, its stdout is
@@ -1156,6 +1178,7 @@ def create_job(
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
+    normalized_reasoning_effort = _normalize_job_reasoning_effort(reasoning_effort)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
@@ -1228,6 +1251,7 @@ def create_job(
         "provider_snapshot": provider_snapshot,
         "model_snapshot": model_snapshot,
         "base_url": normalized_base_url,
+        "reasoning_effort": normalized_reasoning_effort,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
         "context_from": context_from,
@@ -1355,6 +1379,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "reasoning_effort" in updates:
+                updates["reasoning_effort"] = _normalize_job_reasoning_effort(
+                    updates["reasoning_effort"]
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
