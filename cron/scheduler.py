@@ -2480,6 +2480,29 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _resolve_cron_reasoning_config(job: dict, config: Any):
+    """Resolve reasoning config with job override taking precedence over profile."""
+    from hermes_constants import parse_reasoning_effort
+
+    job_effort = job.get("reasoning_effort")
+    if isinstance(job_effort, str) and job_effort.strip():
+        parsed = parse_reasoning_effort(job_effort)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "Job '%s' has invalid reasoning_effort=%r; falling back to profile config",
+            job.get("id", "?"),
+            job_effort,
+        )
+
+    if not isinstance(config, dict):
+        config = {}
+    agent_cfg = config.get("agent", {})
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    return parse_reasoning_effort(agent_cfg.get("reasoning_effort", ""))
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2862,12 +2885,9 @@ def run_job(
         except Exception:
             pass
 
-        # Reasoning config from config.yaml (raw value — a YAML boolean False
-        # means thinking disabled, see parse_reasoning_effort)
-        from hermes_constants import parse_reasoning_effort
-        reasoning_config = parse_reasoning_effort(
-            _cfg.get("agent", {}).get("reasoning_effort", "")
-        )
+        # Per-job override wins; otherwise inherit the active profile's
+        # agent.reasoning_effort. Stored overrides are validated by cron.jobs.
+        reasoning_config = _resolve_cron_reasoning_config(job, _cfg)
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
