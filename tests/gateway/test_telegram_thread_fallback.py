@@ -11,7 +11,7 @@ avoid retrying with a partial topic route that can render outside the lane.
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -844,6 +844,197 @@ async def test_send_model_picker_uses_metadata_reply_fallback_for_dm_topics():
     assert call_log[0]["reply_to_message_id"] == 462
     assert call_log[0]["message_thread_id"] == 20197
     assert "direct_messages_topic_id" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_picker_sends_detailed_and_preset_buttons_in_the_same_topic():
+    """The picker exposes detailed controls plus session-only presets."""
+    adapter = _make_adapter()
+    adapter._session_runtime_picker_state = {}
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(kwargs)
+        return SimpleNamespace(message_id=780)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    callback = AsyncMock(return_value="done")
+
+    result = await adapter.send_session_runtime_picker(
+        chat_id="123",
+        session_key="telegram:123:20197",
+        current_model="gpt-5.6-terra",
+        current_effort="medium",
+        on_selected=callback,
+        metadata={"thread_id": "20197"},
+    )
+
+    assert result.success is True
+    assert "현재 세션" in call_log[0]["text"]
+    assert "gpt-5.6-terra" in call_log[0]["text"]
+    assert "medium" in call_log[0]["text"]
+    buttons = [
+        button
+        for row in call_log[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    labels = {getattr(button, "text", "") for button in buttons}
+    assert "🎛 모델 선택" in labels
+    assert "🧠 추론 선택" in labels
+    assert {
+        getattr(button, "callback_data", None)
+        or getattr(button, "kwargs", {}).get("callback_data")
+        for button in buttons
+    } == {
+        "sr:model", "sr:effort", "sr:luna", "sr:terra", "sr:sol", "sr:xhigh", "sr:max", "sr:reset"
+    }
+    assert adapter._session_runtime_picker_state[("123", 780)]["session_key"] == "telegram:123:20197"
+
+
+@pytest.mark.asyncio
+async def test_session_fast_picker_uses_buttons_and_session_callback():
+    adapter = _make_adapter()
+    adapter._session_runtime_picker_state = {}
+    sent = []
+
+    async def mock_send_message(**kwargs):
+        sent.append(kwargs)
+        return SimpleNamespace(message_id=781)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    callback = AsyncMock(return_value="✅ FAST")
+    result = await adapter.send_session_runtime_picker(
+        chat_id="123",
+        session_key="telegram:123:20197",
+        current_model="",
+        current_effort="",
+        current_service_tier=None,
+        mode="fast",
+        on_selected=callback,
+        metadata={"thread_id": "20197"},
+    )
+
+    assert result.success is True
+    buttons = [
+        button
+        for row in sent[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert {
+        getattr(button, "callback_data", None)
+        or getattr(button, "kwargs", {}).get("callback_data")
+        for button in buttons
+    } == {"sf:fast", "sf:normal", "sf:reset"}
+
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=781),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    await adapter._handle_session_runtime_picker_callback(query, "sf:fast", "123")
+    callback.assert_awaited_once_with("", "fast")
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_picker_callback_applies_only_the_selected_preset():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value="✅ 이 세션만 설정했습니다.")
+    adapter._session_runtime_picker_state = {
+        ("123", 780): {"session_key": "telegram:123:20197", "on_selected": callback}
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=780),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_session_runtime_picker_callback(query, "sr:max", "123")
+
+    callback.assert_awaited_once_with("gpt-5.6-sol", "max")
+    assert adapter._session_runtime_picker_state == {}
+    query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_picker_effort_drilldown_is_independent():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value="✅ max")
+    adapter._session_runtime_picker_state = {
+        ("123", 780): {"session_key": "telegram:123:20197", "on_selected": callback}
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=780),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_session_runtime_picker_callback(query, "sr:effort", "123")
+
+    callback.assert_not_awaited()
+    keyboard = query.edit_message_text.await_args.kwargs["reply_markup"]
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert {
+        getattr(button, "callback_data", None)
+        or getattr(button, "kwargs", {}).get("callback_data")
+        for button in buttons
+    } == {
+        "sr:e:none", "sr:e:minimal", "sr:e:low", "sr:e:medium", "sr:e:high", "sr:e:xhigh", "sr:e:max", "sr:back"
+    }
+
+    await adapter._handle_session_runtime_picker_callback(query, "sr:e:max", "123")
+
+    callback.assert_awaited_once_with("", "max")
+    assert adapter._session_runtime_picker_state == {}
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_picker_callbacks_do_not_cross_chats_with_same_message_id():
+    adapter = _make_adapter()
+    first = AsyncMock(return_value="first")
+    second = AsyncMock(return_value="second")
+    adapter._session_runtime_picker_state = {
+        ("123", 780): {"session_key": "telegram:123:topic-a", "on_selected": first},
+        ("456", 780): {"session_key": "telegram:456:topic-b", "on_selected": second},
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=780),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_session_runtime_picker_callback(query, "sr:sol", "123")
+
+    first.assert_awaited_once_with("gpt-5.6-sol", "high")
+    second.assert_not_awaited()
+    assert set(adapter._session_runtime_picker_state) == {("456", 780)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_data", ["sr:sol", "sf:fast", "mm:0"])
+async def test_model_picker_callbacks_reject_unauthorized_users(callback_data):
+    adapter = _make_adapter()
+    adapter._is_callback_user_authorized = MagicMock(return_value=False)
+    adapter._handle_session_runtime_picker_callback = AsyncMock()
+    adapter._handle_model_picker_callback = AsyncMock()
+    query = SimpleNamespace(
+        data=callback_data,
+        message=SimpleNamespace(
+            chat_id=123,
+            chat=SimpleNamespace(type="supergroup"),
+            message_thread_id=5,
+        ),
+        from_user=SimpleNamespace(id=999, first_name="Mallory"),
+        answer=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    adapter._is_callback_user_authorized.assert_called_once()
+    adapter._handle_session_runtime_picker_callback.assert_not_awaited()
+    adapter._handle_model_picker_callback.assert_not_awaited()
+    assert "authorized" in query.answer.await_args.kwargs["text"]
 
 
 @pytest.mark.asyncio

@@ -170,6 +170,54 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
         assert "Unknown command" not in result
 
 
+@pytest.mark.asyncio
+async def test_session_model_underscored_alias_dispatches_to_handler(monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._handle_session_model_command = AsyncMock(return_value="picker sent")
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/session_model"))
+
+    assert result == "picker sent"
+    runner._handle_session_model_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_codex_route_underscored_alias_dispatches_to_handler(monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._handle_codex_route_command = AsyncMock(return_value="route status")
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/codex_route status"))
+
+    assert result == "route status"
+    runner._handle_codex_route_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_codex_account_underscored_alias_dispatches_to_handler(monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._handle_codex_account_command = AsyncMock(return_value="account status")
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/codex_account status"))
+
+    assert result == "account status"
+    runner._handle_codex_account_command.assert_awaited_once()
+
+
 # ------------------------------------------------------------------
 # command:<name> decision hook — deny / handled / rewrite
 # ------------------------------------------------------------------

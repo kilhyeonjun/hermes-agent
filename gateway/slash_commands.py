@@ -204,6 +204,7 @@ class GatewaySlashCommandsMixin:
         # picks up configured defaults instead of previous session switches.
         self._session_model_overrides.pop(session_key, None)
         self._set_session_reasoning_override(session_key, None)
+        self._set_session_service_tier_override(session_key, None, clear=True)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
@@ -1395,6 +1396,148 @@ class GatewaySlashCommandsMixin:
             "\n".join(lines),
             getattr(getattr(event, "source", None), "platform", None),
         )
+
+    async def _handle_session_model_command(self, event: MessageEvent) -> Optional[str]:
+        """Show detailed model/reasoning controls scoped to one Telegram session.
+
+        Unlike bare ``/model``, this command never writes ``config.yaml``.
+        Detailed model selection reuses the existing provider/model picker, and
+        presets plus independent effort choices delegate to the established
+        session override handlers.
+        """
+        from gateway.run import _load_gateway_config
+
+        def _args_event(args: str) -> MessageEvent:
+            return dataclasses.replace(event, text=f"/session_model {args}")
+
+        raw_args = event.get_command_args().strip()
+        if raw_args:
+            return await self._handle_model_command(
+                _args_event(f"{raw_args} --session")
+            )
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+        cfg = _load_gateway_config()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        current_model = (
+            model_cfg.get("default", "") if isinstance(model_cfg, dict) else ""
+        )
+        current_effort = (
+            agent_cfg.get("reasoning_effort", "medium")
+            if isinstance(agent_cfg, dict)
+            else "medium"
+        )
+        model_override = self._session_model_overrides.get(session_key, {})
+        if model_override:
+            current_model = model_override.get("model", current_model)
+        reasoning_override = getattr(self, "_session_reasoning_overrides", {}).get(
+            session_key, {}
+        )
+        if reasoning_override:
+            current_effort = (
+                "none"
+                if reasoning_override.get("enabled") is False
+                else reasoning_override.get("effort", current_effort)
+            )
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is None or not hasattr(adapter, "send_session_runtime_picker"):
+            return (
+                "Telegram 세션 전용 모델 선택은 이 플랫폼에서 버튼으로 지원되지 않습니다.\n"
+                "`/model gpt-5.6-sol --session`\n`/reasoning high`"
+            )
+
+        async def _on_selected(model: str, effort: str) -> str:
+            if effort == "reset":
+                self._session_model_overrides.pop(session_key, None)
+                try:
+                    self.session_store.set_model_override(session_key, None)
+                except Exception:
+                    logger.debug("Failed to clear session model override", exc_info=True)
+                self._set_session_reasoning_override(session_key, None)
+                self._evict_cached_agent(session_key)
+                return "✅ 이 세션만 프로필 기본값으로 복귀했습니다."
+
+            if effort == "model":
+                result = await self._handle_model_command(
+                    _args_event("--session")
+                )
+                return result or "🔧 상세 모델 선택기를 열었습니다."
+
+            if not model:
+                return await self._handle_reasoning_command(
+                    _args_event(effort)
+                )
+
+            model_result = await self._handle_model_command(
+                _args_event(f"{model} --session")
+            )
+            effort_result = await self._handle_reasoning_command(
+                _args_event(effort)
+            )
+            return "\n\n".join(
+                result for result in (model_result, effort_result) if result
+            )
+
+        result = await adapter.send_session_runtime_picker(
+            chat_id=source.chat_id,
+            session_key=session_key,
+            current_model=current_model,
+            current_effort=current_effort,
+            on_selected=_on_selected,
+            metadata=self._thread_metadata_for_source(
+                source, self._reply_anchor_for_event(event)
+            ),
+        )
+        if not getattr(result, "success", False):
+            return "❌ 세션 모델 선택 버튼을 열지 못했습니다."
+        return None
+
+    async def _handle_session_fast_command(self, event: MessageEvent) -> Optional[str]:
+        """Show Telegram buttons for a session-only Priority Processing override."""
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+        current_service_tier = self._resolve_session_service_tier(
+            source=source,
+            session_key=session_key,
+        )
+        adapter = self.adapters.get(source.platform)
+        if adapter is None or not hasattr(adapter, "send_session_runtime_picker"):
+            return "이 플랫폼에서는 `/session_fast` 버튼을 지원하지 않습니다."
+
+        async def _on_selected(_model: str, mode: str) -> str:
+            if mode == "reset":
+                self._set_session_service_tier_override(
+                    session_key, None, clear=True
+                )
+                return "✅ 이 세션의 FAST 설정을 프로필 기본값으로 복귀했습니다."
+
+            service_tier = "priority" if mode == "fast" else None
+            self._set_session_service_tier_override(session_key, service_tier)
+            label = "FAST" if service_tier else "NORMAL"
+            return f"⚡ {label} — 이 세션에만 적용했습니다."
+
+        result = await adapter.send_session_runtime_picker(
+            chat_id=source.chat_id,
+            session_key=session_key,
+            current_model="",
+            current_effort="",
+            current_service_tier=current_service_tier,
+            mode="fast",
+            on_selected=_on_selected,
+            metadata=self._thread_metadata_for_source(
+                source, self._reply_anchor_for_event(event)
+            ),
+        )
+        if not getattr(result, "success", False):
+            return "❌ 세션 FAST 선택 버튼을 열지 못했습니다."
+        return None
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
@@ -2729,13 +2872,15 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.reset_done")
         if effort == "none":
             parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
-            parsed = {"enabled": True, "effort": effort}
         else:
-            return t(
-                "gateway.reasoning.unknown_arg",
-                arg=effort or raw_args.lower(),
-            )
+            from hermes_constants import VALID_REASONING_EFFORTS
+
+            if effort not in VALID_REASONING_EFFORTS:
+                return t(
+                    "gateway.reasoning.unknown_arg",
+                    arg=effort or raw_args.lower(),
+                )
+            parsed = {"enabled": True, "effort": effort}
 
         self._reasoning_config = parsed
         if persist_global:
@@ -4112,6 +4257,107 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:
             logger.warning("/codex-usage failed: %s", exc)
             return f"Codex usage check failed: {exc}"
+
+    async def _handle_codex_route_command(self, event: MessageEvent) -> str:
+        """Handle /codex-route — set global Codex routing mode across profiles."""
+        import subprocess
+
+        raw_args = event.get_command_args().strip() if event else ""
+        mode = (raw_args.split()[0] if raw_args else "status").lower()
+        valid_modes = {
+            "status", "show", "상태",
+            "auto", "recommended", "recommend", "추천", "자동",
+            "personal", "personal-backup", "개인", "개인계정",
+            "company", "company-plus-100", "회사", "회사계정",
+        }
+        if mode not in valid_modes or len(raw_args.split()) > 1:
+            return (
+                "사용법:\n"
+                "/codex_route — 현재 설정\n"
+                "/codex_route auto — 추천 자동\n"
+                "/codex_route personal — 개인 고정\n"
+                "/codex_route company — 회사 고정"
+            )
+
+        script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+        if not script.exists():
+            return "❌ Codex 라우팅 제어 스크립트를 찾지 못했습니다."
+
+        def _run_control():
+            return subprocess.run(
+                [sys.executable, str(script), mode],
+                text=True,
+                capture_output=True,
+                timeout=180,
+                shell=False,
+            )
+
+        try:
+            proc = await asyncio.to_thread(_run_control)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("/codex-route failed: %s", exc)
+            return f"❌ Codex 라우팅 변경 실패: {exc}"
+        output = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode != 0:
+            return output or "❌ Codex 라우팅 변경에 실패했습니다."
+        return output or "✅ Codex 라우팅 설정을 적용했습니다."
+
+    async def _handle_codex_account_command(self, event: MessageEvent) -> str:
+        """Handle /codex-account for the Mac mini only."""
+        import subprocess
+
+        raw_args = event.get_command_args().strip() if event else ""
+        parts = raw_args.split()
+        mode_aliases = {
+            "status": "status", "show": "status", "상태": "status",
+            "auto": "auto", "recommended": "auto", "recommend": "auto", "추천": "auto", "자동": "auto",
+            "personal": "personal", "개인": "personal", "개인계정": "personal",
+            "company": "company", "회사": "company", "회사계정": "company",
+        }
+        mode = mode_aliases.get(parts[0].lower(), "") if parts else "status"
+        if not mode or len(parts) > 1:
+            return (
+                "사용법 (Mac mini만 적용):\n"
+                "/codex_account — 현재 상태\n"
+                "/codex_account auto — 자동 추천\n"
+                "/codex_account personal — 개인 고정\n"
+                "/codex_account company — 회사 고정\n\n"
+                "MacBook은 맥북 터미널에서 `codex-account`를 사용하세요."
+            )
+
+        local_script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+
+        def _run_local():
+            if not local_script.exists():
+                return subprocess.CompletedProcess(
+                    args=[], returncode=127, stdout="", stderr=f"제어 스크립트 없음: {local_script}"
+                )
+            return subprocess.run(
+                [sys.executable, str(local_script), mode],
+                text=True,
+                capture_output=True,
+                timeout=240,
+                shell=False,
+            )
+
+        try:
+            proc = await asyncio.to_thread(_run_local)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("/codex-account failed: %s", exc)
+            return f"❌ Codex 계정 명령 실패: {exc}"
+
+        output = (proc.stdout or proc.stderr or "출력 없음").strip()
+        marker = "✅" if proc.returncode == 0 else "❌"
+        cards = [f"🎛 Codex 계정 · {mode}", "", f"{marker} Mac mini", output]
+        if mode != "status":
+            cards.extend(
+                [
+                    "",
+                    "ℹ️ 실행 중인 Codex는 기존 계정을 계속 사용합니다.",
+                    "현재 작업을 종료한 뒤 `codex resume --last`로 다시 시작하세요.",
+                ]
+            )
+        return "\n".join(cards)
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""

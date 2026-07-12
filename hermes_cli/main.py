@@ -14520,6 +14520,27 @@ def main():
         return _codex_usage_main(argv)
     codex_usage_parser.set_defaults(func=_cmd_codex_usage)
 
+    codex_route_parser = subparsers.add_parser(
+        "codex-route",
+        aliases=["codex-account"],
+        help="Show or set Codex account routing across Hermes profiles and CLIProxy",
+        description=(
+            "Select automatic reset-aware routing, the personal account, or the company account. "
+            "The choice is applied to every Hermes profile and CLIProxy."
+        ),
+    )
+    codex_route_parser.add_argument(
+        "mode",
+        nargs="?",
+        default="status",
+        choices=["status", "auto", "personal", "company"],
+        help="routing mode (default: status)",
+    )
+    def _cmd_codex_route(_args):
+        from hermes_cli.codex_route import main as _codex_route_main
+        return _codex_route_main([_args.mode])
+    codex_route_parser.set_defaults(func=_cmd_codex_route)
+
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)
     # =========================================================================

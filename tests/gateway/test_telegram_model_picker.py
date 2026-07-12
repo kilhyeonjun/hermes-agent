@@ -44,6 +44,37 @@ def _make_adapter():
 
 class TestTelegramModelPicker:
     @pytest.mark.asyncio
+    async def test_picker_state_isolated_by_chat_and_message(self):
+        adapter = _make_adapter()
+        message_ids = iter((101, 102, 101))
+
+        async def mock_send_message(**kwargs):
+            return SimpleNamespace(message_id=next(message_ids))
+
+        adapter._bot.send_message = AsyncMock(side_effect=mock_send_message)
+        providers = [{"slug": "openai", "name": "OpenAI", "total_models": 1}]
+
+        await adapter.send_model_picker(
+            chat_id="123", providers=providers, current_model="a",
+            current_provider="openai", session_key="topic-a",
+            on_model_selected=AsyncMock(), metadata=None,
+        )
+        await adapter.send_model_picker(
+            chat_id="123", providers=providers, current_model="b",
+            current_provider="openai", session_key="topic-b",
+            on_model_selected=AsyncMock(), metadata=None,
+        )
+        await adapter.send_model_picker(
+            chat_id="456", providers=providers, current_model="c",
+            current_provider="openai", session_key="chat-c",
+            on_model_selected=AsyncMock(), metadata=None,
+        )
+
+        assert set(adapter._model_picker_state) == {
+            ("123", 101), ("123", 102), ("456", 101)
+        }
+
+    @pytest.mark.asyncio
     async def test_send_model_picker_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
         sent = {}
@@ -74,7 +105,7 @@ class TestTelegramModelPicker:
     @pytest.mark.asyncio
     async def test_back_button_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
-        adapter._model_picker_state["12345"] = {
+        adapter._model_picker_state[("12345", 42)] = {
             "providers": [{"slug": "provider_one", "name": "Provider One", "total_models": 1, "is_current": True}],
             "current_model": "model_1",
             "current_provider": "provider_one",
@@ -87,6 +118,7 @@ class TestTelegramModelPicker:
         query.data = "mb"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
@@ -107,7 +139,7 @@ class TestTelegramModelPicker:
         only fired when the callback raised."""
         adapter = _make_adapter()
         callback = AsyncMock(return_value="Switched to `gpt-5`")
-        adapter._model_picker_state["12345"] = {
+        adapter._model_picker_state[("12345", 42)] = {
             "providers": [
                 {"slug": "openai", "name": "OpenAI", "total_models": 1, "is_current": True}
             ],
@@ -124,6 +156,7 @@ class TestTelegramModelPicker:
         query.data = "mm:0"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -134,7 +167,7 @@ class TestTelegramModelPicker:
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
         assert "`gpt-5`" in edit_kwargs["text"]
-        assert "12345" not in adapter._model_picker_state
+        assert ("12345", 42) not in adapter._model_picker_state
 
     @pytest.mark.asyncio
     async def test_provider_group_folds_and_drills_down(self, monkeypatch):
@@ -196,6 +229,7 @@ class TestTelegramModelPicker:
         query = AsyncMock()
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 101
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -265,6 +299,7 @@ class TestTelegramModelPicker:
         query = AsyncMock()
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 101
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -275,7 +310,7 @@ class TestTelegramModelPicker:
         assert "mpv:0" in second_page
 
         await adapter._handle_model_picker_callback(query, "mp:zai", "12345")
-        assert adapter._model_picker_state["12345"]["selected_provider"] == "zai"
+        assert adapter._model_picker_state[("12345", 101)]["selected_provider"] == "zai"
 
         await adapter._handle_model_picker_callback(query, "mb", "12345")
         back_page = _callbacks(query.edit_message_text.call_args[1]["reply_markup"])
@@ -285,7 +320,7 @@ class TestTelegramModelPicker:
     async def test_expensive_model_requires_confirmation(self, monkeypatch):
         adapter = _make_adapter()
         callback = AsyncMock(return_value="Switched to `openai/gpt-5.5-pro`")
-        adapter._model_picker_state["12345"] = {
+        adapter._model_picker_state[("12345", 42)] = {
             "providers": [
                 {"slug": "openrouter", "name": "OpenRouter", "total_models": 1, "is_current": True}
             ],
@@ -307,13 +342,14 @@ class TestTelegramModelPicker:
         query = AsyncMock()
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
         await adapter._handle_model_picker_callback(query, "mm:0", "12345")
 
         callback.assert_not_awaited()
-        assert "12345" in adapter._model_picker_state
+        assert ("12345", 42) in adapter._model_picker_state
         first_edit = query.edit_message_text.call_args[1]
         assert "EXPENSIVE MODEL WARNING" in first_edit["text"]
         assert first_edit["reply_markup"] is not None
@@ -321,7 +357,7 @@ class TestTelegramModelPicker:
         await adapter._handle_model_picker_callback(query, "mc:0", "12345")
 
         callback.assert_awaited_once_with("12345", "openai/gpt-5.5-pro", "openrouter")
-        assert "12345" not in adapter._model_picker_state
+        assert ("12345", 42) not in adapter._model_picker_state
 
     @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):

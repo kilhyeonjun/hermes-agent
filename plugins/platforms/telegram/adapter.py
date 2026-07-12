@@ -685,8 +685,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
-        # Interactive model picker state per chat
-        self._model_picker_state: Dict[str, dict] = {}
+        # Interactive model picker state per Telegram chat + message.
+        self._model_picker_state: Dict[tuple[str, int], dict] = {}
+        # Session-only model/effort picker state per Telegram chat + message.
+        self._session_runtime_picker_state: Dict[tuple[str, int], dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -4887,8 +4889,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
-            self._model_picker_state[str(chat_id)] = {
+            # Telegram message IDs are unique only inside one chat.
+            state_key = (str(chat_id), msg.message_id)
+            if len(self._model_picker_state) >= 100:
+                self._model_picker_state.pop(next(iter(self._model_picker_state)))
+            self._model_picker_state[state_key] = {
                 "msg_id": msg.message_id,
                 "providers": providers,
                 "session_key": session_key,
@@ -4902,6 +4907,194 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] send_model_picker failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    @staticmethod
+    def _session_runtime_keyboard():
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎛 모델 선택", callback_data="sr:model"),
+                InlineKeyboardButton("🧠 추론 선택", callback_data="sr:effort"),
+            ],
+            [InlineKeyboardButton("⚡ Luna · low", callback_data="sr:luna")],
+            [InlineKeyboardButton("⚙️ Terra · medium", callback_data="sr:terra")],
+            [InlineKeyboardButton("🧠 Sol · high", callback_data="sr:sol")],
+            [InlineKeyboardButton("🔬 Sol · xhigh", callback_data="sr:xhigh")],
+            [InlineKeyboardButton("🚀 Sol · max", callback_data="sr:max")],
+            [InlineKeyboardButton("↩︎ 프로필 기본값", callback_data="sr:reset")],
+        ])
+
+    @staticmethod
+    def _session_fast_keyboard():
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⚡ FAST", callback_data="sf:fast"),
+                InlineKeyboardButton("○ NORMAL", callback_data="sf:normal"),
+            ],
+            [InlineKeyboardButton("↩︎ 프로필 기본값", callback_data="sf:reset")],
+        ])
+
+    @staticmethod
+    def _session_effort_keyboard():
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        efforts = ("none", *VALID_REASONING_EFFORTS)
+        buttons = [
+            InlineKeyboardButton(effort, callback_data=f"sr:e:{effort}")
+            for effort in efforts
+        ]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([InlineKeyboardButton("◀ 돌아가기", callback_data="sr:back")])
+        return InlineKeyboardMarkup(rows)
+
+    async def send_session_runtime_picker(
+        self,
+        chat_id: str,
+        session_key: str,
+        current_model: str,
+        current_effort: str,
+        on_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+        current_service_tier: Optional[str] = None,
+        mode: str = "model",
+    ) -> SendResult:
+        """Send button controls for one session only."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        thread_id = metadata.get("thread_id") if metadata else None
+        reply_to_id = self._reply_to_message_id_for_send(
+            None, metadata, reply_to_mode=self._reply_to_mode
+        )
+        if mode == "fast":
+            picker_text = (
+                "⚡ *세션 FAST 설정*\n\n"
+                f"현재 세션: `{'FAST' if current_service_tier == 'priority' else 'NORMAL'}`\n"
+                "범위: 이 토픽·세션만 적용"
+            )
+            keyboard = self._session_fast_keyboard()
+        else:
+            picker_text = (
+                "⚙ *이 세션만 설정*\n\n"
+                f"현재 세션: `{current_model or 'unknown'}` / `{current_effort or 'medium'}`\n"
+                "범위: 이 토픽·세션만 적용 · 다른 Telegram 세션·프로필·cron 영향 없음"
+            )
+            keyboard = self._session_runtime_keyboard()
+        try:
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=self.format_message(picker_text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            state_key = (str(chat_id), msg.message_id)
+            if len(self._session_runtime_picker_state) >= 100:
+                self._session_runtime_picker_state.pop(
+                    next(iter(self._session_runtime_picker_state))
+                )
+            self._session_runtime_picker_state[state_key] = {
+                "session_key": session_key,
+                "on_selected": on_selected,
+                "current_model": current_model,
+                "current_effort": current_effort,
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.warning("[%s] send_session_runtime_picker failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _handle_session_runtime_picker_callback(
+        self, query, data: str, chat_id: str
+    ) -> None:
+        """Navigate or apply one session-only model/reasoning selection."""
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        if not isinstance(message_id, int):
+            await query.answer(text="선택이 만료되었습니다. /session_model을 다시 실행하세요.")
+            return
+        state_key = (str(chat_id), message_id)
+        state = self._session_runtime_picker_state.get(state_key)
+        if not state:
+            await query.answer(text="선택이 만료되었습니다. /session_model을 다시 실행하세요.")
+            return
+
+        if data == "sr:effort":
+            await query.edit_message_text(
+                text=self.format_message(
+                    "🧠 *추론 수준 · 이 세션만*\n\n"
+                    f"현재: `{state.get('current_effort') or 'medium'}`"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=self._session_effort_keyboard(),
+            )
+            await query.answer()
+            return
+
+        if data == "sr:back":
+            await query.edit_message_text(
+                text=self.format_message(
+                    "⚙ *이 세션만 설정*\n\n"
+                    f"현재 세션: `{state.get('current_model') or 'unknown'}` / "
+                    f"`{state.get('current_effort') or 'medium'}`"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=self._session_runtime_keyboard(),
+            )
+            await query.answer()
+            return
+
+        preset_map = {
+            "sr:model": ("", "model"),
+            "sr:luna": ("gpt-5.6-luna", "low"),
+            "sr:terra": ("gpt-5.6-terra", "medium"),
+            "sr:sol": ("gpt-5.6-sol", "high"),
+            "sr:xhigh": ("gpt-5.6-sol", "xhigh"),
+            "sr:max": ("gpt-5.6-sol", "max"),
+            "sr:reset": ("", "reset"),
+            "sf:fast": ("", "fast"),
+            "sf:normal": ("", "normal"),
+            "sf:reset": ("", "reset"),
+        }
+        preset = preset_map.get(data)
+        if data.startswith("sr:e:"):
+            from hermes_constants import VALID_REASONING_EFFORTS
+
+            effort = data.removeprefix("sr:e:")
+            if effort in {"none", *VALID_REASONING_EFFORTS}:
+                preset = ("", effort)
+
+        callback = state.get("on_selected")
+        if not preset or not callback:
+            await query.answer(text="잘못된 선택입니다.")
+            return
+        try:
+            text = await callback(*preset)
+        except Exception as exc:
+            logger.warning("Session runtime selection failed: %s", exc)
+            await query.answer(text="설정에 실패했습니다.")
+            return
+        self._session_runtime_picker_state.pop(state_key, None)
+        answer_text = (
+            "상세 모델 선택기를 열었습니다."
+            if preset == ("", "model")
+            else "이 세션에만 적용했습니다."
+        )
+        await query.answer(text=answer_text)
+        try:
+            await query.edit_message_text(
+                text=self.format_message(text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.debug("Failed to finalize session runtime picker", exc_info=True)
 
     _PROVIDER_PAGE_SIZE = 10
     _MODEL_PAGE_SIZE = 8
@@ -5022,7 +5215,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        if not isinstance(message_id, int):
+            await query.answer(text="Picker expired — use /model again.")
+            return
+        state_key = (str(chat_id), message_id)
+        state = self._model_picker_state.get(state_key)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
             return
@@ -5185,7 +5383,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(
                 text="Switch failed." if switch_failed else "Model switched!"
             )
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mm:"):
             # --- Model selected: perform the switch ---
@@ -5268,7 +5466,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             # Clean up state
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mpg:"):
             # --- Provider group selected: show member providers ---
@@ -5342,7 +5540,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mx":
             # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
             await query.edit_message_text(
                 text="Model selection cancelled.",
                 reply_markup=None,
@@ -5392,6 +5590,28 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        model_callback_prefixes = (
+            "sr:", "sf:", "mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:",
+        )
+        if data.startswith(model_callback_prefixes):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to change models.")
+                return
+
+        # --- Session-only model/effort/fast picker callbacks ---
+        if data.startswith(("sr:", "sf:")):
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_session_runtime_picker_callback(query, data, chat_id)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

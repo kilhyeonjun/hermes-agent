@@ -1242,6 +1242,10 @@ class TestTelegramMenuCommands:
             "new",
             "stop",
             "status",
+            "model",
+            "session_model",
+            "fast",
+            "session_fast",
         ):
             assert name in names
 

@@ -1832,6 +1832,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+_SERVICE_TIER_UNSET = object()
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -2799,6 +2800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+    _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _startup_restore_in_progress: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
@@ -2968,6 +2970,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        # Per-session Priority Processing overrides from /fast.
+        # Presence distinguishes explicit normal (None) from profile default.
+        self._session_service_tier_overrides: Dict[str, Optional[str]] = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -3884,7 +3889,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        service_tier: object = _SERVICE_TIER_UNSET,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -3917,7 +3929,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
 
-        service_tier = getattr(self, "_service_tier", None)
+        if service_tier is _SERVICE_TIER_UNSET:
+            service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
             route["request_overrides"] = {}
             return route
@@ -4880,6 +4893,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "priority"
         logger.warning("Unknown service_tier '%s', ignoring", raw)
         return None
+
+    def _resolve_session_service_tier(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> str | None:
+        """Resolve Priority Processing for one session before profile default."""
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+
+        overrides = getattr(self, "_session_service_tier_overrides", {}) or {}
+        if resolved_session_key and resolved_session_key in overrides:
+            return overrides[resolved_session_key]
+        return self._load_service_tier()
+
+    def _set_session_service_tier_override(
+        self,
+        session_key: str,
+        service_tier: str | None,
+        *,
+        clear: bool = False,
+    ) -> None:
+        """Set explicit fast/normal for a session, or clear back to profile default."""
+        if not session_key:
+            return
+        if not hasattr(self, "_session_service_tier_overrides"):
+            self._session_service_tier_overrides = {}
+        if clear:
+            self._session_service_tier_overrides.pop(session_key, None)
+        else:
+            self._session_service_tier_overrides[session_key] = service_tier
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -7701,6 +7750,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # finalization, /new, and /reset clear them.)
                         self._session_model_overrides.pop(key, None)
                         self._set_session_reasoning_override(key, None)
+                        self._set_session_service_tier_override(key, None, clear=True)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
                         # Clear per-session model cache so a resumed turn
@@ -9788,6 +9838,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "session-model":
+            return await self._handle_session_model_command(event)
+
+        if canonical == "session-fast":
+            return await self._handle_session_fast_command(event)
+
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
@@ -9865,6 +9921,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "codex-usage":
             return await self._handle_codex_usage_command(event)
+
+        if canonical == "codex-route":
+            return await self._handle_codex_route_command(event)
+
+        if canonical == "codex-account":
+            return await self._handle_codex_account_command(event)
 
         if canonical == "credits":
             return await self._handle_credits_command(event)
@@ -10814,6 +10876,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # or a queued "/model switched" note.
             self._session_model_overrides.pop(session_key, None)
             self._set_session_reasoning_override(session_key, None)
+            self._set_session_service_tier_override(session_key, None, clear=True)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
             # Clear per-session model cache so the fresh session resolves
@@ -11830,6 +11893,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._evict_cached_agent(session_key)
                 self._session_model_overrides.pop(session_key, None)
                 self._set_session_reasoning_override(session_key, None)
+                self._set_session_service_tier_override(session_key, None, clear=True)
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
                 # Clear per-session model cache so the post-reset turn
@@ -13268,8 +13332,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
-            self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            service_tier = self._resolve_session_service_tier(source=source)
+            self._service_tier = service_tier
+            turn_route = self._resolve_turn_agent_config(
+                prompt,
+                model,
+                runtime_kwargs,
+                service_tier=service_tier,
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -13298,7 +13368,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -17918,7 +17988,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
             )
             self._reasoning_config = reasoning_config
-            self._service_tier = self._load_service_tier()
+            service_tier = self._resolve_session_service_tier(
+                source=source,
+                session_key=session_key,
+            )
+            self._service_tier = service_tier
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
@@ -18033,7 +18107,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+                service_tier=service_tier,
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -18183,7 +18262,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -18273,7 +18352,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
-            agent.service_tier = self._service_tier
+            agent.service_tier = service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 
             _bg_review_release = threading.Event()
