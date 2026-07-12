@@ -2355,3 +2355,68 @@ class TestProviderEnabledRuntimeGate:
             assert "disabled" not in str(e).lower()
         except Exception:
             pass  # any non-ValueError is fine; we only gate the disabled path
+class TestNamedProfileV31Migration:
+    def test_v31_to_v33_preserves_profile_owned_runtime_values(self, tmp_path):
+        default_home = tmp_path / ".hermes"
+        profile_home = default_home / "profiles" / "penguincouple"
+        profile_home.mkdir(parents=True)
+        default_config = default_home / "config.yaml"
+        default_config.write_text(
+            "_config_version: 33\nmodel:\n  default: default-sentinel\n",
+            encoding="utf-8",
+        )
+        profile_config = profile_home / "config.yaml"
+        original = {
+            "_config_version": 31,
+            "agent": {"verify_on_stop": True, "max_turns": 321},
+            "delegation": {
+                "max_async_children": 7,
+                "max_concurrent_children": 4,
+            },
+            "mcp_servers": {
+                "family-rag": {
+                    "url": "http://127.0.0.1:8765/mcp",
+                    "enabled": True,
+                }
+            },
+            "plugins": {
+                "enabled": ["ponytail", "caveman-session"],
+                "disabled": [],
+            },
+            "model": {
+                "default": "gpt-5.6-sol",
+                "provider": "openai-codex",
+            },
+            "approvals": {"mode": "ask", "allowed_tools": ["read_file"]},
+            "terminal": {
+                "backend": "local",
+                "cwd": "/Users/penguin/wiki/kh",
+            },
+            "browser": {"provider": "browser-harness"},
+        }
+        profile_config.write_text(
+            yaml.safe_dump(original, sort_keys=False), encoding="utf-8"
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+            migrate_config(interactive=False, quiet=True)
+
+        migrated = yaml.safe_load(profile_config.read_text(encoding="utf-8"))
+        assert migrated["_config_version"] == 33
+        assert migrated["agent"] == {"verify_on_stop": False, "max_turns": 321}
+        assert migrated["delegation"] == {"max_concurrent_children": 7}
+        for key in (
+            "mcp_servers",
+            "plugins",
+            "model",
+            "approvals",
+            "terminal",
+            "browser",
+        ):
+            assert migrated[key] == original[key]
+        assert yaml.safe_load(default_config.read_text(encoding="utf-8")) == {
+            "_config_version": 33,
+            "model": {"default": "default-sentinel"},
+        }
+
+
