@@ -40,3 +40,54 @@ async def test_codex_route_handler_rejects_unknown_mode_without_subprocess():
     run.assert_not_called()
     assert "사용법" in result
     assert "/codex_route auto" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_codex_route_handler_force_redacts_child_output(returncode):
+    from agent import redact
+
+    runner = _runner()
+    event = MagicMock()
+    event.get_command_args.return_value = "company"
+    secret = "sk" + "-proj-" + ("X" * 40)
+    auth_header = "Author" + "ization: Bearer "
+    token_field = "access_" + "token"
+    diagnostic = (
+        f"route {'applied' if returncode == 0 else 'failed'}\n"
+        f"{auth_header}{secret}\n"
+        f'{{"{token_field}":"{secret}"}}'
+    )
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=returncode,
+        stdout=diagnostic if returncode == 0 else "",
+        stderr=diagnostic if returncode else "",
+    )
+
+    with patch.object(redact, "_REDACT_ENABLED", False), patch(
+        "subprocess.run", return_value=completed
+    ):
+        result = await runner._handle_codex_route_command(event)
+
+    assert secret not in result
+    assert ("applied" if returncode == 0 else "failed") in result
+
+
+@pytest.mark.asyncio
+async def test_codex_route_handler_force_redacts_launch_exception():
+    from agent import redact
+
+    runner = _runner()
+    event = MagicMock()
+    event.get_command_args.return_value = "company"
+    secret = "sk" + "-proj-" + ("Y" * 40)
+    failure = OSError(("Author" + "ization: Bearer ") + secret)
+
+    with patch.object(redact, "_REDACT_ENABLED", False), patch(
+        "subprocess.run", side_effect=failure
+    ):
+        result = await runner._handle_codex_route_command(event)
+
+    assert secret not in result
+    assert "Codex 라우팅 변경 실패" in result

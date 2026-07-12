@@ -46,6 +46,46 @@ def test_sync_all_profiles_invokes_tracked_module_without_shell(monkeypatch, tmp
         assert ("--skip-cliproxy" in argv) is (name != "default")
 
 
+def test_profile_sync_failure_redacts_child_output(monkeypatch, tmp_path):
+    from hermes_cli import codex_route
+
+    secret = "sk" + "-" + "abcdefghijklmnopqrstuv"
+    auth_header = "Author" + "ization: Bearer "
+    token_field = "access_" + "token"
+    result = subprocess.CompletedProcess(
+        ["python", "-m", "hermes_cli.codex_priority_sync"],
+        1,
+        "",
+        f'{auth_header}{secret}\n{{"{token_field}":"{secret}"}}\n',
+    )
+    monkeypatch.setattr(codex_route.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    detail = codex_route._sync_profile("gameduo", tmp_path / "gameduo")
+
+    assert detail is not None
+    assert secret not in detail
+    assert detail.startswith("gameduo: " + auth_header)
+
+
+def test_profile_sync_launch_error_is_force_redacted(monkeypatch, tmp_path):
+    from agent import redact
+    from hermes_cli import codex_route
+
+    secret = "sk" + "-proj-" + ("Z" * 40)
+    failure = OSError(("Author" + "ization: Bearer ") + secret)
+
+    def fail_run(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(codex_route.subprocess, "run", fail_run)
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+
+    detail = codex_route._sync_profile("gameduo", tmp_path / "gameduo")
+
+    assert secret not in detail
+    assert detail.startswith("gameduo: sync launch failed: ")
+
+
 def test_partial_profile_failure_restores_policy_and_attempts_full_rollback(monkeypatch, tmp_path, capsys):
     from hermes_cli import codex_route
 

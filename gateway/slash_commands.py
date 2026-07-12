@@ -31,6 +31,7 @@ from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from agent.redact import redact_sensitive_text
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
@@ -4414,9 +4415,13 @@ class GatewaySlashCommandsMixin:
         try:
             proc = await asyncio.to_thread(_run_control)
         except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("/codex-route failed: %s", exc)
-            return f"❌ Codex 라우팅 변경 실패: {exc}"
-        output = (proc.stdout or proc.stderr or "").strip()
+            safe_exc = redact_sensitive_text(str(exc), force=True)
+            logger.warning("/codex-route failed: %s", safe_exc)
+            return f"❌ Codex 라우팅 변경 실패: {safe_exc}"
+        output = redact_sensitive_text(
+            (proc.stdout or proc.stderr or "").strip(),
+            force=True,
+        )
         return output if proc.returncode == 0 else (output or "❌ Codex 라우팅 변경에 실패했습니다.")
 
     async def _handle_codex_account_command(self, event: MessageEvent) -> str:
