@@ -398,7 +398,17 @@ class HonchoSessionManager:
 
         local_messages = []
         for msg in existing_messages:
-            role = "assistant" if msg.peer_id == assistant_peer_id else "user"
+            if msg.peer_id == assistant_peer_id:
+                role = "assistant"
+            elif msg.peer_id == user_peer_id:
+                role = "user"
+            else:
+                logger.warning(
+                    "Skipping Honcho message from unknown peer '%s' in session '%s'",
+                    msg.peer_id,
+                    honcho_session_id,
+                )
+                continue
             local_messages.append({
                 "role": role,
                 "content": msg.content,

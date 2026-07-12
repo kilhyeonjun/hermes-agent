@@ -200,7 +200,7 @@ Pick **[e]** at the prompt to set the three keys directly instead of going throu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `sessionStrategy` | string | `"per-directory"` | `"per-directory"`, `"per-session"`, `"per-repo"` (git root), `"global"` |
-| `sessionPeerPrefix` | bool | `false` | Prepend peer name to session keys |
+| `sessionPeerPrefix` | bool | `false` | Prefix generated session-ID/title/repo/directory keys; not gateway, manual-map, or global keys |
 | `sessions` | object | `{}` | Manual directory-to-session-name mappings |
 
 #### Session Name Resolution
@@ -209,17 +209,17 @@ The Honcho session name determines which conversation bucket memory lands in. Re
 
 | Priority | Source | Example session name |
 |----------|--------|---------------------|
-| 1 | Manual map (`sessions` config) | `"myproject-main"` |
-| 2 | `/title` command (mid-session rename) | `"refactor-auth"` |
-| 3 | Gateway session key (Telegram, Discord, etc.) | `"agent-main-telegram-dm-8439114563"` |
-| 4 | `per-session` strategy | Hermes session ID (`20260415_a3f2b1`) |
+| 1 | Gateway session key (Telegram, Discord, etc.) | `"agent-main-telegram-dm-8439114563"` |
+| 2 | `per-session` strategy | Hermes session ID (`20260415_a3f2b1`) |
+| 3 | Manual map (`sessions` config) | `"myproject-main"` |
+| 4 | `/title` command (mid-session rename) | `"refactor-auth"` |
 | 5 | `per-repo` strategy | Git root directory name (`hermes-agent`) |
 | 6 | `per-directory` strategy | Current directory basename (`src`) |
 | 7 | `global` strategy | Workspace name (`hermes`) |
 
-Gateway platforms always resolve via priority 3 (per-chat isolation) regardless of `sessionStrategy`. The strategy setting only affects CLI sessions.
+Gateway platforms always resolve via priority 1 (per-chat isolation) regardless of `sessionStrategy`. The strategy setting only affects CLI sessions. For a named Hermes profile, the legacy `agent:main:*` key is rewritten only for the Honcho remote session (for example, `agent:gameduo:*`); the gateway's local database key is unchanged. Default-like profiles (`default`, `custom`, `main`, `hermes`) preserve `agent:main:*`, and already namespaced keys are left alone.
 
-If `sessionPeerPrefix` is `true`, the peer name is prepended: `alice-hermes-agent`.
+If `sessionPeerPrefix` is `true`, the peer name is prepended to generated session-ID, title, repository, and directory keys: `alice-hermes-agent`. Gateway keys, manual-map values, and the global workspace key are not affected.
 
 #### What each strategy produces
 

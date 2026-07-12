@@ -371,6 +371,21 @@ class HonchoMemoryProvider(MemoryProvider):
         """Resolve the Honcho session key without touching the network."""
         session_title = kwargs.get("session_title")
         gateway_session_key = kwargs.get("gateway_session_key")
+        agent_identity = kwargs.get("agent_identity")
+
+        # The gateway's local session key remains the stable lookup key. Only
+        # the copy sent to Honcho is profile-scoped so multiple named profiles
+        # cannot write into the legacy ``agent:main:*`` remote session.
+        if gateway_session_key and gateway_session_key.startswith("agent:main:"):
+            profile = re.sub(
+                r"[^a-zA-Z0-9_-]+", "-", str(agent_identity or "")
+            ).strip("-").lower()
+            if profile and profile not in {
+                "default", "custom", "main", "hermes"
+            }:
+                gateway_session_key = (
+                    f"agent:{profile}:" + gateway_session_key[len("agent:main:"):]
+                )
         return (
             cfg.resolve_session_name(
                 session_title=session_title,
@@ -1219,6 +1234,8 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if self._cron_skipped:
             return
+        if self._config is not None and not getattr(self._config, "save_messages", True):
+            return
         if self._recall_mode == "tools" and not self._session_ready():
             return
         if not self._session_ready():
@@ -1236,7 +1253,7 @@ class HonchoMemoryProvider(MemoryProvider):
                     session.add_message("user", chunk)
                 for chunk in self._chunk_message(clean_assistant_content, msg_limit):
                     session.add_message("assistant", chunk)
-                self._manager._flush_session(session)
+                self._manager.save(session)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 
