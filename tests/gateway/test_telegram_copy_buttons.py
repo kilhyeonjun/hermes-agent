@@ -90,11 +90,12 @@ def _make_adapter(monkeypatch):
 
 
 def test_extract_copy_buttons_strips_valid_markers_only():
-    content = """VNC 주소
-COPY_BUTTON: Mac mini IP | 100.96.33.123
-body remains
-COPY_BUTTON: bad | 
-"""
+    content = (
+        "VNC 주소\n"
+        "COPY_BUTTON: Mac mini IP | 100.96.33.123\n"
+        "body remains\n"
+        "COPY_BUTTON: bad | \n"
+    )
 
     stripped, buttons = _extract_copy_buttons(content)
 
