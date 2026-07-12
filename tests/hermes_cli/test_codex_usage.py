@@ -1,15 +1,28 @@
 from hermes_cli.codex_usage import (
     annotate_usage_trends,
     apply_alert_policy,
+    collect,
     compute_recommendation,
     load_history,
     render_alert,
     render_compact,
     render_credential_insights,
+    render_text,
     save_history_snapshot,
     summarize_window,
     usage_bar,
 )
+
+
+def test_codex_route_command_registered_with_telegram_alias():
+    from hermes_cli.commands import resolve_command
+
+    command = resolve_command("codex_route")
+
+    assert command is not None
+    assert command.name == "codex-route"
+    assert command.args_hint == "[status|auto|personal|company]"
+    assert command.gateway_only is True
 
 
 def test_risk_policy_supports_per_window_thresholds():
@@ -36,6 +49,50 @@ def test_risk_policy_supports_per_window_thresholds():
     assert [event["label"] for event in events] == ["personal-backup"]
     assert events[0]["window"] == "7d"
     assert events[0]["used"] == 86
+
+
+def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_path):
+    class Entry:
+        def __init__(self, label, priority):
+            self.id = f"id-{label}"
+            self.label = label
+            self.priority = priority
+            self.source = "manual"
+            self.last_status = None
+            self.last_error_reset_at = None
+            self.extra = {}
+            self.runtime_api_key = f"token-{label}"
+
+    entries = [Entry("personal-backup", 0), Entry("company-plus-100", 10)]
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, *, clear_expired=False, refresh=False):
+            return entries
+
+        def entries(self):
+            return entries
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(
+        "hermes_cli.codex_usage.fetch_usage",
+        lambda _token, account_id=None: {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 1},
+                "secondary_window": {"used_percent": 1, "reset_at": "2099-07-17T06:40:00+09:00"},
+            },
+        },
+    )
+
+    payload = collect()
+
+    assert payload["routing"] == {"strategy": "fill_first", "current_label": "personal-backup"}
+    assert [row["credential_id"] for row in payload["accounts"]] == [
+        "id-personal-backup",
+        "id-company-plus-100",
+    ]
 
 
 def test_recommendation_prefers_soonest_weekly_reset_then_usage_fallback():
@@ -332,15 +389,107 @@ def test_render_compact_includes_risk_and_recommendation():
     text = render_compact(payload)
 
     assert "🧭 Codex 사용량" in text
-    assert "✅ 추천 company-plus-100" in text
-    assert "사유:" in text
-    assert "personal-backup 7d 98%" in text
-    assert "⏱ 다음 회복: personal-backup 5h" in text
-    assert "🚦 위험 회복: personal-backup 7d" in text
-    assert "company-plus-100" in text
+    assert "✅ 추천 company" in text
+    assert "personal 7d 98% · 회복 전 보류" in text
+    assert "⏱ 다음 회복 · personal 5h" in text
+    assert "🚦 위험 회복 · personal 7d" in text
+    assert "company" in text
     assert "5h  1% 🟢" in text
     assert "7d 54% 🟢" in text
     assert "[" in text and "]" in text
+
+
+def test_render_compact_highlights_current_account_and_reduces_duplicate_detail():
+    payload = {
+        "checked_at": "2026-07-10T07:53:00+09:00",
+        "routing": {"strategy": "fill_first", "current_label": "personal-backup"},
+        "accounts": [
+            {
+                "label": "personal-backup",
+                "ok": True,
+                "plan_type": "pro",
+                "primary_window": {
+                    "used_percent": 27,
+                    "remaining": "3h 47m",
+                    "reset_at": "2026-07-10T11:40:00+09:00",
+                },
+                "secondary_window": {
+                    "used_percent": 4,
+                    "remaining": "6d 22h 47m",
+                    "reset_at": "2026-07-17T06:40:00+09:00",
+                },
+            },
+            {
+                "label": "company-plus-100",
+                "ok": True,
+                "plan_type": "prolite",
+                "primary_window": {
+                    "used_percent": 7,
+                    "remaining": "3h 53m",
+                    "reset_at": "2026-07-10T11:47:00+09:00",
+                },
+                "secondary_window": {
+                    "used_percent": 1,
+                    "remaining": "6d 22h 53m",
+                    "reset_at": "2026-07-17T06:47:00+09:00",
+                },
+            },
+        ],
+        "recommendation": {
+            "label": "personal-backup",
+            "reason": "7d reset 07/17 06:40 · 6d 22h 47m, 7d 4%, 5h 27%",
+        },
+    }
+
+    text = render_compact(payload)
+
+    assert "▶ 현재 personal · ✅ 추천과 일치" in text
+    assert "└ 7d 리셋이 가장 빠름 · 07/17 06:40 (6d 22h 47m)" in text
+    assert "⏱ 다음 회복 · personal 5h" in text
+    assert "└ 07/10 11:40 (3h 47m)" in text
+    assert "▶ personal · pro · 현재·추천" in text
+    assert "○ company · prolite" in text
+    assert "reset " not in text
+    assert text.count("7d 4%") == 0
+
+
+def test_render_compact_distinguishes_fixed_route_from_automatic_recommendation():
+    payload = {
+        "checked_at": "2026-07-10T08:30:00+09:00",
+        "routing": {
+            "strategy": "fill_first",
+            "current_label": "company-plus-100",
+            "mode": "fixed",
+            "fixed_credential_id": "company-id",
+            "fixed_label": "company-plus-100",
+        },
+        "accounts": [
+            {
+                "credential_id": "company-id",
+                "label": "company-plus-100",
+                "ok": True,
+                "plan_type": "prolite",
+                "primary_window": {"used_percent": 7, "remaining": "3h", "reset_at": "2026-07-10T11:47:00+09:00"},
+                "secondary_window": {"used_percent": 1, "remaining": "6d", "reset_at": "2026-07-17T06:47:00+09:00"},
+            },
+            {
+                "credential_id": "personal-id",
+                "label": "personal-backup",
+                "ok": True,
+                "plan_type": "pro",
+                "primary_window": {"used_percent": 50, "remaining": "3h", "reset_at": "2026-07-10T11:40:00+09:00"},
+                "secondary_window": {"used_percent": 8, "remaining": "6d", "reset_at": "2026-07-17T06:40:00+09:00"},
+            },
+        ],
+        "recommendation": {"label": "personal-backup", "policy": "7d-reset-aware"},
+    }
+
+    text = render_compact(payload)
+
+    assert "▶ 현재 company · 🔒 고정" in text
+    assert "💡 자동 추천 personal · 고정 모드라 미적용" in text
+    assert "▶ company · prolite · 현재·고정" in text
+    assert "★ personal · pro · 자동추천" in text
 
 
 def test_render_alert_uses_card_layout_with_bar_and_recommendation():
@@ -366,9 +515,35 @@ def test_render_alert_uses_card_layout_with_bar_and_recommendation():
     text = render_alert(payload, primary_threshold=95, secondary_threshold=85)
 
     assert "🚨 Codex 한도 주의" in text
-    assert "personal-backup · 7d 98%" in text
+    assert "personal · 7d 98%" in text
     assert "[██████████]" in text
-    assert "✅ 추천 company-plus-100" in text
+    assert "✅ 추천 company" in text
+    assert "personal-backup" not in text
+    assert "company-plus-100" not in text
+
+
+def test_render_text_uses_display_aliases_without_mutating_payload_labels():
+    payload = {
+        "checked_at": "2026-07-10T09:34:00+09:00",
+        "accounts": [
+            {
+                "label": "personal-backup",
+                "ok": True,
+                "plan_type": "pro",
+                "primary_window": {"used_percent": 100},
+                "secondary_window": {"used_percent": 16},
+            }
+        ],
+        "recommendation": {"label": "company-plus-100", "reason": "7d reset 우선"},
+    }
+
+    text = render_text(payload)
+
+    assert "추천: company" in text
+    assert "[personal]" in text
+    assert "personal-backup" not in text
+    assert "company-plus-100" not in text
+    assert payload["accounts"][0]["label"] == "personal-backup"
 
 
 def test_usage_bar_visualizes_percent_buckets():
@@ -401,11 +576,13 @@ def test_render_credential_insights_groups_rows_readably():
     text = render_credential_insights(rows, provider="openai-codex", days=30)
 
     assert "📊 Codex credential 사용량 · 30d" in text
-    assert "personal-backup" in text
+    assert "personal" in text
     assert "1.48M tokens · 10 calls" in text
     assert "avg 147.7k/call" in text
-    assert "company-plus-100" in text
+    assert "company" in text
     assert "200.0k tokens · 2 calls" in text
+    assert "personal-backup" not in text
+    assert "company-plus-100" not in text
 
 
 def test_render_credential_insights_shows_share_and_cache_breakdown():

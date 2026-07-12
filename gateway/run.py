@@ -11010,6 +11010,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "codex-usage":
             return await self._handle_codex_usage_command(event)
 
+        if canonical == "codex-route":
+            return await self._handle_codex_route_command(event)
+
+        if canonical == "codex-account":
+            return await self._handle_codex_account_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 

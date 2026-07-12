@@ -23,6 +23,16 @@ DEFAULT_WATERMARK = get_hermes_home() / "state" / "codex_usage_alerts.json"
 DEFAULT_HISTORY = get_hermes_home() / "state" / "codex_usage_history.jsonl"
 TREND_TARGETS = (80, 95, 100)
 MIN_TREND_SAMPLE_SECONDS = 10 * 60
+DISPLAY_LABELS = {
+    "personal-backup": "personal",
+    "company-plus-100": "company",
+}
+
+
+def display_label(label: Any) -> str:
+    """Return the stable user-facing alias without changing internal IDs."""
+    raw = str(label or "unknown")
+    return DISPLAY_LABELS.get(raw, raw)
 
 
 def local_dt(epoch: Any) -> Optional[datetime]:
@@ -108,13 +118,16 @@ def collect() -> Dict[str, Any]:
     # inspect the full pool. Quota reporting must include exhausted credentials
     # too; otherwise a 7d-reset-aware recommendation cannot see the account that
     # is about to recover next.
-    pool._available_entries(clear_expired=True, refresh=True)  # intentional internal API
+    available_entries = pool._available_entries(clear_expired=True, refresh=True)  # intentional internal API
     entries = pool.entries()
+    strategy = str(getattr(pool, "_strategy", "fill_first"))
+    current_entry = available_entries[0] if strategy == "fill_first" and available_entries else pool.current()
     now = datetime.now().astimezone()
     rows: list[dict[str, Any]] = []
     for entry in entries:
         exhausted_until = local_dt(entry.last_error_reset_at)
         row: Dict[str, Any] = {
+            "credential_id": entry.id,
             "label": entry.label,
             "priority": entry.priority,
             "source": entry.source,
@@ -150,7 +163,15 @@ def collect() -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - CLI report should survive per-account failures
             row.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
         rows.append(row)
-    payload = {"checked_at": now.isoformat(timespec="seconds"), "provider": "openai-codex", "accounts": rows}
+    payload = {
+        "checked_at": now.isoformat(timespec="seconds"),
+        "provider": "openai-codex",
+        "routing": {
+            "strategy": strategy,
+            "current_label": current_entry.label if current_entry else None,
+        },
+        "accounts": rows,
+    }
     payload["recommendation"] = compute_recommendation(rows)
     return payload
 
@@ -421,10 +442,10 @@ def render_text(payload: Dict[str, Any]) -> str:
         return "\n".join(lines)
     recommendation = payload.get("recommendation") or {}
     if recommendation:
-        lines.append(f"추천: {recommendation.get('label')} ({recommendation.get('reason')})")
+        lines.append(f"추천: {display_label(recommendation.get('label'))} ({recommendation.get('reason')})")
     for row in accounts:
         lines.append("")
-        lines.append(f"[{row.get('label')}] plan={row.get('plan_type', 'unknown')} status={row.get('last_status', 'unknown')}")
+        lines.append(f"[{display_label(row.get('label'))}] plan={row.get('plan_type', 'unknown')} status={row.get('last_status', 'unknown')}")
         if not row.get("ok"):
             lines.append(f"  ERROR: {row.get('http', '')} {row.get('error', '')}".rstrip())
             continue
@@ -523,10 +544,13 @@ def _recommendation_explanation(payload: Dict[str, Any]) -> str:
         for display, _key, window in iter_windows(row):
             used = _window_used(window)
             if used is not None and used >= 80:
-                blockers.append((used, f"{label} {display} {_fmt_percent(used).strip()}"))
+                blockers.append((used, f"{display_label(label)} {display} {_fmt_percent(used).strip()}"))
     blocked = recommendation.get("blocked")
     if blocked:
-        return f"사유: 7d reset 우선 정책 · 제외: {blocked}"
+        display_blocked = str(blocked)
+        for raw, alias in DISPLAY_LABELS.items():
+            display_blocked = display_blocked.replace(raw, alias)
+        return f"사유: 7d reset 우선 정책 · 제외: {display_blocked}"
     if blockers:
         blockers.sort(reverse=True)
         return f"사유: {blockers[0][1]}로 회복 전까지 보류"
@@ -534,8 +558,14 @@ def _recommendation_explanation(payload: Dict[str, Any]) -> str:
     return f"사유: 7d reset이 가장 가까운 사용 가능 계정 ({reason})" if reason else ""
 
 
-def _next_reset(accounts: list[dict[str, Any]], min_used: Optional[float] = None) -> Optional[dict[str, str]]:
+def _next_reset(
+    accounts: list[dict[str, Any]],
+    min_used: Optional[float] = None,
+    *,
+    reference_time: Optional[datetime] = None,
+) -> Optional[dict[str, str]]:
     candidates: list[tuple[datetime, dict[str, str]]] = []
+    now = reference_time or datetime.now().astimezone()
     for row in accounts:
         if not row.get("ok"):
             continue
@@ -546,7 +576,7 @@ def _next_reset(accounts: list[dict[str, Any]], min_used: Optional[float] = None
                 continue
             reset_at = window.get("reset_at")
             dt = local_dt(reset_at)
-            if dt is None or dt <= datetime.now().astimezone():
+            if dt is None or dt <= now:
                 continue
             candidates.append(
                 (
@@ -626,42 +656,120 @@ def _burn_summary(payload: Dict[str, Any]) -> str:
     return "🔥 Burn: " + " · ".join(parts) if parts else ""
 
 
+def _routing_current_label(payload: Dict[str, Any]) -> Optional[str]:
+    routing = payload.get("routing") or {}
+    label = routing.get("current_label")
+    return str(label) if label else None
+
+
+def _compact_recommendation_lines(payload: Dict[str, Any]) -> list[str]:
+    recommendation = payload.get("recommendation") or {}
+    rec_label = recommendation.get("label")
+    routing = payload.get("routing") or {}
+    current_label = _routing_current_label(payload)
+    fixed_route = routing.get("mode") == "fixed"
+    lines: list[str] = []
+
+    if current_label:
+        if fixed_route:
+            suffix = " · 🔒 고정"
+        else:
+            suffix = " · ✅ 추천과 일치" if rec_label and str(rec_label) == current_label else ""
+        lines.append(f"▶ 현재 {display_label(current_label)}{suffix}")
+    if rec_label and fixed_route:
+        if str(rec_label) == current_label:
+            lines.append("💡 자동 추천과도 일치")
+        else:
+            lines.append(f"💡 자동 추천 {display_label(rec_label)} · 고정 모드라 미적용")
+    elif rec_label and str(rec_label) != current_label:
+        lines.append(f"✅ 추천 {display_label(rec_label)}")
+
+    blocked = recommendation.get("blocked")
+    if blocked:
+        display_blocked = str(blocked)
+        for raw, alias in DISPLAY_LABELS.items():
+            display_blocked = display_blocked.replace(raw, alias)
+        lines.append(f"└ 7d 리셋 우선 · 제외: {display_blocked}")
+        return lines
+
+    blockers: list[tuple[float, str]] = []
+    for row in payload.get("accounts") or []:
+        label = row.get("label")
+        if not row.get("ok") or label == rec_label:
+            continue
+        for display, _key, window in iter_windows(row):
+            used = _window_used(window)
+            if used is not None and used >= 80:
+                blockers.append((used, f"{display_label(label)} {display} {_fmt_percent(used).strip()}"))
+    if blockers:
+        blockers.sort(reverse=True)
+        lines.append(f"└ {blockers[0][1]} · 회복 전 보류")
+        return lines
+
+    row = _recommended_row(payload)
+    secondary = (row or {}).get("secondary_window") or {}
+    if rec_label and secondary:
+        lines.append(
+            f"└ 7d 리셋이 가장 빠름 · {short_reset(secondary.get('reset_at'))} "
+            f"({secondary.get('remaining', '?')})"
+        )
+    return lines
+
+
 def render_compact(payload: Dict[str, Any]) -> str:
     accounts = payload.get("accounts") or []
     worst = _worst_risk(accounts)
     lines = [f"🧭 Codex 사용량 · {short_checked_at(payload.get('checked_at'))} · {worst.get('icon')} {worst.get('label')}"]
-    recommendation = payload.get("recommendation") or {}
-    if recommendation:
-        lines.append(f"✅ 추천 {recommendation.get('label')} — {recommendation.get('reason')}")
-        explanation = _recommendation_explanation(payload)
-        if explanation:
-            lines.append(explanation)
+    lines.extend(_compact_recommendation_lines(payload))
     burn_summary = _burn_summary(payload)
     if burn_summary:
         lines.append(burn_summary)
-    next_reset = _next_reset(accounts)
+    reference_time = local_dt(payload.get("checked_at"))
+    next_reset = _next_reset(accounts, reference_time=reference_time)
     if next_reset:
-        lines.append(f"⏱ 다음 회복: {next_reset['label']} {next_reset['window']} · {next_reset['remaining']} ({next_reset['reset']})")
-    risk_reset = _next_reset(accounts, min_used=95)
+        lines.append(f"\n⏱ 다음 회복 · {display_label(next_reset['label'])} {next_reset['window']}")
+        lines.append(f"└ {next_reset['reset']} ({next_reset['remaining']})")
+    risk_reset = _next_reset(accounts, min_used=95, reference_time=reference_time)
     if risk_reset and risk_reset != next_reset:
-        lines.append(f"🚦 위험 회복: {risk_reset['label']} {risk_reset['window']} · {risk_reset['remaining']} ({risk_reset['reset']})")
+        lines.append(f"🚦 위험 회복 · {display_label(risk_reset['label'])} {risk_reset['window']}")
+        lines.append(f"└ {risk_reset['reset']} ({risk_reset['remaining']})")
     if not accounts:
         lines.append("계정 없음")
         return "\n".join(lines)
+
+    current_label = _routing_current_label(payload)
+    routing = payload.get("routing") or {}
+    fixed_route = routing.get("mode") == "fixed"
+    rec_label = str((payload.get("recommendation") or {}).get("label") or "")
     for row in accounts:
-        label = row.get("label")
+        label = str(row.get("label"))
         plan = row.get("plan_type") or "unknown"
+        is_current = bool(current_label and label == current_label)
+        is_recommended = bool(rec_label and label == rec_label)
+        marker = "▶" if is_current else "★" if is_recommended else "○"
+        tags = ""
+        if fixed_route and is_current:
+            tags = " · 현재·고정"
+        elif fixed_route and is_recommended:
+            tags = " · 자동추천"
+        elif is_current and is_recommended:
+            tags = " · 현재·추천"
+        elif is_current:
+            tags = " · 현재"
+        elif is_recommended:
+            tags = " · 추천"
         if not row.get("ok"):
-            lines.append(f"\n❌ {label} · {plan}")
+            lines.append(f"\n❌ {display_label(label)} · {plan}{tags}")
             lines.append(f"└ ERROR {row.get('http', '')} {row.get('error', '')}".rstrip())
             continue
-        lines.append(f"\n• {label} · {plan}")
+        lines.append(f"\n{marker} {display_label(label)} · {plan}{tags}")
         for display, key, window in iter_windows(row):
             r = window.get("risk") or risk(window.get("used_percent"))
             used = window.get("used_percent")
             line = (
                 f"  {display:>2} {_fmt_percent(used)} {r.get('icon')} "
-                f"[{usage_bar(used)}] reset {short_reset(window.get('reset_at'))} · {window.get('remaining', '?')}"
+                f"[{usage_bar(used)}] · {short_reset(window.get('reset_at'))} "
+                f"({window.get('remaining', '?')})"
             )
             trend_detail = _render_trend_detail(_trend_for(row, key))
             if trend_detail:
@@ -766,15 +874,15 @@ def render_alert(
     for event in events:
         if event.get("error"):
             row = event["row"]
-            lines.append(f"\n❌ {row.get('label')}")
+            lines.append(f"\n❌ {display_label(row.get('label'))}")
             lines.append(f"└ ERROR {row.get('http', '')} {row.get('error', '')}".rstrip())
             continue
         r = event.get("risk") or {}
-        lines.append(f"\n{r.get('icon', '⚠️')} {event.get('label')} · {event.get('window')} {event.get('used'):g}% [{usage_bar(event.get('used'))}]")
+        lines.append(f"\n{r.get('icon', '⚠️')} {display_label(event.get('label'))} · {event.get('window')} {event.get('used'):g}% [{usage_bar(event.get('used'))}]")
         lines.append(f"└ 기준 {event.get('threshold'):g}% · reset {short_reset(event.get('reset_at'))} · {event.get('remaining')}")
     recommendation = payload.get("recommendation") or {}
     if recommendation:
-        lines.append(f"\n✅ 추천 {recommendation.get('label')} — {recommendation.get('reason')}")
+        lines.append(f"\n✅ 추천 {display_label(recommendation.get('label'))} — {recommendation.get('reason')}")
         explanation = _recommendation_explanation(payload)
         if explanation:
             lines.append(explanation)
@@ -803,7 +911,7 @@ def render_credential_insights(rows: list[dict[str, Any]], *, provider: Optional
         return "\n".join(lines)
     total_all = sum(int(row.get("total_tokens") or 0) for row in rows) or 1
     for row in rows:
-        label = row.get("credential_label") or "unknown"
+        label = display_label(row.get("credential_label"))
         model = row.get("model") or "unknown"
         total = int(row.get("total_tokens") or 0)
         calls = int(row.get("api_calls") or row.get("api_call_count") or 0)

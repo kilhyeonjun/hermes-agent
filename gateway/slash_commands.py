@@ -4388,6 +4388,73 @@ class GatewaySlashCommandsMixin:
             return "\n".join(parts)
         return t("gateway.usage.no_data")
 
+    async def _handle_codex_route_command(self, event: MessageEvent) -> str:
+        """Handle /codex-route — set global Codex routing mode across profiles."""
+        import subprocess
+
+        raw_args = event.get_command_args().strip() if event else ""
+        mode = (raw_args.split()[0] if raw_args else "status").lower()
+        valid_modes = {
+            "status", "show", "상태", "auto", "recommended", "recommend", "추천", "자동",
+            "personal", "personal-backup", "개인", "개인계정",
+            "company", "company-plus-100", "회사", "회사계정",
+        }
+        if mode not in valid_modes or len(raw_args.split()) > 1:
+            return "사용법: /codex_route auto|personal|company|status"
+        script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+        if not script.exists():
+            return "❌ Codex 라우팅 제어 스크립트를 찾지 못했습니다."
+
+        def _run_control():
+            return subprocess.run(
+                [sys.executable, str(script), mode], text=True, capture_output=True,
+                timeout=180, shell=False,
+            )
+        try:
+            proc = await asyncio.to_thread(_run_control)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("/codex-route failed: %s", exc)
+            return f"❌ Codex 라우팅 변경 실패: {exc}"
+        output = (proc.stdout or proc.stderr or "").strip()
+        return output if proc.returncode == 0 else (output or "❌ Codex 라우팅 변경에 실패했습니다.")
+
+    async def _handle_codex_account_command(self, event: MessageEvent) -> str:
+        """Handle /codex-account for the local profile only."""
+        import subprocess
+
+        raw_args = event.get_command_args().strip() if event else ""
+        parts = raw_args.split()
+        aliases = {
+            "status": "status", "show": "status", "상태": "status",
+            "auto": "auto", "recommended": "auto", "recommend": "auto", "추천": "auto", "자동": "auto",
+            "personal": "personal", "개인": "personal", "개인계정": "personal",
+            "company": "company", "회사": "company", "회사계정": "company",
+        }
+        mode = aliases.get(parts[0].lower(), "") if parts else "status"
+        if not mode or len(parts) > 1:
+            return "사용법 (Mac mini만 적용): /codex_account auto|personal|company|status"
+        script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+
+        def _run_local():
+            if not script.exists():
+                return subprocess.CompletedProcess([], 127, "", f"제어 스크립트 없음: {script}")
+            return subprocess.run(
+                [sys.executable, str(script), mode], text=True, capture_output=True,
+                timeout=240, shell=False,
+            )
+        try:
+            proc = await asyncio.to_thread(_run_local)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("/codex-account failed: %s", exc)
+            return f"❌ Codex 계정 명령 실패: {exc}"
+        output = (proc.stdout or proc.stderr or "출력 없음").strip()
+        marker = "✅" if proc.returncode == 0 else "❌"
+        cards = [f"🎛 Codex 계정 · {mode}", "", f"{marker} Mac mini", output]
+        if mode != "status":
+            cards.extend(["", "ℹ️ 실행 중인 Codex는 기존 계정을 계속 사용합니다.",
+                          "현재 작업을 종료한 뒤 `codex resume --last`로 다시 시작하세요."])
+        return "\n".join(cards)
+
     async def _handle_codex_usage_command(self, event: MessageEvent) -> str:
         """Handle /codex-usage — current Codex quota by Hermes credential."""
         raw_args = event.get_command_args().strip() if event else ""
