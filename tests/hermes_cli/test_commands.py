@@ -339,6 +339,38 @@ class TestSlackNativeSlashes:
                 f"/{reserved} is a Slack built-in and must not appear in the manifest"
             )
 
+    def test_via_hermes_allocation_is_exact(self):
+        assert _SLACK_VIA_HERMES_ONLY == frozenset({
+            "topup",
+            "moa",
+            "debug",
+            "codex-route",
+            "codex-account",
+            "version",
+        })
+
+    def test_via_hermes_commands_and_aliases_are_not_native(self):
+        names = {name for name, _description, _hint in slack_native_slashes()}
+        for routed_name in (
+            "credits",
+            "billing",
+            "moa",
+            "debug",
+            "session-model",
+            "session_model",
+            "session-fast",
+            "session_fast",
+            "codex-route",
+            "codex_route",
+            "codex-account",
+            "codex_account",
+            "version",
+            "v",
+        ):
+            assert routed_name not in names
+        for native_name in ("insights", "platform", "update"):
+            assert native_name in names
+
     def test_includes_aliases_as_first_class_slashes(self):
         """Aliases (/btw, /bg, …) must be registered as standalone
         slashes — this is the whole point of native-slashes parity.
