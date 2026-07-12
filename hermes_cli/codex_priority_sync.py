@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.redact import redact_sensitive_text
+
 HOME = Path.home()
 GLOBAL_HERMES_HOME = HOME / ".hermes"
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or GLOBAL_HERMES_HOME).expanduser()
@@ -98,7 +100,10 @@ def choose_route_recommendation(payload: dict[str, Any]) -> dict[str, Any]:
             "reason": "manual fixed route",
             "policy": "fixed",
         }
-    return payload.get("recommendation") or {}
+    return {
+        "policy": "fixed",
+        "error": "Fixed Codex route unavailable",
+    }
 
 
 def is_unstarted_weekly_candidate(row: dict[str, Any]) -> bool:
@@ -178,7 +183,8 @@ def run_warmup_call(label: str, *, dry_run: bool) -> tuple[bool, str]:
     if proc.returncode == 0:
         return True, "warmup call ok"
     detail = (proc.stderr or proc.stdout or "").strip().splitlines()[:2]
-    return False, "warmup call failed: " + " | ".join(detail)
+    safe_detail = redact_sensitive_text(" | ".join(detail), force=True)
+    return False, "warmup call failed: " + safe_detail
 
 
 def sync_hermes(recommended_label: str, *, dry_run: bool) -> list[str]:
@@ -245,7 +251,8 @@ def sync_native_codex(recommended_label: str, *, dry_run: bool) -> list[str]:
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "activation failed").strip().splitlines()[:2]
-        return [f"Native Codex CLI {wanted_kind}: {' | '.join(detail)}"]
+        safe_detail = redact_sensitive_text(" | ".join(detail), force=True)
+        return [f"Native Codex CLI {wanted_kind}: {safe_detail}"]
     if (proc.stdout or "").strip() == "UNCHANGED":
         return []
     return [f"Native Codex CLI -> {wanted_kind}"]
@@ -267,6 +274,10 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
     payload = collect_payload()
     state = load_state()
     policy_recommendation = choose_route_recommendation(payload)
+    route_error = str(policy_recommendation.get("error") or "")
+    if route_error:
+        print(route_error)
+        return 1
     fixed_route = policy_recommendation.get("policy") == "fixed"
     warmup_row = choose_unstarted_weekly(payload, state) if args.warmup_unstarted and not fixed_route else None
     warmup_note = ""

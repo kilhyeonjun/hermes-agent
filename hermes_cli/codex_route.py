@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agent.redact import redact_sensitive_text
 from hermes_cli.codex_route_lock import atomic_write_bytes, route_lock
 
 HOME = Path.home()
@@ -155,11 +156,13 @@ def _sync_profile(name: str, home: Path) -> str | None:
     except subprocess.TimeoutExpired:
         return f"{name}: sync timed out after {PROFILE_SYNC_TIMEOUT}s"
     except OSError as exc:
-        return f"{name}: sync launch failed: {exc}"
+        safe_exc = redact_sensitive_text(str(exc), force=True)
+        return f"{name}: sync launch failed: {safe_exc}"
     if proc.returncode == 0:
         return None
     detail = (proc.stderr or proc.stdout or "실행 실패").strip().splitlines()[:2]
-    return f"{name}: {' | '.join(detail)}"
+    safe_detail = redact_sensitive_text(" | ".join(detail), force=True)
+    return f"{name}: {safe_detail}"
 
 
 def sync_all_profiles() -> list[str]:
