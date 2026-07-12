@@ -38,9 +38,11 @@ async def test_codex_account_controls_macmini_only_and_warns_about_running_sessi
     assert "resume --last" in result
     assert run.call_count == 1
     argv = run.call_args.args[0]
-    assert argv[-1] == "company"
+    assert argv[-3:] == ["-m", "hermes_cli.codex_route", "company"]
     assert argv[0] != "ssh"
     assert run.call_args.kwargs["shell"] is False
+    from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
+    assert run.call_args.kwargs["timeout"] == ROUTE_COMMAND_TIMEOUT
 
 
 @pytest.mark.asyncio

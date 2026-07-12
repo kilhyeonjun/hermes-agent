@@ -52,6 +52,11 @@ def test_risk_policy_supports_per_window_thresholds():
 
 
 def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_cli.codex_usage.ROUTE_POLICY_PATH",
+        tmp_path / "missing-route-policy.json",
+    )
+
     class Entry:
         def __init__(self, label, priority):
             self.id = f"id-{label}"
@@ -93,6 +98,63 @@ def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_
         "id-personal-backup",
         "id-company-plus-100",
     ]
+
+
+def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_path):
+    import json
+
+    import hermes_cli.codex_usage as codex_usage
+
+    class Entry:
+        id = "company-id"
+        label = "company-plus-100"
+        priority = 0
+        source = "manual"
+        last_status = None
+        last_error_reset_at = None
+        extra = {}
+        runtime_api_key = "test-token"
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, **_kwargs):
+            return [Entry()]
+
+        def entries(self):
+            return [Entry()]
+
+    policy_path = tmp_path / "codex_route_policy.json"
+    policy_path.write_text(
+        json.dumps({
+            "mode": "fixed",
+            "credential_id": "company-id",
+            "label": "company-plus-100",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_usage, "ROUTE_POLICY_PATH", policy_path, raising=False)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(
+        codex_usage,
+        "fetch_usage",
+        lambda *_args, **_kwargs: {
+            "rate_limit": {
+                "primary_window": {"used_percent": 1},
+                "secondary_window": {"used_percent": 1},
+            },
+        },
+    )
+
+    payload = collect()
+
+    assert payload["routing"] == {
+        "strategy": "fill_first",
+        "current_label": "company-plus-100",
+        "mode": "fixed",
+        "fixed_credential_id": "company-id",
+        "fixed_label": "company-plus-100",
+    }
 
 
 def test_recommendation_prefers_soonest_weekly_reset_then_usage_fallback():

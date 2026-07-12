@@ -22,9 +22,10 @@ async def test_codex_route_handler_runs_control_script_with_valid_mode():
 
     assert "개인 고정" in result
     argv = run.call_args.args[0]
-    assert argv[-2].endswith("codex_route_control.py")
-    assert argv[-1] == "personal"
+    assert argv[-3:] == ["-m", "hermes_cli.codex_route", "personal"]
     assert run.call_args.kwargs["shell"] is False
+    from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
+    assert run.call_args.kwargs["timeout"] == ROUTE_COMMAND_TIMEOUT
 
 
 @pytest.mark.asyncio

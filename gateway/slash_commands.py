@@ -4401,14 +4401,15 @@ class GatewaySlashCommandsMixin:
         }
         if mode not in valid_modes or len(raw_args.split()) > 1:
             return "사용법: /codex_route auto|personal|company|status"
-        script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
-        if not script.exists():
-            return "❌ Codex 라우팅 제어 스크립트를 찾지 못했습니다."
+        from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
 
         def _run_control():
             return subprocess.run(
-                [sys.executable, str(script), mode], text=True, capture_output=True,
-                timeout=180, shell=False,
+                [sys.executable, "-m", "hermes_cli.codex_route", mode],
+                text=True,
+                capture_output=True,
+                timeout=ROUTE_COMMAND_TIMEOUT,
+                shell=False,
             )
         try:
             proc = await asyncio.to_thread(_run_control)
@@ -4433,14 +4434,15 @@ class GatewaySlashCommandsMixin:
         mode = aliases.get(parts[0].lower(), "") if parts else "status"
         if not mode or len(parts) > 1:
             return "사용법 (Mac mini만 적용): /codex_account auto|personal|company|status"
-        script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+        from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
 
         def _run_local():
-            if not script.exists():
-                return subprocess.CompletedProcess([], 127, "", f"제어 스크립트 없음: {script}")
             return subprocess.run(
-                [sys.executable, str(script), mode], text=True, capture_output=True,
-                timeout=240, shell=False,
+                [sys.executable, "-m", "hermes_cli.codex_route", mode],
+                text=True,
+                capture_output=True,
+                timeout=ROUTE_COMMAND_TIMEOUT,
+                shell=False,
             )
         try:
             proc = await asyncio.to_thread(_run_local)

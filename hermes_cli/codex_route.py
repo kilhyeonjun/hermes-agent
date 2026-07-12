@@ -1,47 +1,331 @@
-"""Top-level CLI adapter for Codex credential routing control."""
+"""Control the global Codex routing policy and apply it to every Hermes profile."""
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-CONTROL_SCRIPT = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+from hermes_cli.codex_route_lock import atomic_write_bytes, route_lock
+
+HOME = Path.home()
+HERMES_HOME = HOME / ".hermes"
+DEFAULT_AUTH = HERMES_HOME / "auth.json"
+POLICY_PATH = HERMES_HOME / "state" / "codex_route_policy.json"
+CLIPROXY_AUTH_DIR = HOME / ".cli-proxy-api"
+NATIVE_CODEX_AUTH = HOME / ".codex" / "auth.json"
+PRIORITY_SYNC_MODULE = "hermes_cli.codex_priority_sync"
+PROFILE_SYNC_TIMEOUT = 180
+ROUTE_COMMAND_TIMEOUT = 2 * PROFILE_SYNC_TIMEOUT + 30
+ROUTE_LOCK_TIMEOUT = 30
+
+AUTO_ALIASES = {"auto", "recommended", "recommend", "추천", "자동"}
+PERSONAL_ALIASES = {"personal", "personal-backup", "개인", "개인계정"}
+COMPANY_ALIASES = {"company", "company-plus-100", "회사", "회사계정"}
+CANONICAL_LABELS = {
+    "personal": "personal",
+    "company": "company",
+}
+
+
+def canonical_label(kind: str) -> str:
+    return CANONICAL_LABELS.get(kind, kind)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def credential_rows(auth_path: Path) -> list[dict[str, Any]]:
+    try:
+        data = load_json(auth_path)
+    except Exception:
+        return []
+    rows = data.get("credential_pool", {}).get("openai-codex", [])
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _kind(row: dict[str, Any]) -> str | None:
+    label = str(row.get("label") or "").lower()
+    if any(part in label for part in ("company", "gameduo", "plus")):
+        return "company"
+    if any(part in label for part in ("personal", "backup")):
+        return "personal"
+    return None
+
+
+def resolve_policy(mode: str, auth_path: Path = DEFAULT_AUTH) -> dict[str, Any]:
+    normalized = (mode or "status").strip().lower()
+    if normalized in AUTO_ALIASES:
+        return {"mode": "auto"}
+    if normalized in PERSONAL_ALIASES:
+        wanted = "personal"
+    elif normalized in COMPANY_ALIASES:
+        wanted = "company"
+    else:
+        raise ValueError("지원 모드: auto | personal | company")
+
+    rows = credential_rows(auth_path)
+    row = next((item for item in rows if _kind(item) == wanted), None)
+    if row is None and wanted == "personal":
+        row = next((item for item in rows if _kind(item) != "company"), None)
+    if row is None:
+        raise ValueError(f"{wanted} Codex 계정을 찾지 못했습니다")
+    credential_id = str(row.get("id") or "")
+    if not credential_id:
+        raise ValueError(f"{wanted} Codex credential ID가 없습니다")
+    return {
+        "mode": "fixed",
+        "credential_id": credential_id,
+        "label": str(row.get("label") or wanted),
+    }
+
+
+def load_policy() -> dict[str, Any]:
+    try:
+        policy = load_json(POLICY_PATH)
+    except Exception:
+        return {"mode": "auto"}
+    return policy if isinstance(policy, dict) else {"mode": "auto"}
+
+
+def save_policy(policy: dict[str, Any]) -> None:
+    payload = dict(policy)
+    payload["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    content = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
+    atomic_write_bytes(POLICY_PATH, content)
+
+
+def snapshot_policy() -> tuple[bool, bytes]:
+    """Capture exact prior policy bytes so rollback does not rewrite metadata."""
+    try:
+        return True, POLICY_PATH.read_bytes()
+    except FileNotFoundError:
+        return False, b""
+
+
+def restore_policy(snapshot: tuple[bool, bytes]) -> None:
+    existed, content = snapshot
+    if not existed:
+        POLICY_PATH.unlink(missing_ok=True)
+        return
+    atomic_write_bytes(POLICY_PATH, content)
+
+
+class RouteApplyError(RuntimeError):
+    """Raised after a failed apply and the required full rollback attempt."""
+
+
+
+def profile_homes() -> list[tuple[str, Path]]:
+    homes = [("default", HERMES_HOME)]
+    profiles_root = HERMES_HOME / "profiles"
+    if profiles_root.exists():
+        for path in sorted(profiles_root.iterdir()):
+            if path.is_dir() and (path / "auth.json").exists():
+                homes.append((path.name, path))
+    return homes
+
+
+def _sync_profile(name: str, home: Path) -> str | None:
+    argv = [
+        sys.executable,
+        "-m",
+        PRIORITY_SYNC_MODULE,
+    ]
+    if name != "default":
+        argv.append("--skip-cliproxy")
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_CODEX_ROUTE_LOCK_HELD"] = "1"
+    try:
+        proc = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=PROFILE_SYNC_TIMEOUT,
+            shell=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{name}: sync timed out after {PROFILE_SYNC_TIMEOUT}s"
+    except OSError as exc:
+        return f"{name}: sync launch failed: {exc}"
+    if proc.returncode == 0:
+        return None
+    detail = (proc.stderr or proc.stdout or "실행 실패").strip().splitlines()[:2]
+    return f"{name}: {' | '.join(detail)}"
+
+
+def sync_all_profiles() -> list[str]:
+    """Run tracked priority sync for every profile within one bounded round."""
+    homes = profile_homes()
+    if not homes:
+        return []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(len(homes), 4)) as executor:
+        futures = {
+            executor.submit(_sync_profile, name, home): name
+            for name, home in homes
+        }
+        for future in as_completed(futures):
+            error = future.result()
+            if error:
+                errors.append(error)
+    return sorted(errors)
+
+
+def canonical_row_label(row: dict[str, Any]) -> str:
+    kind = _kind(row)
+    if kind:
+        return canonical_label(kind)
+    credential_id = str(row.get("id") or "")
+    if credential_id:
+        for default_row in credential_rows(DEFAULT_AUTH):
+            if str(default_row.get("id") or "") != credential_id:
+                continue
+            default_kind = _kind(default_row)
+            if default_kind:
+                return canonical_label(default_kind)
+            return str(default_row.get("label") or credential_id)
+    return str(row.get("label") or credential_id or "unknown")
+
+
+def current_label(auth_path: Path) -> str:
+    rows = [row for row in credential_rows(auth_path) if (row.get("last_status") or "ok") == "ok"]
+    if not rows:
+        return "계정 없음"
+    row = min(rows, key=lambda item: int(item.get("priority") or 0))
+    return canonical_row_label(row)
+
+
+def _cliproxy_kind(data: dict[str, Any]) -> str | None:
+    lower = " ".join(
+        str(data.get(key, "")) for key in ("label", "note")
+    ).lower()
+    if any(part in lower for part in ("gameduo", "company", "plus")):
+        return "company"
+    if any(part in lower for part in ("personal", "backup")):
+        return "personal"
+    return None
+
+
+def cliproxy_current_account() -> str:
+    candidates: list[tuple[int, str]] = []
+    for path in sorted(CLIPROXY_AUTH_DIR.glob("codex-*.json")):
+        try:
+            data = load_json(path)
+        except Exception:
+            continue
+        kind = _cliproxy_kind(data)
+        if kind is None:
+            continue
+        raw_attrs = data.get("attributes")
+        attrs = raw_attrs if isinstance(raw_attrs, dict) else {}
+        raw_priority = attrs.get("priority", data.get("priority", 0))
+        try:
+            priority = int(raw_priority)
+        except (TypeError, ValueError):
+            priority = 0
+        candidates.append((priority, kind))
+    return canonical_label(max(candidates)[1]) if candidates else "계정 없음"
+
+
+def native_codex_current_account() -> str:
+    if not NATIVE_CODEX_AUTH.exists():
+        return "none"
+    if not NATIVE_CODEX_AUTH.is_symlink():
+        return "legacy"
+    resolved = NATIVE_CODEX_AUTH.resolve(strict=False)
+    if resolved.parent.name in CANONICAL_LABELS and resolved.parent.parent.name == "accounts":
+        return canonical_label(resolved.parent.name)
+    return "unknown"
+
+
+def render_status(policy: dict[str, Any], sync_errors: list[str] | None = None) -> str:
+    if policy.get("mode") == "fixed":
+        label = canonical_row_label(
+            {
+                "id": policy.get("credential_id"),
+                "label": policy.get("label"),
+            }
+        )
+        mode_text = f"고정 · {label}"
+    else:
+        mode_text = "자동 추천"
+    lines = ["🎛 Codex 라우팅", f"모드: {mode_text}"]
+    for name, home in profile_homes():
+        lines.append(f"• {name}: {current_label(home / 'auth.json')}")
+    lines.append(f"• CLIProxy: {cliproxy_current_account()}")
+    lines.append(f"• Native Codex CLI: {native_codex_current_account()}")
+    if sync_errors:
+        lines.append("⚠️ " + "; ".join(sync_errors))
+    lines.extend(
+        [
+            "",
+            "CLI: hermes codex-route [auto|personal|company]",
+            "Telegram: /codex_route [auto|personal|company]",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _apply_mode_locked(mode: str) -> str:
+    policy = resolve_policy(mode, DEFAULT_AUTH)
+    prior = snapshot_policy()
+    save_policy(policy)
+    try:
+        errors = sync_all_profiles()
+    except Exception as exc:
+        errors = [f"profile sync raised {type(exc).__name__}"]
+    if not errors:
+        return render_status(policy)
+
+    restore_policy(prior)
+    try:
+        rollback_errors = sync_all_profiles()
+    except Exception as exc:
+        rollback_errors = [f"rollback sync raised {type(exc).__name__}"]
+    lines = [
+        "❌ Codex 라우팅 적용 실패: " + "; ".join(errors),
+        "↩️ 이전 정책을 복원하고 전체 프로필 rollback을 시도했습니다.",
+    ]
+    if rollback_errors:
+        lines.append("❌ rollback 실패: " + "; ".join(rollback_errors))
+    else:
+        lines.append("✅ rollback 완료")
+    raise RouteApplyError("\n".join(lines))
+
+
+def apply_mode(mode: str) -> str:
+    with route_lock(
+        path=POLICY_PATH.parent / "codex_route.lock",
+        timeout=ROUTE_LOCK_TIMEOUT,
+    ):
+        return _apply_mode_locked(mode)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="hermes codex-route",
-        description="Show or set Codex routing across Hermes profiles and CLIProxy.",
-    )
-    parser.add_argument(
-        "mode",
-        nargs="?",
-        default="status",
-        choices=["status", "auto", "personal", "company"],
-    )
+    parser = argparse.ArgumentParser(description="Set Codex routing mode across all Hermes profiles")
+    parser.add_argument("mode", nargs="?", default="status")
     args = parser.parse_args(argv)
-
-    if not CONTROL_SCRIPT.exists():
-        print(f"Codex routing control script not found: {CONTROL_SCRIPT}", file=sys.stderr)
-        return 1
-
     try:
-        proc = subprocess.run(
-            [sys.executable, str(CONTROL_SCRIPT), args.mode],
-            text=True,
-            capture_output=True,
-            timeout=180,
-            shell=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"Codex routing command failed: {exc}", file=sys.stderr)
+        if args.mode.lower() in {"status", "show", "상태"}:
+            print(render_status(load_policy()))
+        else:
+            print(apply_mode(args.mode))
+    except RouteApplyError as exc:
+        print(str(exc))
         return 1
-
-    output = proc.stdout if proc.returncode == 0 else (proc.stderr or proc.stdout)
-    if output:
-        print(output, end="" if output.endswith("\n") else "\n")
-    return int(proc.returncode)
+    except (ValueError, OSError, TimeoutError, subprocess.SubprocessError) as exc:
+        print(f"❌ Codex 라우팅 변경 실패: {exc}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
