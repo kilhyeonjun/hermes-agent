@@ -4393,10 +4393,14 @@ class GatewaySlashCommandsMixin:
         try:
             proc = await asyncio.to_thread(_run_local)
         except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("/codex-account failed: %s", exc)
-            return f"❌ Codex 계정 명령 실패: {exc}"
+            safe_exc = redact_sensitive_text(str(exc), force=True)
+            logger.warning("/codex-account failed: %s", safe_exc)
+            return f"❌ Codex 계정 명령 실패: {safe_exc}"
 
-        output = (proc.stdout or proc.stderr or "출력 없음").strip()
+        output = redact_sensitive_text(
+            (proc.stdout or proc.stderr or "출력 없음").strip(),
+            force=True,
+        )
         marker = "✅" if proc.returncode == 0 else "❌"
         cards = [f"🎛 Codex 계정 · {mode}", "", f"{marker} Mac mini", output]
         if mode != "status":
