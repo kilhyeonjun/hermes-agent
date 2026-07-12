@@ -1177,7 +1177,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - codex_account: Mac-mini account routing control; /codex_route stays native.
+#   - insights, platform, update, version: lower-frequency administrative/info
+#     surfaces kept reachable through /hermes so the 50-slot cap is explicit.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits", "billing", "moa", "debug", "codex_account",
+    "insights", "platform", "update", "version",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

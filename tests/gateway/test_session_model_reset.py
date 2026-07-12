@@ -92,6 +92,9 @@ async def test_new_command_clears_session_model_override():
     assert session_key not in runner._session_service_tier_overrides
     assert session_key not in runner._pending_model_notes
 
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.purge_picker_state.assert_called_once_with(session_key)
+
 
 @pytest.mark.asyncio
 async def test_new_command_no_override_is_noop():

@@ -99,6 +99,44 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    def _picker_session_binding(self, source, session_key: str) -> Dict[str, Any]:
+        """Snapshot the principal and concrete session behind a new picker."""
+        owner_user_id = str(getattr(source, "user_id", "") or "")
+        session_id = ""
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                entry = store.get_or_create_session(source)
+                session_id = str(getattr(entry, "session_id", "") or "")
+            except Exception:
+                logger.debug("Failed to bind picker session identity", exc_info=True)
+        generations = getattr(self, "_session_run_generation", {}) or {}
+        generation = int(generations.get(session_key, 0))
+
+        def _is_current() -> bool:
+            peek = getattr(store, "peek_session_id", None) if store is not None else None
+            if callable(peek):
+                current_session_id = str(peek(session_key) or "")
+            else:
+                entries = getattr(store, "_entries", {}) if store is not None else {}
+                current_entry = entries.get(session_key) if entries is not None else None
+                current_session_id = str(
+                    getattr(current_entry, "session_id", "") or ""
+                )
+            current_generations = getattr(self, "_session_run_generation", {}) or {}
+            return bool(
+                session_id
+                and current_session_id == session_id
+                and int(current_generations.get(session_key, 0)) == generation
+            )
+
+        return {
+            "owner_user_id": owner_user_id,
+            "session_id": session_id,
+            "session_generation": generation,
+            "is_session_current": _is_current,
+        }
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -199,6 +237,11 @@ class GatewaySlashCommandsMixin:
 
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
+
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        purge_picker_state = getattr(adapter, "purge_picker_state", None)
+        if callable(purge_picker_state):
+            purge_picker_state(session_key)
 
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
@@ -1492,6 +1535,7 @@ class GatewaySlashCommandsMixin:
             metadata=self._thread_metadata_for_source(
                 source, self._reply_anchor_for_event(event)
             ),
+            **self._picker_session_binding(source, session_key),
         )
         if not getattr(result, "success", False):
             return "❌ 세션 모델 선택 버튼을 열지 못했습니다."
@@ -1534,6 +1578,7 @@ class GatewaySlashCommandsMixin:
             metadata=self._thread_metadata_for_source(
                 source, self._reply_anchor_for_event(event)
             ),
+            **self._picker_session_binding(source, session_key),
         )
         if not getattr(result, "success", False):
             return "❌ 세션 FAST 선택 버튼을 열지 못했습니다."
@@ -1857,6 +1902,11 @@ class GatewaySlashCommandsMixin:
                         return "\n".join(lines)
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    picker_binding = (
+                        self._picker_session_binding(source, session_key)
+                        if source.platform == Platform.TELEGRAM
+                        else {}
+                    )
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -1865,6 +1915,7 @@ class GatewaySlashCommandsMixin:
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
+                        **picker_binding,
                     )
                     if result.success:
                         return None  # Picker sent — adapter handles the response
@@ -4279,16 +4330,14 @@ class GatewaySlashCommandsMixin:
                 "/codex_route company — 회사 고정"
             )
 
-        script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
-        if not script.exists():
-            return "❌ Codex 라우팅 제어 스크립트를 찾지 못했습니다."
+        from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
 
         def _run_control():
             return subprocess.run(
-                [sys.executable, str(script), mode],
+                [sys.executable, "-m", "hermes_cli.codex_route", mode],
                 text=True,
                 capture_output=True,
-                timeout=180,
+                timeout=ROUTE_COMMAND_TIMEOUT,
                 shell=False,
             )
 
@@ -4325,18 +4374,14 @@ class GatewaySlashCommandsMixin:
                 "MacBook은 맥북 터미널에서 `codex-account`를 사용하세요."
             )
 
-        local_script = Path.home() / ".hermes" / "scripts" / "codex_route_control.py"
+        from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
 
         def _run_local():
-            if not local_script.exists():
-                return subprocess.CompletedProcess(
-                    args=[], returncode=127, stdout="", stderr=f"제어 스크립트 없음: {local_script}"
-                )
             return subprocess.run(
-                [sys.executable, str(local_script), mode],
+                [sys.executable, "-m", "hermes_cli.codex_route", mode],
                 text=True,
                 capture_output=True,
-                timeout=240,
+                timeout=ROUTE_COMMAND_TIMEOUT,
                 shell=False,
             )
 

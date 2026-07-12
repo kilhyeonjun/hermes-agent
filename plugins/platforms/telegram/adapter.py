@@ -16,6 +16,7 @@ import os
 import html as _html
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -502,6 +503,7 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
+    _PICKER_TTL_SECONDS = 15 * 60
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -4842,6 +4844,11 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        owner_user_id: str = "",
+        session_id: str = "",
+        session_generation: int = 0,
+        is_session_current=None,
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
 
@@ -4901,6 +4908,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "provider_page": 0,
+                "owner_user_id": str(owner_user_id or ""),
+                "session_id": str(session_id or ""),
+                "session_generation": int(session_generation or 0),
+                "created_at": time.monotonic(),
+                "is_session_current": is_session_current,
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -4956,6 +4968,11 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         current_service_tier: Optional[str] = None,
         mode: str = "model",
+        *,
+        owner_user_id: str = "",
+        session_id: str = "",
+        session_generation: int = 0,
+        is_session_current=None,
     ) -> SendResult:
         """Send button controls for one session only."""
         if not self._bot:
@@ -5005,6 +5022,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 "on_selected": on_selected,
                 "current_model": current_model,
                 "current_effort": current_effort,
+                "owner_user_id": str(owner_user_id or ""),
+                "session_id": str(session_id or ""),
+                "session_generation": int(session_generation or 0),
+                "created_at": time.monotonic(),
+                "is_session_current": is_session_current,
             }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as exc:
@@ -5074,6 +5096,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not preset or not callback:
             await query.answer(text="잘못된 선택입니다.")
             return
+        # Consume before invoking user code so two callback updates cannot both
+        # apply the same session-scoped selection.
+        self._session_runtime_picker_state.pop(state_key, None)
         try:
             text = await callback(*preset)
         except Exception as exc:
@@ -5357,6 +5382,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Picker expired.")
                 return
 
+            # Atomically consume before user code. A second confirmation update
+            # then fails closed at the dispatcher instead of applying twice.
+            self._model_picker_state.pop(state_key, None)
             switch_failed = False
             try:
                 result_text = await callback(chat_id, model_id, provider_slug)
@@ -5436,6 +5464,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Confirm expensive model")
                 return
 
+            # The pricing lookup above yields to the event loop. Revalidate the
+            # concrete session after it returns so /new or expiry cannot apply
+            # the old pick to a replacement session.
+            if not await self._validate_picker_callback(query, data, chat_id):
+                return
+            self._model_picker_state.pop(state_key, None)
             switch_failed = False
             try:
                 result_text = await callback(chat_id, model_id, provider_slug)
@@ -5551,6 +5585,78 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def purge_picker_state(self, session_key: str) -> None:
+        """Discard all interactive model controls owned by one session."""
+        for state_map in (
+            self._model_picker_state,
+            self._session_runtime_picker_state,
+        ):
+            stale_keys = [
+                key
+                for key, state in state_map.items()
+                if state.get("session_key") == session_key
+            ]
+            for key in stale_keys:
+                state_map.pop(key, None)
+
+    async def _validate_picker_callback(
+        self,
+        query,
+        data: str,
+        chat_id: Optional[str],
+    ) -> bool:
+        """Enforce picker ownership, lifetime, and concrete session binding."""
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        if chat_id is None or not isinstance(message_id, int):
+            await query.answer(
+                text="Picker expired — open a new picker in the current session."
+            )
+            return False
+
+        state_map = (
+            self._session_runtime_picker_state
+            if data.startswith(("sr:", "sf:"))
+            else self._model_picker_state
+        )
+        state_key = (str(chat_id), message_id)
+        state = state_map.get(state_key)
+        if not state:
+            await query.answer(
+                text="Picker expired — open a new picker in the current session."
+            )
+            return False
+
+        owner_user_id = str(state.get("owner_user_id") or "")
+        caller_user_id = str(
+            getattr(getattr(query, "from_user", None), "id", "") or ""
+        )
+        if not owner_user_id or caller_user_id != owner_user_id:
+            await query.answer(
+                text="⛔ Only the user who opened this picker can use it."
+            )
+            return False
+
+        created_at = state.get("created_at")
+        checker = state.get("is_session_current")
+        stale = not isinstance(created_at, (int, float))
+        if not stale:
+            stale = time.monotonic() - float(created_at) > self._PICKER_TTL_SECONDS
+        if not stale:
+            if not callable(checker):
+                stale = True
+            else:
+                try:
+                    stale = not bool(checker())
+                except Exception:
+                    stale = True
+        if stale:
+            state_map.pop(state_key, None)
+            await query.answer(
+                text="Picker expired — open a new picker in the current session."
+            )
+            return False
+        return True
+
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late to be delivered.
 
@@ -5604,6 +5710,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 user_name=query_user_name,
             ):
                 await query.answer(text="⛔ You are not authorized to change models.")
+                return
+            if not await self._validate_picker_callback(
+                query,
+                data,
+                str(query_chat_id) if query_chat_id is not None else None,
+            ):
                 return
 
         # --- Session-only model/effort/fast picker callbacks ---

@@ -114,6 +114,14 @@ def _inject_fake_telegram(monkeypatch):
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    # Patch the already-cached adapter module in place. Reloading/removing it
+    # splits class identity across test modules collected in the same worker.
+    import plugins.platforms.telegram.adapter as telegram_mod
+
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardButton", _FakeInlineKeyboardButton)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardMarkup", _FakeInlineKeyboardMarkup)
+    monkeypatch.setattr(telegram_mod, "ChatType", _fake_telegram_constants.ChatType)
+    monkeypatch.setattr(telegram_mod, "ParseMode", _fake_telegram_constants.ParseMode)
 
 
 def _make_adapter():

@@ -19,6 +19,7 @@ closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
 import types
+from unittest.mock import MagicMock
 
 import yaml
 import pytest
@@ -39,27 +40,34 @@ class _FakePickerAdapter:
 
     def __init__(self):
         self.captured_callback = None
+        self.captured_kwargs = None
 
     async def send_model_picker(self, *, on_model_selected, **kwargs):
         # Stash the closure the handler built so the test can fire a "tap".
         self.captured_callback = on_model_selected
+        self.captured_kwargs = kwargs
         return types.SimpleNamespace(success=True)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, platform=Platform.TELEGRAM):
     runner = object.__new__(GatewayRunner)
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {platform: adapter}
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
     return runner
 
 
-def _make_event(text):
+def _make_event(text, platform=Platform.TELEGRAM):
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        source=SessionSource(
+            platform=platform,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="owner-1",
+        ),
     )
 
 
@@ -133,6 +141,55 @@ async def _drive_picker(runner, event):
     assert adapter.captured_callback is not None, "picker callback was not wired"
     # Simulate the user tapping "gpt-5.5" under the openrouter provider.
     return await adapter.captured_callback("12345", "gpt-5.5", "openrouter")
+
+
+@pytest.mark.asyncio
+async def test_generic_model_picker_receives_owner_and_session_binding(
+    tmp_path, monkeypatch
+):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    runner = _make_runner(adapter)
+    event = _make_event("/model")
+    session_key = runner._session_key_for_source(event.source)
+    entry = types.SimpleNamespace(session_id="session-1")
+    runner.session_store = types.SimpleNamespace(
+        _entries={session_key: entry},
+        get_or_create_session=MagicMock(return_value=entry),
+    )
+    runner._session_run_generation = {session_key: 3}
+
+    assert await runner._handle_model_command(event) is None
+
+    assert adapter.captured_kwargs["owner_user_id"] == "owner-1"
+    assert adapter.captured_kwargs["session_id"] == "session-1"
+    assert adapter.captured_kwargs["session_generation"] == 3
+    assert adapter.captured_kwargs["is_session_current"]() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.MATRIX])
+async def test_non_telegram_picker_does_not_receive_telegram_binding_kwargs(
+    tmp_path, monkeypatch, platform
+):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    runner = _make_runner(adapter, platform)
+
+    assert await runner._handle_model_command(_make_event("/model", platform)) is None
+
+    assert "owner_user_id" not in adapter.captured_kwargs
+    assert "session_id" not in adapter.captured_kwargs
+    assert "session_generation" not in adapter.captured_kwargs
+    assert "is_session_current" not in adapter.captured_kwargs
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 """Tests for Telegram model picker thread fallback."""
 
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -98,7 +99,9 @@ class TestTelegramModelPicker:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        import plugins.platforms.telegram.adapter as telegram_mod
+
+        assert sent["parse_mode"] == telegram_mod.ParseMode.MARKDOWN_V2
         assert "provider\\_one" in sent["text"]
         assert "`model_1`" in sent["text"]
 
@@ -126,7 +129,9 @@ class TestTelegramModelPicker:
         await adapter._handle_model_picker_callback(query, "mb", "12345")
 
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        import plugins.platforms.telegram.adapter as telegram_mod
+
+        assert edit_kwargs["parse_mode"] == telegram_mod.ParseMode.MARKDOWN_V2
         assert "provider\\_one" in edit_kwargs["text"]
         assert "`model_1`" in edit_kwargs["text"]
 
@@ -150,6 +155,11 @@ class TestTelegramModelPicker:
             "selected_provider": "openai",
             "model_list": ["gpt-5"],
             "msg_id": 42,
+            "owner_user_id": "owner-1",
+            "session_id": "session-1",
+            "session_generation": 1,
+            "created_at": time.monotonic(),
+            "is_session_current": MagicMock(return_value=True),
         }
 
         query = AsyncMock()
@@ -157,6 +167,7 @@ class TestTelegramModelPicker:
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.message.message_id = 42
+        query.from_user.id = "owner-1"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -165,7 +176,9 @@ class TestTelegramModelPicker:
         callback.assert_awaited_once()
         query.edit_message_text.assert_awaited()
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        import plugins.platforms.telegram.adapter as telegram_mod
+
+        assert edit_kwargs["parse_mode"] == telegram_mod.ParseMode.MARKDOWN_V2
         assert "`gpt-5`" in edit_kwargs["text"]
         assert ("12345", 42) not in adapter._model_picker_state
 
@@ -331,6 +344,11 @@ class TestTelegramModelPicker:
             "selected_provider": "openrouter",
             "model_list": ["openai/gpt-5.5-pro"],
             "msg_id": 42,
+            "owner_user_id": "owner-1",
+            "session_id": "session-1",
+            "session_generation": 1,
+            "created_at": time.monotonic(),
+            "is_session_current": MagicMock(return_value=True),
         }
         monkeypatch.setattr(
             "hermes_cli.model_cost_guard.expensive_model_warning",
@@ -343,6 +361,7 @@ class TestTelegramModelPicker:
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.message.message_id = 42
+        query.from_user.id = "owner-1"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -358,6 +377,46 @@ class TestTelegramModelPicker:
 
         callback.assert_awaited_once_with("12345", "openai/gpt-5.5-pro", "openrouter")
         assert ("12345", 42) not in adapter._model_picker_state
+
+    @pytest.mark.asyncio
+    async def test_session_is_revalidated_after_cost_lookup_yields(self, monkeypatch):
+        import plugins.platforms.telegram.adapter as telegram_mod
+
+        adapter = _make_adapter()
+        callback = AsyncMock(return_value="changed")
+        adapter._model_picker_state[("12345", 42)] = {
+            "providers": [{"slug": "openrouter", "name": "OpenRouter"}],
+            "current_model": "old",
+            "current_provider": "openrouter",
+            "session_key": "telegram:12345",
+            "on_model_selected": callback,
+            "selected_provider": "openrouter",
+            "model_list": ["safe-model"],
+            "owner_user_id": "owner-1",
+            "session_id": "session-old",
+            "session_generation": 1,
+            "created_at": time.monotonic(),
+            "is_session_current": MagicMock(return_value=True),
+        }
+
+        async def reset_during_cost_lookup(_func, *_args, **_kwargs):
+            adapter._model_picker_state.clear()
+            return None
+
+        monkeypatch.setattr(telegram_mod.asyncio, "to_thread", reset_during_cost_lookup)
+        query = SimpleNamespace(
+            message=SimpleNamespace(message_id=42),
+            from_user=SimpleNamespace(id="owner-1"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await adapter._handle_model_picker_callback(query, "mm:0", "12345")
+
+        callback.assert_not_awaited()
+        query.answer.assert_awaited_with(
+            text="Picker expired — open a new picker in the current session."
+        )
 
     @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):
@@ -390,3 +449,126 @@ class TestTelegramModelPicker:
         assert len(call_log) == 2
         assert call_log[0]["message_thread_id"] == 99999
         assert "message_thread_id" not in call_log[1] or call_log[1]["message_thread_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_binds_owner_session_and_creation_time(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=42)
+        )
+        is_session_current = MagicMock(return_value=True)
+
+        result = await adapter.send_model_picker(
+            chat_id="12345",
+            providers=[{"slug": "openai", "name": "OpenAI", "total_models": 1}],
+            current_model="gpt-5",
+            current_provider="openai",
+            session_key="telegram:12345",
+            on_model_selected=AsyncMock(),
+            owner_user_id="owner-1",
+            session_id="session-1",
+            session_generation=7,
+            is_session_current=is_session_current,
+        )
+
+        assert result.success is True
+        state = adapter._model_picker_state[("12345", 42)]
+        assert state["owner_user_id"] == "owner-1"
+        assert state["session_id"] == "session-1"
+        assert state["session_generation"] == 7
+        assert state["is_session_current"] is is_session_current
+        assert isinstance(state["created_at"], float)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("callback_data", "state_attr"),
+        [
+            ("sr:sol", "_session_runtime_picker_state"),
+            ("mm:0", "_model_picker_state"),
+        ],
+    )
+    async def test_authorized_non_owner_cannot_use_same_chat_picker(
+        self, callback_data, state_attr
+    ):
+        adapter = _make_adapter()
+        adapter._is_callback_user_authorized = MagicMock(return_value=True)
+        callback = AsyncMock(return_value="changed")
+        state = {
+            "owner_user_id": "owner-1",
+            "session_key": "telegram:12345",
+            "session_id": "session-1",
+            "session_generation": 7,
+            "created_at": time.monotonic(),
+            "is_session_current": MagicMock(return_value=True),
+            "on_selected": callback,
+            "on_model_selected": callback,
+            "model_list": ["gpt-5"],
+            "selected_provider": "openai",
+        }
+        getattr(adapter, state_attr)[("12345", 42)] = state
+        query = SimpleNamespace(
+            data=callback_data,
+            message=SimpleNamespace(
+                chat_id=12345,
+                message_id=42,
+                chat=SimpleNamespace(type="supergroup"),
+                message_thread_id=5,
+            ),
+            from_user=SimpleNamespace(id="other-authorized", first_name="Other"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+
+        callback.assert_not_awaited()
+        query.answer.assert_awaited_once_with(
+            text="⛔ Only the user who opened this picker can use it."
+        )
+        assert ("12345", 42) in getattr(adapter, state_attr)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stale_reason", ["session", "ttl"])
+    async def test_stale_picker_is_rejected_and_purged(self, stale_reason):
+        adapter = _make_adapter()
+        adapter._is_callback_user_authorized = MagicMock(return_value=True)
+        callback = AsyncMock(return_value="changed")
+        adapter._session_runtime_picker_state[("12345", 42)] = {
+            "owner_user_id": "owner-1",
+            "session_key": "telegram:12345",
+            "session_id": "session-old",
+            "session_generation": 7,
+            "created_at": (
+                time.monotonic() - adapter._PICKER_TTL_SECONDS - 1
+                if stale_reason == "ttl"
+                else time.monotonic()
+            ),
+            "is_session_current": MagicMock(
+                return_value=stale_reason != "session"
+            ),
+            "on_selected": callback,
+        }
+        query = SimpleNamespace(
+            data="sr:sol",
+            message=SimpleNamespace(
+                chat_id=12345,
+                message_id=42,
+                chat=SimpleNamespace(type="private"),
+                message_thread_id=None,
+            ),
+            from_user=SimpleNamespace(id="owner-1", first_name="Owner"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await adapter._handle_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace()
+        )
+
+        callback.assert_not_awaited()
+        query.answer.assert_awaited_once_with(
+            text="Picker expired — open a new picker in the current session."
+        )
+        assert adapter._session_runtime_picker_state == {}

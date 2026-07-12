@@ -28,7 +28,12 @@ def _event(text: str = "/session_model") -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="owner-1",
+        ),
     )
 
 
@@ -66,6 +71,36 @@ async def test_session_model_picker_applies_model_and_effort_session_only(monkey
     assert model_event.get_command_args() == "gpt-5.6-sol --session"
     assert effort_event.get_command_args() == "high"
     assert confirmation == "model switched\n\neffort switched"
+
+
+@pytest.mark.asyncio
+async def test_session_model_picker_binds_durable_session_and_run_generation():
+    adapter = _RuntimePickerAdapter()
+    runner = _runner(adapter)
+    event = _event()
+    session_key = runner._session_key_for_source(event.source)
+    entry = types.SimpleNamespace(session_id="session-1")
+    runner.session_store = types.SimpleNamespace(
+        _entries={session_key: entry},
+        get_or_create_session=MagicMock(return_value=entry),
+    )
+    runner._session_run_generation = {session_key: 7}
+
+    await runner._handle_session_model_command(event)
+
+    assert adapter.kwargs["owner_user_id"] == "owner-1"
+    assert adapter.kwargs["session_id"] == "session-1"
+    assert adapter.kwargs["session_generation"] == 7
+    is_current = adapter.kwargs["is_session_current"]
+    assert is_current() is True
+
+    runner._session_run_generation[session_key] = 8
+    assert is_current() is False
+    runner._session_run_generation[session_key] = 7
+    runner.session_store._entries[session_key] = types.SimpleNamespace(
+        session_id="session-2"
+    )
+    assert is_current() is False
 
 
 @pytest.mark.asyncio

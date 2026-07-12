@@ -21,6 +21,7 @@ from hermes_cli.config import get_hermes_home
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_WATERMARK = get_hermes_home() / "state" / "codex_usage_alerts.json"
 DEFAULT_HISTORY = get_hermes_home() / "state" / "codex_usage_history.jsonl"
+ROUTE_POLICY_PATH = Path.home() / ".hermes" / "state" / "codex_route_policy.json"
 TREND_TARGETS = (80, 95, 100)
 MIN_TREND_SAMPLE_SECONDS = 10 * 60
 DISPLAY_LABELS = {
@@ -110,6 +111,24 @@ def fetch_usage(access_token: str, account_id: Optional[str] = None, timeout: in
         return json.loads(response.read().decode("utf-8"))
 
 
+def load_route_policy() -> Dict[str, Any]:
+    """Read the host-wide Codex route policy without exposing credentials."""
+    try:
+        value = json.loads(ROUTE_POLICY_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(value, dict) or value.get("mode") != "fixed":
+        return {}
+    credential_id = str(value.get("credential_id") or "")
+    if not credential_id:
+        return {}
+    return {
+        "mode": "fixed",
+        "fixed_credential_id": credential_id,
+        "fixed_label": str(value.get("label") or credential_id),
+    }
+
+
 def collect() -> Dict[str, Any]:
     from agent.credential_pool import load_pool
 
@@ -172,6 +191,7 @@ def collect() -> Dict[str, Any]:
         },
         "accounts": rows,
     }
+    payload["routing"].update(load_route_policy())
     payload["recommendation"] = compute_recommendation(rows)
     return payload
 
@@ -558,8 +578,13 @@ def _recommendation_explanation(payload: Dict[str, Any]) -> str:
     return f"사유: 7d reset이 가장 가까운 사용 가능 계정 ({reason})" if reason else ""
 
 
-def _next_reset(accounts: list[dict[str, Any]], min_used: Optional[float] = None) -> Optional[dict[str, str]]:
+def _next_reset(
+    accounts: list[dict[str, Any]],
+    min_used: Optional[float] = None,
+    reference_time: Optional[datetime] = None,
+) -> Optional[dict[str, str]]:
     candidates: list[tuple[datetime, dict[str, str]]] = []
+    reference_time = reference_time or datetime.now().astimezone()
     for row in accounts:
         if not row.get("ok"):
             continue
@@ -570,7 +595,7 @@ def _next_reset(accounts: list[dict[str, Any]], min_used: Optional[float] = None
                 continue
             reset_at = window.get("reset_at")
             dt = local_dt(reset_at)
-            if dt is None or dt <= datetime.now().astimezone():
+            if dt is None or dt <= reference_time:
                 continue
             candidates.append(
                 (
@@ -718,11 +743,12 @@ def render_compact(payload: Dict[str, Any]) -> str:
     burn_summary = _burn_summary(payload)
     if burn_summary:
         lines.append(burn_summary)
-    next_reset = _next_reset(accounts)
+    reference_time = local_dt(payload.get("checked_at"))
+    next_reset = _next_reset(accounts, reference_time=reference_time)
     if next_reset:
         lines.append(f"\n⏱ 다음 회복 · {display_label(next_reset['label'])} {next_reset['window']}")
         lines.append(f"└ {next_reset['reset']} ({next_reset['remaining']})")
-    risk_reset = _next_reset(accounts, min_used=95)
+    risk_reset = _next_reset(accounts, min_used=95, reference_time=reference_time)
     if risk_reset and risk_reset != next_reset:
         lines.append(f"🚦 위험 회복 · {display_label(risk_reset['label'])} {risk_reset['window']}")
         lines.append(f"└ {risk_reset['reset']} ({risk_reset['remaining']})")
