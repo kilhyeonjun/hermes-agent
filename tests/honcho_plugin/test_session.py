@@ -813,6 +813,60 @@ class TestConcludeToolDispatch:
 
         assert session.add_message.call_args_list[0].args == ("user", "hello")
         assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
+        provider._manager.save.assert_called_once_with(session)
+        provider._manager._flush_session.assert_not_called()
+
+    def test_sync_turn_does_nothing_when_message_saving_is_disabled(self):
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(save_messages=False, message_max_chars=25000)
+        provider._start_session_init_background = MagicMock()
+
+        provider.sync_turn("hello", "world")
+
+        assert provider._sync_thread is None
+        provider._manager.get_or_create.assert_not_called()
+        provider._manager.save.assert_not_called()
+        provider._start_session_init_background.assert_not_called()
+
+
+class TestProfileScopedGatewaySessionKeys:
+    def _resolve(self, profile, gateway_key):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        cfg = HonchoClientConfig()
+        return provider._resolve_session_key(
+            cfg,
+            "ephemeral-session",
+            agent_identity=profile,
+            gateway_session_key=gateway_key,
+        )
+
+    def test_named_profiles_replace_only_the_legacy_main_namespace(self):
+        assert self._resolve("gameduo", "agent:main:telegram:dm:42") == (
+            "agent-gameduo-telegram-dm-42"
+        )
+        assert self._resolve("penguincouple", "agent:main:telegram:dm:42") == (
+            "agent-penguincouple-telegram-dm-42"
+        )
+
+    def test_default_like_profiles_preserve_legacy_namespace(self):
+        for profile in (None, "", "default", "custom", "main", "hermes"):
+            assert self._resolve(profile, "agent:main:telegram:dm:42") == (
+                "agent-main-telegram-dm-42"
+            )
+
+    def test_already_namespaced_gateway_key_is_unchanged(self):
+        assert self._resolve("gameduo", "agent:coder:telegram:dm:42") == (
+            "agent-coder-telegram-dm-42"
+        )
+
+    def test_profile_scoped_long_key_still_obeys_honcho_limit(self):
+        result = self._resolve("penguincouple", "agent:main:matrix:" + "x" * 300)
+        assert len(result) == 100
 
 
 # ---------------------------------------------------------------------------
@@ -2252,3 +2306,63 @@ class TestGetSessionContextFallback:
         peer_id, target = fetch_calls[0]
         assert peer_id == "ai-peer", f"expected ai-peer, got {peer_id}"
         assert target == "ai-peer"
+
+
+class TestExistingMessagePeerIsolation:
+    def _make_manager(self, existing_messages):
+        manager = HonchoSessionManager.__new__(HonchoSessionManager)
+        manager._cache = {}
+        manager._cache_lock = __import__("threading").RLock()
+        manager._config = SimpleNamespace(
+            peer_name="user-peer",
+            ai_peer="assistant-peer",
+            pin_peer_name=True,
+        )
+        manager._runtime_user_peer_name = None
+        manager._runtime_user_peer_name_alt = None
+        manager._get_or_create_peer = MagicMock(side_effect=lambda peer_id: peer_id)
+        manager._get_or_create_honcho_session = MagicMock(
+            return_value=(MagicMock(), existing_messages)
+        )
+        return manager
+
+    def test_unknown_foreign_peers_are_not_mislabeled_as_user(self, caplog):
+        existing = [
+            SimpleNamespace(
+                peer_id="user-peer",
+                content="local user",
+                created_at=datetime(2026, 7, 12, 1, 0, 0),
+            ),
+            SimpleNamespace(
+                peer_id="assistant-peer",
+                content="local assistant",
+                created_at=datetime(2026, 7, 12, 1, 0, 1),
+            ),
+            SimpleNamespace(
+                peer_id="foreign-assistant",
+                content="must not leak into the local transcript",
+                created_at=datetime(2026, 7, 12, 1, 0, 2),
+            ),
+        ]
+        manager = self._make_manager(existing)
+
+        with caplog.at_level("WARNING"):
+            session = manager.get_or_create("agent-gameduo-telegram-dm-42")
+
+        assert [(m["role"], m["content"]) for m in session.messages] == [
+            ("user", "local user"),
+            ("assistant", "local assistant"),
+        ]
+        assert "foreign-assistant" in caplog.text
+        assert "must not leak" not in caplog.text
+
+    def test_exact_peer_ids_determine_roles(self):
+        existing = [
+            SimpleNamespace(peer_id="assistant-peer", content="a", created_at=None),
+            SimpleNamespace(peer_id="user-peer", content="u", created_at=None),
+        ]
+        session = self._make_manager(existing).get_or_create("session")
+        assert [message["role"] for message in session.messages] == [
+            "assistant",
+            "user",
+        ]
