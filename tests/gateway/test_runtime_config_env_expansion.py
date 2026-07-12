@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -118,3 +123,60 @@ def test_gateway_runtime_loaders_expand_env_var_templates(
     loader = getattr(gateway_run.GatewayRunner, loader_name)
 
     assert loader() == expected
+
+
+def test_launchd_clean_env_resolves_key_env_from_active_profile_only(tmp_path):
+    project_root = Path(__file__).resolve().parents[2]
+    default_home = tmp_path / ".hermes"
+    profile_home = default_home / "profiles" / "gameduo"
+    profile_home.mkdir(parents=True)
+    (default_home / ".env").write_text(
+        "PROFILE_ONLY_KEY=default-sentinel\n", encoding="utf-8"
+    )
+    profile_env = profile_home / ".env"
+    profile_env.write_text("PROFILE_ONLY_KEY=profile-sentinel\n", encoding="utf-8")
+    profile_env.chmod(0o600)
+    (profile_home / "config.yaml").write_text(
+        "providers:\n"
+        "  profile-endpoint:\n"
+        "    api: http://127.0.0.1:9999/v1\n"
+        "    key_env: PROFILE_ONLY_KEY\n",
+        encoding="utf-8",
+    )
+    script = textwrap.dedent(
+        """
+        import json
+        from gateway import run  # noqa: F401 -- startup loads active .env
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        resolved = _get_named_custom_provider("custom:profile-endpoint") or {}
+        value = resolved.get("api_key")
+        print(json.dumps({
+            "profile": value == "profile-sentinel",
+            "default": value == "default-sentinel",
+        }))
+        """
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"HOME", "PATH", "PYTHONPATH", "VIRTUAL_ENV"}
+    }
+    env["HERMES_HOME"] = str(profile_home)
+    env.pop("PROFILE_ONLY_KEY", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "profile": True,
+        "default": False,
+    }
+    assert profile_env.stat().st_mode & 0o777 == 0o600

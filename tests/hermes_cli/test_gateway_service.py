@@ -491,6 +491,7 @@ class TestGeneratedSystemdUnits:
         link_node.symlink_to(real_node)
 
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: str(link_node) if cmd == "node" else None)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
 
         plist = gateway_cli.generate_launchd_plist()
 
@@ -3569,6 +3570,122 @@ class TestServiceWorkingDirIsStable:
         # The old conditional dict form must NOT appear
         assert "SuccessfulExit" not in plist
         assert "<key>KeepAlive</key>\n    <dict>" not in plist
+
+
+class TestLaunchdPortablePath:
+    @pytest.mark.parametrize(
+        ("profile_name", "relative_home"),
+        [
+            ("default", ".hermes"),
+            ("gameduo", ".hermes/profiles/gameduo"),
+            ("penguincouple", ".hermes/profiles/penguincouple"),
+        ],
+    )
+    def test_profile_plist_uses_canonical_checkout_and_portable_path(
+        self, profile_name, relative_home, tmp_path, monkeypatch
+    ):
+        import plistlib
+
+        machine_home = tmp_path / "penguin"
+        hermes_home = machine_home / relative_home
+        canonical_root = machine_home / ".hermes" / "hermes-agent"
+        project_root = canonical_root / ".worktrees" / "feature"
+        active_venv = project_root / ".venv"
+        canonical_venv = canonical_root / "venv"
+        canonical_dot_venv = canonical_root / ".venv"
+        project_node_bin = canonical_root / "node_modules" / ".bin"
+        profile_node_bin = hermes_home / "node" / "bin"
+        git_dir = canonical_root / ".git" / "worktrees" / "feature"
+        for directory in (
+            hermes_home,
+            active_venv / "bin",
+            canonical_venv / "bin",
+            canonical_dot_venv / "bin",
+            project_node_bin,
+            profile_node_bin,
+            git_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        (project_root / ".git").write_text(f"gitdir: {git_dir}\n")
+        canonical_python = canonical_venv / "bin" / "python"
+        canonical_python.write_text("#!/bin/sh\n")
+        (canonical_dot_venv / "bin" / "python").write_text("#!/bin/sh\n")
+
+        monkeypatch.setattr(Path, "home", lambda: machine_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", project_root)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: machine_home)
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: active_venv)
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda command: (
+                "/opt/homebrew/Cellar/node/24.4.1/bin/node"
+                if command == "node"
+                else None
+            ),
+        )
+        monkeypatch.setenv(
+            "PATH",
+            ":".join(
+                [
+                    "/private/var/folders/volatile/bin",
+                    "/opt/homebrew/Cellar/python@3.11/3.11.15/bin",
+                    "/tmp/transient-tool/bin",
+                ]
+            ),
+        )
+
+        plist_text = gateway_cli.generate_launchd_plist()
+        plist = plistlib.loads(plist_text.encode())
+        environment = plist["EnvironmentVariables"]
+        path_entries = environment["PATH"].split(":")
+
+        assert plist["ProgramArguments"][0] == str(canonical_python)
+        assert environment["VIRTUAL_ENV"] == str(canonical_venv)
+        assert path_entries == list(
+            dict.fromkeys(
+                [
+                    str(canonical_venv / "bin"),
+                    str(project_node_bin),
+                    str(profile_node_bin),
+                    str(machine_home / ".local" / "bin"),
+                    str(machine_home / ".orbstack" / "bin"),
+                    "/opt/homebrew/bin",
+                    "/opt/homebrew/sbin",
+                    "/usr/local/bin",
+                    "/usr/local/sbin",
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/sbin",
+                    "/sbin",
+                ]
+            )
+        )
+        assert ".worktrees" not in plist_text
+        assert not any("/Cellar/" in entry for entry in path_entries)
+        assert "/private/var/folders/volatile/bin" not in path_entries
+        assert "/tmp/transient-tool/bin" not in path_entries
+        assert environment["HERMES_HOME"] == str(hermes_home.resolve())
+        assert plist["WorkingDirectory"] == str(hermes_home.resolve())
+        if profile_name == "default":
+            assert "--profile" not in plist["ProgramArguments"]
+        else:
+            profile_index = plist["ProgramArguments"].index("--profile")
+            assert plist["ProgramArguments"][profile_index + 1] == profile_name
+
+
+    @pytest.mark.parametrize("git_marker", ["directory", "missing"])
+    def test_stable_project_root_preserves_non_worktree_checkout(
+        self, git_marker, tmp_path
+    ):
+        project_root = tmp_path / "custom-hermes"
+        project_root.mkdir()
+        if git_marker == "directory":
+            (project_root / ".git").mkdir()
+
+        assert gateway_cli._stable_launchd_project_root(project_root) == project_root
 
 
 class TestLaunchctlBootstrapEioRetry:
