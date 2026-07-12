@@ -193,7 +193,7 @@ Pick **[e]** at the prompt to set the three keys directly instead of going throu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `writeFrequency` | string/int | `"async"` | `"async"` (background), `"turn"` (sync per turn), `"session"` (batch on end), or integer N (every N turns) |
-| `saveMessages` | bool | `true` | Persist messages to Honcho API |
+| `saveMessages` | bool | `true` | Persist messages to Honcho API. When `false`, the Honcho provider is fully inactive: no remote session, network calls, or Honcho tools; existing remote data is unchanged |
 
 ### Session Resolution
 
@@ -220,6 +220,11 @@ The Honcho session name determines which conversation bucket memory lands in. Re
 Gateway platforms always resolve via priority 1 (per-chat isolation) regardless of `sessionStrategy`. The strategy setting only affects CLI sessions. For a named Hermes profile, the legacy `agent:main:*` key is rewritten only for the Honcho remote session (for example, `agent:gameduo:*`); the gateway's local database key is unchanged. Default-like profiles (`default`, `custom`, `main`, `hermes`) preserve `agent:main:*`, and already namespaced keys are left alone.
 
 If `sessionPeerPrefix` is `true`, the peer name is prepended to generated session-ID, title, repository, and directory keys: `alice-hermes-agent`. Gateway keys, manual-map values, and the global workspace key are not affected.
+
+When an existing Honcho session is loaded, Hermes imports messages only from
+the exact user and assistant peer IDs resolved for that session. Messages from
+any other peer are skipped. The warning records only the foreign peer ID and
+session ID; it never includes message content.
 
 #### What each strategy produces
 
