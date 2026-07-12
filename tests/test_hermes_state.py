@@ -75,6 +75,41 @@ def db(tmp_path):
     session_db.close()
 
 
+def _record_credential_usage(db, session_id, label=None):
+    """Record one real credential telemetry row for a session."""
+    db.update_token_counts(
+        session_id,
+        input_tokens=11,
+        output_tokens=7,
+        cache_read_tokens=3,
+        cache_write_tokens=2,
+        reasoning_tokens=5,
+        api_call_count=1,
+        billing_provider="test-provider",
+        credential_label=label or f"credential-{session_id}",
+        model="test-model",
+    )
+
+
+def _credential_usage_session_ids(db):
+    return [
+        row["session_id"]
+        for row in db._conn.execute(
+            "SELECT session_id FROM credential_usage ORDER BY id"
+        ).fetchall()
+    ]
+
+
+def _credential_usage_on_delete(conn):
+    rows = conn.execute("PRAGMA foreign_key_list('credential_usage')").fetchall()
+    for row in rows:
+        table = row["table"] if isinstance(row, sqlite3.Row) else row[2]
+        from_column = row["from"] if isinstance(row, sqlite3.Row) else row[3]
+        if table == "sessions" and from_column == "session_id":
+            return row["on_delete"] if isinstance(row, sqlite3.Row) else row[6]
+    return None
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================
@@ -2271,6 +2306,42 @@ class TestDeleteAndExport:
             "SELECT COUNT(*) FROM session_model_usage WHERE session_id = 'usage'"
         ).fetchone()[0]
         assert count == 0
+    def test_delete_session_cascades_only_matching_credential_usage(self, db):
+        db.create_session("delete-me", "cli")
+        db.create_session("keep-me", "cli")
+        _record_credential_usage(db, "delete-me")
+        _record_credential_usage(db, "keep-me")
+
+        assert db.delete_session("delete-me") is True
+
+        assert _credential_usage_session_ids(db) == ["keep-me"]
+
+    def test_delete_session_if_empty_cascades_credential_usage(self, db):
+        db.create_session("empty", "cli")
+        db.create_session("keep", "cli")
+        _record_credential_usage(db, "empty")
+        _record_credential_usage(db, "keep")
+
+        assert db.delete_session_if_empty("empty") is True
+
+        assert _credential_usage_session_ids(db) == ["keep"]
+
+    def test_prune_empty_ghost_sessions_cascades_credential_usage(self, db):
+        db.create_session("ghost", "tui")
+        db.end_session("ghost", end_reason="user_exit")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 2 * 86400, "ghost"),
+        )
+        db._conn.commit()
+        db.create_session("keep", "cli")
+        _record_credential_usage(db, "ghost")
+        _record_credential_usage(db, "keep")
+
+        assert db.prune_empty_ghost_sessions() == 1
+
+        assert _credential_usage_session_ids(db) == ["keep"]
+
 
     def test_delete_nonexistent(self, db):
         assert db.delete_session("nope") is False
@@ -2563,6 +2634,23 @@ class TestPruneSessions:
         session = db.get_session("new")
         assert session is not None
         assert session["id"] == "new"
+
+    def test_prune_sessions_cascades_only_matching_credential_usage(self, db):
+        db.create_session("old", "cli")
+        db.end_session("old", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 100 * 86400, "old"),
+        )
+        db._conn.commit()
+        db.create_session("recent", "cli")
+        db.end_session("recent", end_reason="done")
+        _record_credential_usage(db, "old")
+        _record_credential_usage(db, "recent")
+
+        assert db.prune_sessions(older_than_days=90) == 1
+
+        assert _credential_usage_session_ids(db) == ["recent"]
 
     def test_prune_skips_active_sessions(self, db):
         db.create_session(session_id="active", source="cli")
@@ -2911,6 +2999,15 @@ class TestBulkDeleteSessions:
         # Unlisted survives.
         assert db.get_session("c") is not None
 
+    def test_delete_sessions_cascades_only_matching_credential_usage(self, db):
+        for session_id in ("delete-a", "delete-b", "keep"):
+            db.create_session(session_id, "cli")
+            _record_credential_usage(db, session_id)
+
+        assert db.delete_sessions(["delete-a", "delete-b"]) == 2
+
+        assert _credential_usage_session_ids(db) == ["keep"]
+
     def test_returns_real_count_skipping_unknown_ids(self, db):
         """Unknown IDs are silently skipped — the return value reflects
         what was *actually* deleted, so the UI can show an accurate
@@ -3035,6 +3132,19 @@ class TestDeleteEmptySessions:
         assert db.get_session("empty2") is None
         assert db.get_session("hasmsg") is not None
         assert db.count_empty_sessions() == 0
+
+    def test_delete_empty_sessions_cascades_only_matching_credential_usage(self, db):
+        db.create_session("empty", "cli")
+        db.end_session("empty", end_reason="done")
+        db.create_session("keep", "cli")
+        db.end_session("keep", end_reason="done")
+        db.set_session_archived("keep", True)
+        _record_credential_usage(db, "empty")
+        _record_credential_usage(db, "keep")
+
+        assert db.delete_empty_sessions() == 1
+
+        assert _credential_usage_session_ids(db) == ["keep"]
 
     def test_skips_active_empty_sessions(self, db):
         """A live (un-ended) empty session is what you get during the
@@ -3456,6 +3566,172 @@ class TestSchemaInit:
     def test_foreign_keys_enabled(self, db):
         cursor = db._conn.execute("PRAGMA foreign_keys")
         assert cursor.fetchone()[0] == 1
+
+    def test_fresh_credential_usage_fk_uses_on_delete_cascade(self, db):
+        assert _credential_usage_on_delete(db._conn) == "CASCADE"
+
+    def test_legacy_credential_usage_fk_migrates_rows_index_and_is_idempotent(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "legacy_credential_usage.db"
+        columns = [
+            "id",
+            "session_id",
+            "timestamp",
+            "provider",
+            "credential_label",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "api_call_count",
+        ]
+        valid_rows = [
+            (
+                7,
+                "legacy-a",
+                101.25,
+                "provider-a",
+                "credential-a",
+                "model-a",
+                11,
+                7,
+                3,
+                2,
+                5,
+                1,
+            ),
+            (
+                11,
+                "legacy-b",
+                202.5,
+                "provider-b",
+                "credential-b",
+                "model-b",
+                22,
+                14,
+                6,
+                4,
+                10,
+                2,
+            ),
+        ]
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            f"""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES ({SCHEMA_VERSION});
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                parent_session_id TEXT REFERENCES sessions(id),
+                started_at REAL NOT NULL
+            );
+            CREATE TABLE credential_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                timestamp REAL NOT NULL,
+                provider TEXT,
+                credential_label TEXT,
+                model TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                api_call_count INTEGER DEFAULT 0
+            );
+            CREATE INDEX idx_credential_usage_time_provider
+                ON credential_usage(timestamp DESC, provider, credential_label);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, 'cli', ?)",
+            [("legacy-a", 100.0), ("legacy-b", 200.0)],
+        )
+        placeholders = ", ".join("?" for _ in columns)
+        conn.executemany(
+            f"INSERT INTO credential_usage ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            valid_rows,
+        )
+        # Foreign-key enforcement was not always enabled on legacy writers.
+        # The migration must not copy an orphan into the rebuilt FK table.
+        conn.execute(
+            f"INSERT INTO credential_usage ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            (
+                9,
+                "missing-session",
+                150.0,
+                "orphan-provider",
+                "orphan-credential",
+                "orphan-model",
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        read_only = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert _credential_usage_on_delete(read_only._conn) == "NO ACTION"
+            assert read_only._conn.execute(
+                "SELECT COUNT(*) FROM credential_usage"
+            ).fetchone()[0] == 3
+        finally:
+            read_only.close()
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            assert _credential_usage_on_delete(migrated._conn) == "CASCADE"
+            expected_rows = [dict(zip(columns, row)) for row in valid_rows]
+            actual_rows = [
+                dict(row)
+                for row in migrated._conn.execute(
+                    "SELECT * FROM credential_usage ORDER BY id"
+                ).fetchall()
+            ]
+            assert actual_rows == expected_rows
+            assert [
+                row["name"]
+                for row in migrated._conn.execute(
+                    "PRAGMA table_info('credential_usage')"
+                ).fetchall()
+            ] == columns
+            assert migrated._conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'index' "
+                "AND name = 'idx_credential_usage_time_provider'"
+            ).fetchone() is not None
+            assert migrated._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        finally:
+            migrated.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert _credential_usage_on_delete(reopened._conn) == "CASCADE"
+            assert [
+                dict(row)
+                for row in reopened._conn.execute(
+                    "SELECT * FROM credential_usage ORDER BY id"
+                ).fetchall()
+            ] == [dict(zip(columns, row)) for row in valid_rows]
+            assert reopened._conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'index' "
+                "AND name = 'idx_credential_usage_time_provider'"
+            ).fetchone() is not None
+        finally:
+            reopened.close()
 
     def test_tables_exist(self, db):
         cursor = db._conn.execute(
@@ -4337,6 +4613,27 @@ class TestListSessionsRich:
         assert db.delete_session("parent") is True
         assert db.get_session("delegate") is None
         assert db.get_session("branch") is not None
+
+    def test_delete_parent_cascades_delegate_credential_usage_only(self, db):
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+        for session_id in ("parent", "delegate", "branch"):
+            _record_credential_usage(db, session_id)
+
+        assert db.delete_session("parent") is True
+
+        assert _credential_usage_session_ids(db) == ["branch"]
 
     def test_v16_migration_tags_linked_delegate_rows(self, tmp_path):
         """Pre-marker linked subagent rows get tagged, then cascade with parent."""
