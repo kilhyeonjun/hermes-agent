@@ -455,13 +455,17 @@ def _resolve_codex_usage_credentials(
 ) -> tuple[str, str, Optional[str]]:
     """Resolve Codex quota credentials from the native runtime path.
 
-    Prefer explicit live-agent credentials, then the legacy singleton OAuth
-    state, then the credential pool.  Hermes's native OAuth setup now stores
-    device-code logins in the pool, so quota diagnostics must not depend only
-    on the older singleton store.
+    In automatic routing, prefer explicit live-agent credentials, then the
+    legacy singleton OAuth state, then the credential pool. Fixed or invalid
+    host route policy must go through the canonical runtime resolver before
+    considering a live-agent snapshot, because that snapshot can belong to
+    the previously selected account.
     """
+    from hermes_cli import auth as auth_mod
+
+    route_policy = auth_mod._load_codex_runtime_route_policy()
     explicit_key = str(api_key or "").strip()
-    if explicit_key:
+    if explicit_key and route_policy.get("mode") == "auto":
         return explicit_key, str(base_url or "").strip(), None
 
     # Tier 2: the native runtime resolver. It ALREADY falls back to the
@@ -469,8 +473,9 @@ def _resolve_codex_usage_credentials(
     # ``resolve_codex_runtime_credentials`` — issue #32992), so in a pool-only
     # setup this returns a usable ``source="credential_pool"`` token.
     #
-    # Only ``AuthError`` ("no creds" / rate-limited) is caught so tier 3 can
-    # run: a broad ``except Exception`` would (a) mask a transient refresh /
+    # Only automatic-mode ``AuthError`` ("no creds" / rate-limited) is caught
+    # so tier 3 can run. Fixed/invalid policy errors are re-raised; a broad
+    # ``except Exception`` would (a) mask a transient refresh /
     # network failure and silently hand back a DIFFERENT pool account's usage,
     # and (b) hide genuine programming errors. A refresh/network error must
     # propagate — the outer ``fetch_account_usage`` guard fails open (shows
@@ -482,15 +487,26 @@ def _resolve_codex_usage_credentials(
     try:
         creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
         account_id: Optional[str] = None
-        try:
-            token_data = _read_codex_tokens()
-            tokens = token_data.get("tokens") or {}
-            account_id = str(tokens.get("account_id", "") or "").strip() or None
-        except AuthError:
-            # Pool-only creds carry no singleton account_id; header is optional.
-            logger.debug("codex ▸ /usage account_id read failed (best-effort)", exc_info=True)
+        credential_source = str(creds.get("source") or "").strip()
+        if not credential_source.startswith("credential_pool"):
+            try:
+                token_data = _read_codex_tokens()
+                tokens = token_data.get("tokens") or {}
+                account_id = str(tokens.get("account_id", "") or "").strip() or None
+            except AuthError:
+                logger.debug(
+                    "codex ▸ /usage account_id read failed (best-effort)",
+                    exc_info=True,
+                )
+        else:
+            # A singleton account_id may belong to the opposite account. Pool
+            # entries do not guarantee an account-id field, so safely omit the
+            # optional header rather than mixing identities.
+            logger.debug("codex ▸ /usage omitting singleton account_id for pool token")
         return creds["api_key"], str(creds.get("base_url", "") or "").strip(), account_id
     except AuthError:
+        if route_policy.get("mode") != "auto":
+            raise
         logger.debug("codex ▸ /usage runtime resolver returned no creds; trying pool", exc_info=True)
 
     # Tier 3: direct pool select. Reached only when the resolver itself raises

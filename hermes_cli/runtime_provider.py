@@ -1406,20 +1406,29 @@ def _resolve_explicit_runtime(
 
     if provider == "openai-codex":
         base_url = explicit_base_url or DEFAULT_CODEX_BASE_URL
-        api_key = explicit_api_key
+        route_policy = auth_mod._load_codex_runtime_route_policy()
+        route_mode = route_policy.get("mode")
+        api_key = explicit_api_key if route_mode == "auto" else ""
         last_refresh = None
+        source = "explicit"
         if not api_key:
             creds = resolve_codex_runtime_credentials()
             api_key = creds.get("api_key", "")
             last_refresh = creds.get("last_refresh")
-            if not explicit_base_url:
+            if route_mode != "auto":
+                source = creds.get("source", "hermes-auth-store")
+                base_url = (
+                    creds.get("base_url", "").rstrip("/")
+                    or DEFAULT_CODEX_BASE_URL
+                )
+            elif not explicit_base_url:
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
         return {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
             "base_url": base_url,
             "api_key": api_key,
-            "source": "explicit",
+            "source": source,
             "last_refresh": last_refresh,
             "requested_provider": requested_provider,
         }
@@ -1821,7 +1830,12 @@ def resolve_runtime_provider(
                 "last_refresh": creds.get("last_refresh"),
                 "requested_provider": requested_provider,
             }
-        except AuthError:
+        except AuthError as exc:
+            if exc.code in {
+                "codex_fixed_route_unavailable",
+                "codex_route_policy_invalid",
+            }:
+                raise
             if requested_provider != "auto":
                 raise
             # Auto-detected Codex but credentials are stale/revoked —

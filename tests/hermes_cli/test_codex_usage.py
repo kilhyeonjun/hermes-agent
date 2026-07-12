@@ -1,3 +1,7 @@
+import io
+import json
+import urllib.error
+
 from hermes_cli.codex_usage import (
     annotate_usage_trends,
     apply_alert_policy,
@@ -12,6 +16,36 @@ from hermes_cli.codex_usage import (
     summarize_window,
     usage_bar,
 )
+
+
+def test_display_label_never_echoes_unknown_account_metadata():
+    from hermes_cli.codex_usage import display_label
+
+    secret_label = "private-seat-owner@example.invalid"
+
+    assert display_label(secret_label) == "unknown"
+
+
+def test_usage_policy_missing_is_empty_but_corrupt_or_unknown_is_invalid(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    policy_path = tmp_path / "codex_route_policy.json"
+    monkeypatch.setattr(codex_usage, "ROUTE_POLICY_PATH", policy_path)
+    assert codex_usage.load_route_policy() == {}
+
+    policy_path.write_text('{"mode":', encoding="utf-8")
+    assert codex_usage.load_route_policy() == {
+        "mode": "invalid",
+        "error": "Codex route policy is invalid",
+    }
+
+    policy_path.write_text('{"mode":"surprise"}', encoding="utf-8")
+    assert codex_usage.load_route_policy() == {
+        "mode": "invalid",
+        "error": "Codex route policy is invalid",
+    }
 
 
 def test_codex_route_command_registered_with_telegram_alias():
@@ -76,6 +110,9 @@ def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_
         def _available_entries(self, *, clear_expired=False, refresh=False):
             return entries
 
+        def _routable_entries(self, values):
+            return values
+
         def entries(self):
             return entries
 
@@ -119,10 +156,18 @@ def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_pa
         _strategy = "fill_first"
 
         def _available_entries(self, **_kwargs):
-            return [Entry()]
+            return [personal_entry, Entry()]
+
+        def _routable_entries(self, entries):
+            return [entry for entry in entries if entry.id == "company-id"]
 
         def entries(self):
-            return [Entry()]
+            return [personal_entry, Entry()]
+
+    personal_entry = Entry()
+    personal_entry.id = "personal-id"
+    personal_entry.label = "personal-backup"
+    personal_entry.priority = -10
 
     policy_path = tmp_path / "codex_route_policy.json"
     policy_path.write_text(
@@ -153,8 +198,133 @@ def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_pa
         "current_label": "company-plus-100",
         "mode": "fixed",
         "fixed_credential_id": "company-id",
-        "fixed_label": "company-plus-100",
+        "fixed_label": "company",
     }
+
+
+def test_collect_and_compact_redact_raw_label_and_http_error_body(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    private_label = "private-seat-owner@example.invalid"
+    private_body = '{"error":"private-owner@example.invalid token=secret"}'
+
+    class Entry:
+        id = "opaque-credential-id"
+        label = private_label
+        priority = 0
+        source = "manual"
+        last_status = None
+        last_error_reset_at = None
+        extra = {}
+        runtime_api_key = "opaque-runtime-token"
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, **_kwargs):
+            return [Entry()]
+
+        def _routable_entries(self, entries):
+            return entries
+
+        def entries(self):
+            return [Entry()]
+
+    error = urllib.error.HTTPError(
+        codex_usage.USAGE_URL,
+        403,
+        "Forbidden",
+        {},
+        io.BytesIO(private_body.encode("utf-8")),
+    )
+    monkeypatch.setattr(
+        codex_usage,
+        "ROUTE_POLICY_PATH",
+        tmp_path / "missing-route-policy.json",
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(
+        codex_usage,
+        "fetch_usage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    payload = codex_usage.collect()
+    account = payload["accounts"][0]
+    compact = codex_usage.render_compact(payload)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert account["label"] == private_label
+    assert account["error"] == {"kind": "http_error", "status": 403}
+    assert private_label not in compact
+    assert private_body not in serialized + compact
+    assert "private-owner@example.invalid" not in serialized + compact
+
+
+def test_json_and_compact_output_boundaries_redact_legacy_raw_error_payload(
+    monkeypatch, capsys
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    private_label = "private-seat-owner@example.invalid"
+    private_body = '{"error":"private-owner@example.invalid token=secret"}'
+    payload = {
+        "checked_at": "2026-07-13T09:00:00+09:00",
+        "provider": "openai-codex",
+        "routing": {"current_label": private_label},
+        "accounts": [
+            {
+                "credential_id": "opaque-credential-id",
+                "label": private_label,
+                "ok": False,
+                "http": 403,
+                "error": private_body,
+            }
+        ],
+        "recommendation": {"label": private_label, "reason": "safe reason"},
+    }
+
+    compact = codex_usage.render_compact(payload)
+    monkeypatch.setattr(codex_usage, "collect", lambda: payload)
+    monkeypatch.setattr(codex_usage, "load_history", lambda _path: [])
+    monkeypatch.setattr(codex_usage, "annotate_usage_trends", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_usage, "save_history_snapshot", lambda *_args, **_kwargs: None)
+
+    assert codex_usage.main(["--json"]) == 0
+    output = capsys.readouterr().out
+    public_payload = json.loads(output)
+
+    assert public_payload["accounts"][0]["label"] == "unknown"
+    assert public_payload["accounts"][0]["error"] == {
+        "kind": "http_error",
+        "status": 403,
+    }
+    assert private_label not in output + compact
+    assert private_body not in output + compact
+    assert "private-owner@example.invalid" not in output + compact
+
+
+def test_invalid_route_is_visible_and_cannot_show_an_opposite_current_account():
+    payload = {
+        "checked_at": "2026-07-10T08:30:00+09:00",
+        "routing": {
+            "strategy": "fill_first",
+            "current_label": "personal-backup",
+            "mode": "invalid",
+            "error": "Codex route policy is invalid",
+        },
+        "accounts": [],
+        "recommendation": {},
+    }
+
+    full = render_text(payload)
+    compact = render_compact(payload)
+
+    assert "Routing blocked: Codex route policy is invalid" in full
+    assert "Codex routing blocked" in compact
+    assert "personal" not in full + compact
 
 
 def test_recommendation_prefers_soonest_weekly_reset_then_usage_fallback():

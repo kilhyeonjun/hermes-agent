@@ -1937,6 +1937,204 @@ def test_auto_detected_codex_auth_failure_falls_through_to_openrouter(monkeypatc
     assert resolved["api_key"] == "test-or-key"
 
 
+@pytest.mark.parametrize(
+    "code",
+    ["codex_fixed_route_unavailable", "codex_route_policy_invalid"],
+)
+def test_auto_codex_fixed_route_errors_never_fall_through_provider(
+    monkeypatch, code
+):
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+    monkeypatch.setattr(rp, "load_config", lambda: {})
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda p: type(
+            "P",
+            (),
+            {
+                "has_credentials": lambda self: True,
+                "select": lambda self: None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda **kw: (_ for _ in ()).throw(
+            AuthError(
+                "Codex fixed route blocked",
+                provider="openai-codex",
+                code=code,
+                relogin_required=False,
+            )
+        ),
+    )
+
+    with pytest.raises(AuthError) as exc:
+        rp.resolve_runtime_provider(requested="auto")
+
+    assert exc.value.code == code
+
+
+def test_explicit_codex_key_cannot_bypass_fixed_host_route(monkeypatch):
+    explicit_key = "explicit-private-key"
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {
+            "mode": "fixed",
+            "credential_id": "fixed-target-id",
+            "label": "private-seat-owner@example.invalid",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "api_key": "fixed-route-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "source": "credential_pool-fixed",
+            "last_refresh": None,
+        },
+    )
+
+    resolved = rp._resolve_explicit_runtime(
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        model_cfg={},
+        explicit_api_key=explicit_key,
+    )
+
+    assert resolved["api_key"] == "fixed-route-key"
+    assert resolved["source"] == "credential_pool-fixed"
+    assert explicit_key not in str(resolved)
+
+
+def test_explicit_codex_base_url_cannot_bypass_fixed_host_route(monkeypatch):
+    explicit_base_url = "https://private-route.example.invalid/codex"
+    canonical_base_url = "https://chatgpt.com/backend-api/codex"
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {
+            "mode": "fixed",
+            "credential_id": "fixed-target-id",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "api_key": "fixed-route-key",
+            "base_url": canonical_base_url,
+            "source": "credential_pool-fixed",
+            "last_refresh": None,
+        },
+    )
+
+    resolved = rp._resolve_explicit_runtime(
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        model_cfg={},
+        explicit_base_url=explicit_base_url,
+    )
+
+    assert resolved["base_url"] == canonical_base_url
+    assert explicit_base_url not in str(resolved)
+
+
+def test_explicit_codex_key_cannot_bypass_invalid_host_route(monkeypatch):
+    from hermes_cli.auth import AuthError
+
+    private_label = "private-seat-owner@example.invalid"
+    explicit_key = "explicit-private-key"
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "invalid", "label": private_label},
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: (_ for _ in ()).throw(
+            AuthError(
+                "Codex route policy is invalid; credential resolution is blocked.",
+                provider="openai-codex",
+                code="codex_route_policy_invalid",
+                relogin_required=False,
+            )
+        ),
+    )
+
+    with pytest.raises(AuthError) as exc:
+        rp._resolve_explicit_runtime(
+            provider="openai-codex",
+            requested_provider="openai-codex",
+            model_cfg={},
+            explicit_api_key=explicit_key,
+        )
+
+    assert exc.value.code == "codex_route_policy_invalid"
+    assert private_label not in str(exc.value)
+    assert explicit_key not in str(exc.value)
+
+
+def test_explicit_codex_key_is_allowed_only_in_auto_route_mode(monkeypatch):
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "auto"},
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: pytest.fail("auto route must keep the explicit Codex key"),
+    )
+
+    resolved = rp._resolve_explicit_runtime(
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        model_cfg={},
+        explicit_api_key="explicit-auto-key",
+    )
+
+    assert resolved["api_key"] == "explicit-auto-key"
+    assert resolved["source"] == "explicit"
+
+
+def test_explicit_codex_base_url_is_preserved_in_auto_route_mode(monkeypatch):
+    explicit_base_url = "https://explicit-auto.example.invalid/codex"
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "auto"},
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "api_key": "auto-resolved-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "source": "hermes-auth-store",
+            "last_refresh": None,
+        },
+    )
+
+    resolved = rp._resolve_explicit_runtime(
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        model_cfg={},
+        explicit_base_url=explicit_base_url,
+    )
+
+    assert resolved["base_url"] == explicit_base_url
+    assert resolved["api_key"] == "auto-resolved-key"
+
+
 def test_explicit_nous_auth_failure_still_raises(monkeypatch):
     """When user explicitly requests Nous and auth fails, the error should propagate."""
     from hermes_cli.auth import AuthError

@@ -1,6 +1,136 @@
+import json
 import subprocess
 import sys
 import types
+
+import pytest
+
+
+def test_resolve_policy_records_exact_canonical_kind(tmp_path):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        '{"credential_pool":{"openai-codex":['
+        '{"id":"company-id","label":"company-plus-100"}]}}',
+        encoding="utf-8",
+    )
+
+    policy = codex_route.resolve_policy("company", auth)
+
+    assert policy == {
+        "mode": "fixed",
+        "credential_id": "company-id",
+        "label": "company-plus-100",
+        "kind": "company",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "label"),
+    [
+        ("company", "personal-company-plus"),
+        ("personal", "unclassified-account"),
+    ],
+)
+def test_resolve_policy_rejects_ambiguous_or_unknown_labels(tmp_path, mode, label):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {"id": "candidate-id", "label": label},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="계정을 찾지 못했습니다"):
+        codex_route.resolve_policy(mode, auth)
+
+
+def test_resolve_policy_rejects_duplicate_id_anywhere_in_pool(tmp_path):
+    from hermes_cli import codex_route
+
+    private_label = "private-seat-owner@example.invalid"
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "shared-id",
+                            "label": "company-plus-100",
+                        },
+                        {
+                            "id": "shared-id",
+                            "label": private_label,
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc:
+        codex_route.resolve_policy("company", auth)
+
+    assert "credential ID" in str(exc.value)
+    assert private_label not in str(exc.value)
+
+
+def test_load_policy_missing_is_auto_but_corrupt_or_unknown_is_rejected(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import codex_route
+
+    policy_path = tmp_path / "codex_route_policy.json"
+    monkeypatch.setattr(codex_route, "POLICY_PATH", policy_path)
+    assert codex_route.load_policy() == {"mode": "auto"}
+
+    policy_path.write_text('{"mode":', encoding="utf-8")
+    with pytest.raises(ValueError, match="policy is invalid"):
+        codex_route.load_policy()
+
+    policy_path.write_text('{"mode":"surprise"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="policy is invalid"):
+        codex_route.load_policy()
+
+
+def test_canonical_row_label_never_echoes_unknown_account_metadata(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import codex_route
+
+    secret_label = "private-seat-owner@example.invalid"
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {"id": "unknown-id", "label": secret_label},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_route, "DEFAULT_AUTH", auth)
+
+    label = codex_route.canonical_row_label(
+        {"id": "unknown-id", "label": secret_label}
+    )
+
+    assert label == "unknown"
+    assert secret_label not in label
 
 
 def test_codex_route_status_works_without_external_control_script(monkeypatch, tmp_path, capsys):

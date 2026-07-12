@@ -271,6 +271,194 @@ class TestResolveSessionAgentRuntimePriority:
         assert model == "session/model"
         assert runtime["provider"] == "anthropic"
 
+    def test_codex_session_override_uses_canonical_fixed_route_credentials(self):
+        from hermes_cli import auth as auth_mod
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        session_key = "agent:main:discord:channel:chan_1"
+        stale_pool = object()
+        fixed_pool = object()
+        runner._session_model_overrides = {
+            session_key: {
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_key": "stale-personal-token",
+                "base_url": "https://stale.invalid/codex",
+                "api_mode": "codex_responses",
+                "credential_pool": stale_pool,
+            },
+        }
+        canonical = {
+            "provider": "openai-codex",
+            "api_key": "fixed-company-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "credential_pool": fixed_pool,
+        }
+
+        with (
+            patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+            patch.object(
+                auth_mod,
+                "_load_codex_runtime_route_policy",
+                return_value={"mode": "fixed", "credential_id": "company-id"},
+            ),
+            patch("gateway.run._resolve_runtime_agent_kwargs") as global_resolver,
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                return_value=canonical,
+            ) as provider_resolver,
+        ):
+            model, runtime = runner._resolve_session_agent_runtime(
+                session_key=session_key,
+            )
+
+        assert model == "gpt-5.6-sol"
+        assert runtime == canonical
+        assert runtime["api_key"] != "stale-personal-token"
+        assert runtime["credential_pool"] is fixed_pool
+        global_resolver.assert_not_called()
+        provider_resolver.assert_called_once_with("openai-codex")
+
+    def test_codex_auto_session_override_keeps_live_credential_snapshot(self):
+        from hermes_cli import auth as auth_mod
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        session_key = "agent:main:discord:channel:chan_1"
+        live_pool = object()
+        snapshot = {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "api_key": "auto-session-snapshot",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "max_tokens": 1234,
+            "credential_pool": live_pool,
+        }
+        runner._session_model_overrides = {session_key: snapshot}
+
+        with (
+            patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+            patch.object(
+                auth_mod,
+                "_load_codex_runtime_route_policy",
+                return_value={"mode": "auto"},
+            ),
+            patch("gateway.run._resolve_runtime_agent_kwargs") as global_resolver,
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                side_effect=AssertionError(
+                    "auto session snapshot must not be replaced by global credentials"
+                ),
+            ) as provider_resolver,
+        ):
+            model, runtime = runner._resolve_session_agent_runtime(
+                session_key=session_key,
+            )
+
+        assert model == "gpt-5.6-sol"
+        assert runtime == {
+            "provider": "openai-codex",
+            "api_key": "auto-session-snapshot",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "max_tokens": 1234,
+            "credential_pool": live_pool,
+        }
+        global_resolver.assert_not_called()
+        provider_resolver.assert_not_called()
+
+    def test_codex_session_override_re_resolves_after_host_route_change(self):
+        from hermes_cli import auth as auth_mod
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        session_key = "agent:main:discord:channel:chan_1"
+        runner._session_model_overrides = {
+            session_key: {
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_key": "stale-personal-token",
+                "base_url": "https://stale.invalid/codex",
+            },
+        }
+        company = {
+            "provider": "openai-codex",
+            "api_key": "fixed-company-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "credential_pool": object(),
+        }
+        personal = {
+            **company,
+            "api_key": "fixed-personal-token",
+            "credential_pool": object(),
+        }
+        policy = {"mode": "fixed", "credential_id": "company-id"}
+
+        with (
+            patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+            patch.object(
+                auth_mod,
+                "_load_codex_runtime_route_policy",
+                side_effect=lambda: dict(policy),
+            ),
+            patch("gateway.run._resolve_runtime_agent_kwargs") as global_resolver,
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                side_effect=[company, personal],
+            ) as provider_resolver,
+        ):
+            _model, first_runtime = runner._resolve_session_agent_runtime(
+                session_key=session_key,
+            )
+            policy["credential_id"] = "personal-id"
+            _model, second_runtime = runner._resolve_session_agent_runtime(
+                session_key=session_key,
+            )
+
+        assert first_runtime["api_key"] == "fixed-company-token"
+        assert second_runtime["api_key"] == "fixed-personal-token"
+        assert first_runtime["credential_pool"] is not second_runtime["credential_pool"]
+        global_resolver.assert_not_called()
+        assert provider_resolver.call_count == 2
+
+    def test_invalid_codex_route_policy_cannot_use_stale_session_credentials(self):
+        from hermes_cli import auth as auth_mod
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        session_key = "agent:main:discord:channel:chan_1"
+        runner._session_model_overrides = {
+            session_key: {
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_key": "stale-personal-token",
+                "base_url": "https://stale.invalid/codex",
+            },
+        }
+
+        with (
+            patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+            patch.object(
+                auth_mod,
+                "_load_codex_runtime_route_policy",
+                return_value={"mode": "invalid"},
+            ),
+            patch("gateway.run._resolve_runtime_agent_kwargs") as global_resolver,
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                side_effect=RuntimeError("Codex route policy is invalid"),
+            ) as provider_resolver,
+            pytest.raises(RuntimeError, match="route policy is invalid"),
+        ):
+            runner._resolve_session_agent_runtime(session_key=session_key)
+
+        global_resolver.assert_not_called()
+        provider_resolver.assert_called_once_with("openai-codex")
+
     def test_parent_channel_model_inherited_in_thread(self):
         runner = object.__new__(GatewayRunner)
         runner._session_model_overrides = {}

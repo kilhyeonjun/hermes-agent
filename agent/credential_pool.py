@@ -42,6 +42,11 @@ from hermes_cli.auth import (
 logger = logging.getLogger(__name__)
 
 
+def _load_codex_route_policy() -> dict[str, Any]:
+    """Reuse the canonical host-wide runtime route-policy loader."""
+    return auth_mod._load_codex_runtime_route_policy()
+
+
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml read-only, returning None on any error.
 
@@ -595,12 +600,41 @@ class CredentialPool:
         # transition logs promptly instead of being swallowed by a stale window.
         self._last_no_entries_log_at: Optional[float] = None
 
+    def _fixed_route_constraint(self) -> tuple[bool, str]:
+        if self.provider != "openai-codex":
+            return False, ""
+        policy = _load_codex_route_policy()
+        mode = policy.get("mode")
+        if mode == "auto":
+            return False, ""
+        if mode != "fixed":
+            logger.error("credential pool: invalid Codex route policy; failing closed")
+            return True, ""
+        return True, str(policy.get("credential_id") or "").strip()
+
+    def _routable_entries(
+        self, entries: List[PooledCredential]
+    ) -> List[PooledCredential]:
+        fixed, credential_id = self._fixed_route_constraint()
+        if not fixed:
+            return entries
+        if not credential_id:
+            logger.error("credential pool: fixed Codex route has no credential id")
+            return []
+        pool_matches = [entry for entry in self._entries if entry.id == credential_id]
+        if len(pool_matches) != 1:
+            logger.error(
+                "credential pool: fixed Codex route credential is missing or duplicated"
+            )
+            return []
+        return [entry for entry in entries if entry.id == credential_id]
+
     def has_credentials(self) -> bool:
         return bool(self._entries)
 
     def has_available(self) -> bool:
         """True if at least one entry is not currently in exhaustion cooldown."""
-        return bool(self._available_entries())
+        return bool(self._routable_entries(self._available_entries()))
 
     def entries(self) -> List[PooledCredential]:
         return list(self._entries)
@@ -608,7 +642,11 @@ class CredentialPool:
     def current(self) -> Optional[PooledCredential]:
         if not self._current_id:
             return None
-        return next((entry for entry in self._entries if entry.id == self._current_id), None)
+        entry = next((entry for entry in self._entries if entry.id == self._current_id), None)
+        if entry is None:
+            return None
+        routable = self._routable_entries([entry])
+        return routable[0] if routable else None
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
@@ -1519,11 +1557,14 @@ class CredentialPool:
         reset to STATUS_OK and persisted.  When *refresh* is True, entries
         that need a token refresh are refreshed (skipped on failure).
         """
+        candidate_entries = self._routable_entries(self._entries)
+        if not candidate_entries:
+            return []
         now = time.time()
         cleared_any = False
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
-        for entry in self._entries:
+        for entry in candidate_entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
             # can remain unhydrated; never lease or select it as an empty key.
@@ -1686,9 +1727,9 @@ class CredentialPool:
 
     def peek(self) -> Optional[PooledCredential]:
         current = self.current()
-        if current is not None:
+        if current is not None and self._routable_entries([current]):
             return current
-        available = self._available_entries()
+        available = self._routable_entries(self._available_entries())
         return available[0] if available else None
 
     def mark_exhausted_and_rotate(
@@ -1700,7 +1741,44 @@ class CredentialPool:
     ) -> Optional[PooledCredential]:
         with self._lock:
             entry = None
-            if api_key_hint:
+            fixed, fixed_id = self._fixed_route_constraint()
+            if fixed:
+                # Under fixed/invalid Codex routing, a failure may arrive from
+                # a request that started before the host route changed. Only
+                # mutate a credential that is still attributable to the exact
+                # fixed target. Never select the new target to explain an old,
+                # unattributed failure.
+                if not fixed_id:
+                    return None
+                fixed_matches = [
+                    candidate
+                    for candidate in self._entries
+                    if candidate.id == fixed_id
+                ]
+                if len(fixed_matches) != 1:
+                    return None
+                fixed_target = fixed_matches[0]
+                if api_key_hint:
+                    entry = next(
+                        (
+                            candidate
+                            for candidate in self._entries
+                            if candidate.runtime_api_key == api_key_hint
+                        ),
+                        None,
+                    )
+                elif self._current_id:
+                    entry = next(
+                        (
+                            candidate
+                            for candidate in self._entries
+                            if candidate.id == self._current_id
+                        ),
+                        None,
+                    )
+                if entry is None or entry is not fixed_target:
+                    return None
+            elif api_key_hint:
                 # Prefer the specific entry whose API key matches the one that
                 # actually failed.  When this pool was freshly loaded from disk
                 # (another process already rotated), current() is None and
@@ -1709,7 +1787,7 @@ class CredentialPool:
                     (e for e in self._entries if e.runtime_api_key == api_key_hint),
                     None,
                 )
-            if entry is None:
+            if entry is None and not fixed:
                 entry = self.current() or self._select_unlocked()
             if entry is None:
                 return None
@@ -1746,12 +1824,26 @@ class CredentialPool:
         still return the least-leased one instead of blocking.
         """
         with self._lock:
+            fixed, fixed_id = self._fixed_route_constraint()
+            if fixed:
+                if not fixed_id or (credential_id and credential_id != fixed_id):
+                    return None
+                credential_id = fixed_id
+
             if credential_id:
+                if fixed:
+                    available = self._routable_entries(
+                        self._available_entries(clear_expired=True, refresh=True)
+                    )
+                    if not any(entry.id == credential_id for entry in available):
+                        return None
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
                 return credential_id
 
-            available = self._available_entries(clear_expired=True, refresh=True)
+            available = self._routable_entries(
+                self._available_entries(clear_expired=True, refresh=True)
+            )
             if not available:
                 return None
 
