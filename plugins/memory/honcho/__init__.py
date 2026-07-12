@@ -294,6 +294,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+        self._disabled_by_config = False
 
     @property
     def name(self) -> str:
@@ -304,8 +305,16 @@ class HonchoMemoryProvider(MemoryProvider):
         try:
             from plugins.memory.honcho.client import HonchoClientConfig
             cfg = HonchoClientConfig.from_global_config()
-            return cfg.enabled and bool(cfg.api_key or cfg.base_url)
+            # A configured endpoint is insufficient when message persistence is disabled;
+            # keep the provider out of tool registration in that inactive mode.
+            self._disabled_by_config = not getattr(cfg, "save_messages", True)
+            return (
+                not self._disabled_by_config
+                and cfg.enabled
+                and bool(cfg.api_key or cfg.base_url)
+            )
         except Exception:
+            self._disabled_by_config = True
             return False
 
     def save_config(self, values, hermes_home):
@@ -355,8 +364,12 @@ class HonchoMemoryProvider(MemoryProvider):
             from plugins.memory.honcho.session import HonchoSessionManager
 
             cfg = HonchoClientConfig.from_global_config()
+            self._disabled_by_config = not getattr(cfg, "save_messages", True)
             if not cfg.enabled or not (cfg.api_key or cfg.base_url):
                 logger.debug("Honcho not configured — plugin inactive")
+                return
+            if self._disabled_by_config:
+                logger.debug("Honcho message saving disabled — plugin inactive")
                 return
 
             self._config = cfg
@@ -1432,7 +1445,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         Context-only mode exposes no Honcho tools.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._disabled_by_config:
             return []
         if self._recall_mode == "context":
             return []

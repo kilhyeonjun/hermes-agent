@@ -882,6 +882,41 @@ class TestProfileScopedGatewaySessionKeys:
 class TestToolsModeInitBehavior:
     """Verify initOnSessionStart controls session init timing in tools mode."""
 
+    def test_save_messages_false_stops_before_client_or_session_initialization(self):
+        """Disabled persistence must be a true no-client/no-session boundary."""
+        from plugins.memory.honcho.client import HonchoClientConfig
+        from unittest.mock import patch
+
+        cfg = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="tools",
+            init_on_session_start=True,
+            save_messages=False,
+        )
+        provider = HonchoMemoryProvider()
+
+        with patch(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            return_value=cfg,
+        ), patch(
+            "plugins.memory.honcho.client.get_honcho_client"
+        ) as get_client, patch(
+            "plugins.memory.honcho.session.HonchoSessionManager"
+        ) as manager_cls:
+            assert provider.is_available() is False
+            provider.initialize(session_id="disabled-persistence")
+
+        get_client.assert_not_called()
+        manager_cls.assert_not_called()
+        assert provider._config is None
+        assert provider._manager is None
+        assert provider._session_initialized is False
+        assert provider._lazy_init_kwargs is None
+        assert provider._lazy_init_session_id is None
+        assert provider._init_thread is None
+        assert provider.get_tool_schemas() == []
+
     def _make_provider_with_config(self, recall_mode="tools", init_on_session_start=False,
                                     peer_name=None, user_id=None, user_id_alt=None):
         """Create a HonchoMemoryProvider with mocked config and dependencies."""
