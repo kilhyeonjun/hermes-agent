@@ -70,9 +70,22 @@ def _codex_override():
     return {
         "model": "gpt-5.4",
         "provider": "openai-codex",
-        "api_key": "***",
+        "api_key": "stale-session-token",
+        "base_url": "https://stale.invalid/codex",
+        "api_mode": "codex_responses",
+    }
+
+
+def _canonical_codex_runtime(provider):
+    assert provider == "openai-codex"
+    return {
+        "provider": "openai-codex",
+        "api_key": "fixed-company-token",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "api_mode": "codex_responses",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
     }
 
 
@@ -83,9 +96,23 @@ def _explode_runtime_resolution():
 
 
 def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
+    from hermes_cli import auth as auth_mod
+
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        _canonical_codex_runtime,
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "fixed", "credential_id": "company-id"},
+    )
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = _CapturingAgent
@@ -103,7 +130,10 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     )
     session_key = "agent:main:local:dm"
     runner._session_model_overrides[session_key] = _codex_override()
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_reasoning_overrides[session_key] = {
+        "enabled": True,
+        "effort": "high",
+    }
 
     result = asyncio.run(
         runner._run_agent(
@@ -121,15 +151,37 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
     assert _CapturingAgent.last_init["provider"] == "openai-codex"
     assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
-    assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
-    assert _CapturingAgent.last_init["api_key"] == "***"
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert (
+        _CapturingAgent.last_init["base_url"]
+        == "https://chatgpt.com/backend-api/codex"
+    )
+    assert _CapturingAgent.last_init["api_key"] == "fixed-company-token"
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "high",
+    }
 
 
 @pytest.mark.asyncio
-async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
+async def test_background_task_prefers_session_override_over_global_runtime(
+    monkeypatch,
+):
+    from hermes_cli import auth as auth_mod
+
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        _canonical_codex_runtime,
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "fixed", "credential_id": "company-id"},
+    )
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = _CapturingAgent
@@ -152,7 +204,10 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     )
     session_key = runner._session_key_for_source(source)
     runner._session_model_overrides[session_key] = _codex_override()
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_reasoning_overrides[session_key] = {
+        "enabled": True,
+        "effort": "high",
+    }
 
     await runner._run_background_task("say hello", source, "bg_test")
 
@@ -160,9 +215,16 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
     assert _CapturingAgent.last_init["provider"] == "openai-codex"
     assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
-    assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
-    assert _CapturingAgent.last_init["api_key"] == "***"
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert (
+        _CapturingAgent.last_init["base_url"]
+        == "https://chatgpt.com/backend-api/codex"
+    )
+    assert _CapturingAgent.last_init["api_key"] == "fixed-company-token"
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "high",
+    }
+
 
 def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
     """Regression: fallback provider must not inherit the primary model.
@@ -260,4 +322,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-

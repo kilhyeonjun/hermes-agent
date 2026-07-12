@@ -19,6 +19,7 @@ from gateway.config import PlatformConfig, Platform
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
+    PickerCallbackOutcome,
     SendResult,
     _reply_anchor_for_event,
     _thread_metadata_for_source,
@@ -961,6 +962,44 @@ async def test_session_runtime_picker_callback_applies_only_the_selected_preset(
     callback.assert_awaited_once_with("gpt-5.6-sol", "max")
     assert adapter._session_runtime_picker_state == {}
     query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_toast"),
+    [
+        ("expired", "선택이 만료되었습니다."),
+        ("cancelled", "선택을 취소했습니다."),
+        ("failure", "설정에 실패했습니다."),
+    ],
+)
+async def test_session_runtime_non_success_outcome_never_emits_success_toast(
+    status, expected_toast
+):
+    adapter = _make_adapter()
+    callback = AsyncMock(
+        return_value=PickerCallbackOutcome(
+            f"callback ended with {status}", status=status
+        )
+    )
+    adapter._session_runtime_picker_state = {
+        ("123", 780): {
+            "session_key": "telegram:123:20197",
+            "on_selected": callback,
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=780),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_session_runtime_picker_callback(
+        query, "sr:sol", "123"
+    )
+
+    query.answer.assert_awaited_with(text=expected_toast)
+    assert query.answer.await_args.kwargs["text"] != "이 세션에만 적용했습니다."
 
 
 @pytest.mark.asyncio

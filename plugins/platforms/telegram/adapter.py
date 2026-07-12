@@ -207,6 +207,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    PickerCallbackOutcome,
     ProcessingOutcome,
     SendResult,
     classify_send_error,
@@ -230,6 +231,26 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+
+
+_MODEL_PICKER_OUTCOME_TOASTS = {
+    "success": "Model switched!",
+    "expired": "Picker expired.",
+    "cancelled": "Switch cancelled.",
+    "failure": "Switch failed.",
+}
+_SESSION_PICKER_OUTCOME_TOASTS = {
+    "expired": "선택이 만료되었습니다.",
+    "cancelled": "선택을 취소했습니다.",
+    "failure": "설정에 실패했습니다.",
+}
+
+
+def _coerce_picker_callback_outcome(value) -> PickerCallbackOutcome:
+    """Keep legacy string callbacks successful while honoring explicit state."""
+    if isinstance(value, PickerCallbackOutcome):
+        return value
+    return PickerCallbackOutcome(str(value), status="success")
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -5100,21 +5121,26 @@ class TelegramAdapter(BasePlatformAdapter):
         # apply the same session-scoped selection.
         self._session_runtime_picker_state.pop(state_key, None)
         try:
-            text = await callback(*preset)
+            outcome = _coerce_picker_callback_outcome(await callback(*preset))
         except Exception as exc:
             logger.warning("Session runtime selection failed: %s", exc)
             await query.answer(text="설정에 실패했습니다.")
             return
         self._session_runtime_picker_state.pop(state_key, None)
-        answer_text = (
+        success_text = (
             "상세 모델 선택기를 열었습니다."
             if preset == ("", "model")
             else "이 세션에만 적용했습니다."
         )
+        answer_text = outcome.toast or (
+            success_text
+            if outcome.status == "success"
+            else _SESSION_PICKER_OUTCOME_TOASTS[outcome.status]
+        )
         await query.answer(text=answer_text)
         try:
             await query.edit_message_text(
-                text=self.format_message(text),
+                text=self.format_message(outcome.text),
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=None,
             )
@@ -5385,13 +5411,16 @@ class TelegramAdapter(BasePlatformAdapter):
             # Atomically consume before user code. A second confirmation update
             # then fails closed at the dispatcher instead of applying twice.
             self._model_picker_state.pop(state_key, None)
-            switch_failed = False
             try:
-                result_text = await callback(chat_id, model_id, provider_slug)
+                outcome = _coerce_picker_callback_outcome(
+                    await callback(chat_id, model_id, provider_slug)
+                )
             except Exception as exc:
                 logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
-                switch_failed = True
+                outcome = PickerCallbackOutcome(
+                    f"Error switching model: {exc}", status="failure"
+                )
+            result_text = outcome.text
 
             try:
                 await query.edit_message_text(
@@ -5409,7 +5438,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             await query.answer(
-                text="Switch failed." if switch_failed else "Model switched!"
+                text=outcome.toast or _MODEL_PICKER_OUTCOME_TOASTS[outcome.status]
             )
             self._model_picker_state.pop(state_key, None)
 
@@ -5470,13 +5499,16 @@ class TelegramAdapter(BasePlatformAdapter):
             if not await self._validate_picker_callback(query, data, chat_id):
                 return
             self._model_picker_state.pop(state_key, None)
-            switch_failed = False
             try:
-                result_text = await callback(chat_id, model_id, provider_slug)
+                outcome = _coerce_picker_callback_outcome(
+                    await callback(chat_id, model_id, provider_slug)
+                )
             except Exception as exc:
                 logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
-                switch_failed = True
+                outcome = PickerCallbackOutcome(
+                    f"Error switching model: {exc}", status="failure"
+                )
+            result_text = outcome.text
 
             # Edit message to show confirmation, remove buttons
             try:
@@ -5496,7 +5528,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             await query.answer(
-                text="Switch failed." if switch_failed else "Model switched!"
+                text=outcome.toast or _MODEL_PICKER_OUTCOME_TOASTS[outcome.status]
             )
 
             # Clean up state

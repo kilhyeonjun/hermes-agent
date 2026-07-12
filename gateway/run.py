@@ -3765,6 +3765,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        codex_override = bool(
+            override
+            and str(override.get("provider") or "").strip() == "openai-codex"
+        )
+        codex_policy_enforced = False
+        if codex_override:
+            from hermes_cli import auth as auth_mod
+
+            codex_policy_enforced = (
+                auth_mod._load_codex_runtime_route_policy().get("mode") != "auto"
+            )
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -3775,7 +3786,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
-            if override_runtime.get("api_key"):
+            if override_runtime.get("api_key") and not codex_policy_enforced:
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
                         override.get("provider")
@@ -3786,12 +3797,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
-            logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                resolved_session_key or "", model, override_model,
-            )
+            if codex_policy_enforced:
+                logger.debug(
+                    "Session Codex override: session=%s config_model=%s override_model=%s; re-resolving host route",
+                    resolved_session_key or "", model, override_model,
+                )
+            else:
+                # Override exists but has no api_key — fall through to env-based
+                # resolution and apply model/provider from the override on top.
+                logger.debug(
+                    "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
+                    resolved_session_key or "", model, override_model,
+                )
         else:
             logger.debug(
                 "No session model override: session=%s config_model=%s override_keys=%s",
@@ -3799,7 +3816,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if codex_policy_enforced:
+            # A session /model override outlives host-wide /codex-route
+            # changes. Never reuse the credential snapshot captured when the
+            # override was created: fixed/invalid route policy must be
+            # enforced by the canonical provider resolver on every turn.
+            runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider("openai-codex")
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -3810,7 +3834,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             model = runtime_model
 
         cfg = getattr(self, "config", None)
-        if cfg and source is not None:
+        if cfg and source is not None and not codex_policy_enforced:
             chat_id = str(source.chat_id) if source.chat_id else ""
             thread_id = (
                 str(source.thread_id) if getattr(source, "thread_id", None) else None
@@ -3841,9 +3865,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         model = ch_runtime_model
 
         if override and resolved_session_key:
-            model, runtime_kwargs = self._apply_session_model_override(
-                resolved_session_key, model, runtime_kwargs
-            )
+            if codex_policy_enforced:
+                model = override_model
+                if override.get("max_tokens") is not None:
+                    runtime_kwargs["max_tokens"] = override["max_tokens"]
+            else:
+                model, runtime_kwargs = self._apply_session_model_override(
+                    resolved_session_key, model, runtime_kwargs
+                )
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),

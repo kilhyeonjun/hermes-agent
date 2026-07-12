@@ -33,7 +33,12 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
 from gateway.config import HomeChannel, Platform, PlatformConfig
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.platforms.base import (
+    EphemeralReply,
+    MessageEvent,
+    MessageType,
+    PickerCallbackOutcome,
+)
 from gateway.session import (
     SessionSource,
     build_session_key,
@@ -87,6 +92,22 @@ def _model_switch_skew_guard() -> Optional[str]:
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
+    _PICKER_EXPIRED_REPLY = (
+        "Picker expired — open a new picker in the current session."
+    )
+
+    @staticmethod
+    def _picker_session_is_current(checker) -> bool:
+        """Evaluate a picker binding fail-closed; unbound command paths pass."""
+        if checker is None:
+            return True
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -100,7 +121,7 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    def _picker_session_binding(self, source, session_key: str) -> Dict[str, Any]:
+    def _picker_session_binding(self, source, session_key: str) -> dict[str, Any]:
         """Snapshot the principal and concrete session behind a new picker."""
         owner_user_id = str(getattr(source, "user_id", "") or "")
         session_id = ""
@@ -1495,8 +1516,33 @@ class GatewaySlashCommandsMixin:
                 "`/model gpt-5.6-sol --session`\n`/reasoning high`"
             )
 
+        picker_binding = self._picker_session_binding(source, session_key)
+        is_session_current = picker_binding.get("is_session_current")
+
+        def _session_expired() -> bool:
+            return not self._picker_session_is_current(is_session_current)
+
+        def _outcome(
+            text: str,
+            *,
+            status: str = "success",
+            toast: Optional[str] = None,
+        ) -> PickerCallbackOutcome:
+            return PickerCallbackOutcome(text, status=status, toast=toast)
+
+        def _non_success(result) -> bool:
+            return (
+                isinstance(result, PickerCallbackOutcome)
+                and result.status != "success"
+            )
+
         async def _on_selected(model: str, effort: str) -> str:
+            if _session_expired():
+                return _outcome(self._PICKER_EXPIRED_REPLY, status="expired")
+
             if effort == "reset":
+                if _session_expired():
+                    return _outcome(self._PICKER_EXPIRED_REPLY, status="expired")
                 self._session_model_overrides.pop(session_key, None)
                 try:
                     self.session_store.set_model_override(session_key, None)
@@ -1504,27 +1550,50 @@ class GatewaySlashCommandsMixin:
                     logger.debug("Failed to clear session model override", exc_info=True)
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
-                return "✅ 이 세션만 프로필 기본값으로 복귀했습니다."
+                return _outcome("✅ 이 세션만 프로필 기본값으로 복귀했습니다.")
 
             if effort == "model":
                 result = await self._handle_model_command(
-                    _args_event("--session")
+                    _args_event("--session"),
+                    is_session_current=is_session_current,
                 )
-                return result or "🔧 상세 모델 선택기를 열었습니다."
+                if _session_expired():
+                    return _outcome(self._PICKER_EXPIRED_REPLY, status="expired")
+                if _non_success(result):
+                    return result
+                return _outcome(result or "🔧 상세 모델 선택기를 열었습니다.")
 
             if not model:
-                return await self._handle_reasoning_command(
-                    _args_event(effort)
+                result = await self._handle_reasoning_command(
+                    _args_event(effort),
+                    is_session_current=is_session_current,
                 )
+                if _session_expired():
+                    return _outcome(self._PICKER_EXPIRED_REPLY, status="expired")
+                if _non_success(result):
+                    return result
+                return _outcome(result)
 
             model_result = await self._handle_model_command(
-                _args_event(f"{model} --session")
+                _args_event(f"{model} --session"),
+                is_session_current=is_session_current,
             )
+            if _session_expired():
+                return _outcome(self._PICKER_EXPIRED_REPLY, status="expired")
+            if _non_success(model_result):
+                return model_result
             effort_result = await self._handle_reasoning_command(
-                _args_event(effort)
+                _args_event(effort),
+                is_session_current=is_session_current,
             )
-            return "\n\n".join(
-                result for result in (model_result, effort_result) if result
+            if _session_expired():
+                return _outcome(self._PICKER_EXPIRED_REPLY, status="expired")
+            if _non_success(effort_result):
+                return effort_result
+            return _outcome(
+                "\n\n".join(
+                    result for result in (model_result, effort_result) if result
+                )
             )
 
         result = await adapter.send_session_runtime_picker(
@@ -1536,7 +1605,7 @@ class GatewaySlashCommandsMixin:
             metadata=self._thread_metadata_for_source(
                 source, self._reply_anchor_for_event(event)
             ),
-            **self._picker_session_binding(source, session_key),
+            **picker_binding,
         )
         if not getattr(result, "success", False):
             return "❌ 세션 모델 선택 버튼을 열지 못했습니다."
@@ -1585,7 +1654,12 @@ class GatewaySlashCommandsMixin:
             return "❌ 세션 FAST 선택 버튼을 열지 못했습니다."
         return None
 
-    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_model_command(
+        self,
+        event: MessageEvent,
+        *,
+        is_session_current=None,
+    ) -> Optional[str]:
         """Handle /model command — switch model.
 
         Supports:
@@ -1605,6 +1679,17 @@ class GatewaySlashCommandsMixin:
             list_picker_providers,
         )
         from hermes_cli.providers import get_label
+
+        def _session_expired() -> bool:
+            return not self._picker_session_is_current(is_session_current)
+
+        def _command_reply(text: str, *, status: str = "success"):
+            if is_session_current is not None:
+                return PickerCallbackOutcome(text, status=status)
+            return text
+
+        if _session_expired():
+            return _command_reply(self._PICKER_EXPIRED_REPLY, status="expired")
 
         raw_args = event.get_command_args().strip()
 
@@ -1658,6 +1743,8 @@ class GatewaySlashCommandsMixin:
         # the override is stored under the key the next message turn reads
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        if _session_expired():
+            return _command_reply(self._PICKER_EXPIRED_REPLY, status="expired")
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         if override:
@@ -1693,6 +1780,11 @@ class GatewaySlashCommandsMixin:
                 except Exception:
                     providers = []
 
+                if _session_expired():
+                    return _command_reply(
+                        self._PICKER_EXPIRED_REPLY, status="expired"
+                    )
+
                 if providers:
                     # Build a callback closure for when the user picks a model.
                     # Captures self + locals needed for the switch logic.
@@ -1702,14 +1794,37 @@ class GatewaySlashCommandsMixin:
                     _cur_provider = current_provider
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
+                    picker_binding = (
+                        self._picker_session_binding(source, session_key)
+                        if source.platform == Platform.TELEGRAM
+                        else {}
+                    )
+                    picker_session_current = picker_binding.get(
+                        "is_session_current"
+                    )
+
+                    def _callback_outcome(
+                        text: str,
+                        *,
+                        status: str = "success",
+                    ):
+                        if source.platform == Platform.TELEGRAM:
+                            return PickerCallbackOutcome(text, status=status)
+                        return text
 
                     async def _on_model_selected(
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
+                        if not _self._picker_session_is_current(
+                            picker_session_current
+                        ):
+                            return _callback_outcome(
+                                _self._PICKER_EXPIRED_REPLY, status="expired"
+                            )
                         skew_error = _model_switch_skew_guard()
                         if skew_error:
-                            return skew_error
+                            return _callback_outcome(skew_error, status="failure")
                         # Offload the switch off the event loop — switch_model()
                         # can fall through to a synchronous models.dev HTTP fetch
                         # (requests.get, 15s timeout) on a cold/expired cache,
@@ -1721,13 +1836,25 @@ class GatewaySlashCommandsMixin:
                             current_model=_cur_model,
                             current_base_url=_cur_base_url,
                             current_api_key=_cur_api_key,
-                            is_global=persist_global,
+                            is_global=False,
                             explicit_provider=provider_slug,
                             user_providers=user_provs,
                             custom_providers=custom_provs,
                         )
+                        if not _self._picker_session_is_current(
+                            picker_session_current
+                        ):
+                            return _callback_outcome(
+                                _self._PICKER_EXPIRED_REPLY, status="expired"
+                            )
                         if not result.success:
-                            return t("gateway.model.error_prefix", error=result.error_message)
+                            return _callback_outcome(
+                                t(
+                                    "gateway.model.error_prefix",
+                                    error=result.error_message,
+                                ),
+                                status="failure",
+                            )
 
                         try:
                             from hermes_cli.context_switch_guard import (
@@ -1738,12 +1865,19 @@ class GatewaySlashCommandsMixin:
                                 result,
                                 _self,
                                 session_key=_session_key,
-                                source=event.source,
+                                source=source,
                                 custom_providers=custom_provs,
                                 load_gateway_config=_load_gateway_config,
                             )
                         except Exception as exc:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
+
+                        if not _self._picker_session_is_current(
+                            picker_session_current
+                        ):
+                            return _callback_outcome(
+                                _self._PICKER_EXPIRED_REPLY, status="expired"
+                            )
 
                         # Update cached agent in-place
                         cached_entry = None
@@ -1774,13 +1908,23 @@ class GatewaySlashCommandsMixin:
                                 logger.warning(
                                     "Picker model switch failed for cached agent: %s", exc
                                 )
-                                return t(
-                                    "gateway.model.error_prefix",
-                                    error=(
-                                        f"Model switch to {result.new_model} failed ({exc}); "
-                                        f"staying on {_cur_model}."
+                                return _callback_outcome(
+                                    t(
+                                        "gateway.model.error_prefix",
+                                        error=(
+                                            f"Model switch to {result.new_model} failed ({exc}); "
+                                            f"staying on {_cur_model}."
+                                        ),
                                     ),
+                                    status="failure",
                                 )
+
+                        if not _self._picker_session_is_current(
+                            picker_session_current
+                        ):
+                            return _callback_outcome(
+                                _self._PICKER_EXPIRED_REPLY, status="expired"
+                            )
 
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
@@ -1788,7 +1932,7 @@ class GatewaySlashCommandsMixin:
                         if _sess_db is not None:
                             try:
                                 _sess_entry = _self.session_store.get_or_create_session(
-                                    event.source
+                                    source
                                 )
                                 await _sess_db.update_session_model(
                                     _sess_entry.session_id, result.new_model
@@ -1797,6 +1941,13 @@ class GatewaySlashCommandsMixin:
                                 logger.debug(
                                     "Failed to persist model switch to DB: %s", exc
                                 )
+
+                        if not _self._picker_session_is_current(
+                            picker_session_current
+                        ):
+                            return _callback_outcome(
+                                _self._PICKER_EXPIRED_REPLY, status="expired"
+                            )
 
                         # Store model note + session override
                         if not hasattr(_self, "_pending_model_notes"):
@@ -1837,6 +1988,13 @@ class GatewaySlashCommandsMixin:
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
                         if persist_global:
+                            if not _self._picker_session_is_current(
+                                picker_session_current
+                            ):
+                                return _callback_outcome(
+                                    _self._PICKER_EXPIRED_REPLY,
+                                    status="expired",
+                                )
                             try:
                                 if config_path.exists():
                                     with open(config_path, encoding="utf-8") as f:
@@ -1900,14 +2058,9 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
-                        return "\n".join(lines)
+                        return _callback_outcome("\n".join(lines))
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    picker_binding = (
-                        self._picker_session_binding(source, session_key)
-                        if source.platform == Platform.TELEGRAM
-                        else {}
-                    )
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -1918,6 +2071,10 @@ class GatewaySlashCommandsMixin:
                         metadata=metadata,
                         **picker_binding,
                     )
+                    if _session_expired():
+                        return _command_reply(
+                            self._PICKER_EXPIRED_REPLY, status="expired"
+                        )
                     if result.success:
                         return None  # Picker sent — adapter handles the response
 
@@ -1937,6 +2094,10 @@ class GatewaySlashCommandsMixin:
                     custom_providers=custom_provs,
                     max_models=5,
                 )
+                if _session_expired():
+                    return _command_reply(
+                        self._PICKER_EXPIRED_REPLY, status="expired"
+                    )
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
                     lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
@@ -1958,7 +2119,7 @@ class GatewaySlashCommandsMixin:
         # Perform the switch
         skew_error = _model_switch_skew_guard()
         if skew_error:
-            return skew_error
+            return _command_reply(skew_error, status="failure")
         # Offload the switch off the event loop — switch_model() can fall
         # through to a synchronous models.dev HTTP fetch (requests.get, 15s
         # timeout) on a cold/expired cache, which freezes the gateway
@@ -1976,8 +2137,14 @@ class GatewaySlashCommandsMixin:
             custom_providers=custom_provs,
         )
 
+        if _session_expired():
+            return _command_reply(self._PICKER_EXPIRED_REPLY, status="expired")
+
         if not result.success:
-            return t("gateway.model.error_prefix", error=result.error_message)
+            return _command_reply(
+                t("gateway.model.error_prefix", error=result.error_message),
+                status="failure",
+            )
 
         try:
             from hermes_cli.context_switch_guard import (
@@ -1997,6 +2164,10 @@ class GatewaySlashCommandsMixin:
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
+            if _session_expired():
+                return _command_reply(
+                    self._PICKER_EXPIRED_REPLY, status="expired"
+                )
             # If there's a cached agent, update it in-place
             cached_entry = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -2022,13 +2193,21 @@ class GatewaySlashCommandsMixin:
                     # conversation (#50163).  Without this early return the
                     # next message rebuilds a broken agent from the override.
                     logger.warning("In-place model switch failed for cached agent: %s", exc)
-                    return t(
-                        "gateway.model.error_prefix",
-                        error=(
-                            f"Model switch to {result.new_model} failed ({exc}); "
-                            f"staying on {current_model}."
+                    return _command_reply(
+                        t(
+                            "gateway.model.error_prefix",
+                            error=(
+                                f"Model switch to {result.new_model} failed ({exc}); "
+                                f"staying on {current_model}."
+                            ),
                         ),
+                        status="failure",
                     )
+
+            if _session_expired():
+                return _command_reply(
+                    self._PICKER_EXPIRED_REPLY, status="expired"
+                )
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
@@ -2048,6 +2227,11 @@ class GatewaySlashCommandsMixin:
                     logger.debug(
                         "Failed to persist model switch to DB: %s", exc
                     )
+
+            if _session_expired():
+                return _command_reply(
+                    self._PICKER_EXPIRED_REPLY, status="expired"
+                )
 
             # Store a note to prepend to the next user message so the model
             # knows about the switch (avoids system messages mid-history).
@@ -2087,6 +2271,10 @@ class GatewaySlashCommandsMixin:
 
             # Persist to config (default) unless --session opted out
             if persist_global:
+                if _session_expired():
+                    return _command_reply(
+                        self._PICKER_EXPIRED_REPLY, status="expired"
+                    )
                 try:
                     if config_path.exists():
                         with open(config_path, encoding="utf-8") as f:
@@ -2192,6 +2380,8 @@ class GatewaySlashCommandsMixin:
             )
         except Exception:
             _cost_warning = None
+        if _session_expired():
+            return _command_reply(self._PICKER_EXPIRED_REPLY, status="expired")
         if _cost_warning is not None:
             async def _on_cost_confirm(choice: str) -> str:
                 if choice == "cancel":
@@ -2205,7 +2395,7 @@ class GatewaySlashCommandsMixin:
                 return await _finish_switch()
 
             _p = self._typed_command_prefix_for(event.source.platform)
-            return await self._request_slash_confirm(
+            confirmation = await self._request_slash_confirm(
                 event=event,
                 command="model",
                 title="Expensive Model Warning",
@@ -2216,8 +2406,16 @@ class GatewaySlashCommandsMixin:
                 ),
                 handler=_on_cost_confirm,
             )
+            if _session_expired():
+                return _command_reply(
+                    self._PICKER_EXPIRED_REPLY, status="expired"
+                )
+            return confirmation
 
-        return await _finish_switch()
+        confirmation = await _finish_switch()
+        if _session_expired():
+            return _command_reply(self._PICKER_EXPIRED_REPLY, status="expired")
+        return confirmation
 
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
@@ -2826,7 +3024,12 @@ class GatewaySlashCommandsMixin:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
-    async def _handle_reasoning_command(self, event: MessageEvent) -> str:
+    async def _handle_reasoning_command(
+        self,
+        event: MessageEvent,
+        *,
+        is_session_current=None,
+    ) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 
         Usage:
@@ -2843,10 +3046,24 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
         config_path = _hermes_home / "config.yaml"
+
+        def _reasoning_reply(text: str, *, status: str = "success"):
+            if is_session_current is not None:
+                return PickerCallbackOutcome(text, status=status)
+            return text
+
+        if not self._picker_session_is_current(is_session_current):
+            return _reasoning_reply(
+                self._PICKER_EXPIRED_REPLY, status="expired"
+            )
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        if not self._picker_session_is_current(is_session_current):
+            return _reasoning_reply(
+                self._PICKER_EXPIRED_REPLY, status="expired"
+            )
         session_key = self._session_key_for_source(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
         self._reasoning_config = self._resolve_session_reasoning_config(

@@ -84,6 +84,10 @@ ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120       # refresh 2 min before expiry
 NOUS_INVOKE_JWT_MIN_TTL_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
 DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1     # poll at most every 1s
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+CODEX_ROUTE_POLICY_PATH = (
+    Path.home() / ".hermes" / "state" / "codex_route_policy.json"
+)
+_DEFAULT_CODEX_ROUTE_POLICY_PATH = CODEX_ROUTE_POLICY_PATH.resolve(strict=False)
 DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
 MINIMAX_OAUTH_CLIENT_ID = "78257093-7e40-4613-99e0-527b14b39113"
 MINIMAX_OAUTH_SCOPE = "group_id profile model.completion"
@@ -3614,6 +3618,160 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _load_codex_runtime_route_policy() -> Dict[str, Any]:
+    """Load the host-wide Codex route policy for credential resolution.
+
+    A missing file means normal automatic routing.  Any existing but
+    unreadable, malformed, or unsupported policy is an invalid security state
+    and must block credential resolution rather than silently enabling auto.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and (
+        CODEX_ROUTE_POLICY_PATH.resolve(strict=False)
+        == _DEFAULT_CODEX_ROUTE_POLICY_PATH
+    ):
+        return {"mode": "auto"}
+    try:
+        policy = json.loads(CODEX_ROUTE_POLICY_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"mode": "auto"}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return {"mode": "invalid"}
+    if not isinstance(policy, dict) or policy.get("mode") not in {"auto", "fixed"}:
+        return {"mode": "invalid"}
+    if policy.get("mode") == "fixed" and not str(
+        policy.get("credential_id") or ""
+    ).strip():
+        return {"mode": "invalid"}
+    return policy
+
+
+def _fixed_codex_runtime_credentials(
+    policy: Dict[str, Any],
+    *,
+    force_refresh: bool,
+    refresh_if_expiring: bool,
+    refresh_skew_seconds: int,
+) -> Dict[str, Any]:
+    """Resolve and optionally refresh only the policy-selected pool entry."""
+    credential_id = str(policy.get("credential_id") or "").strip()
+    refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+    lock_timeout = max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        float(refresh_timeout_seconds) + 5.0,
+    )
+    with _auth_store_lock(timeout_seconds=lock_timeout):
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+        matches = []
+        if isinstance(entries, list):
+            matches = [
+                item
+                for item in entries
+                if isinstance(item, dict)
+                and str(item.get("id") or "").strip() == credential_id
+            ]
+        if len(matches) != 1:
+            raise AuthError(
+                "Fixed Codex route credential is unavailable.",
+                provider="openai-codex",
+                code="codex_fixed_route_unavailable",
+                relogin_required=False,
+            )
+        entry = matches[0]
+
+        status = str(entry.get("last_status") or "ok").strip().lower()
+        reset_at = entry.get("last_error_reset_at")
+        try:
+            reset_epoch = float(reset_at) if reset_at not in (None, "") else None
+        except (TypeError, ValueError):
+            reset_epoch = None
+        if status == "dead" or (
+            status == "exhausted"
+            and (reset_epoch is None or reset_epoch > time.time())
+        ):
+            raise AuthError(
+                "Fixed Codex route credential is unavailable.",
+                provider="openai-codex",
+                code="codex_fixed_route_unavailable",
+                relogin_required=False,
+            )
+
+        access_token = str(entry.get("access_token") or "").strip()
+        refresh_token = str(entry.get("refresh_token") or "").strip()
+        if not access_token:
+            raise AuthError(
+                "Fixed Codex route credential is unavailable.",
+                provider="openai-codex",
+                code="codex_fixed_route_unavailable",
+                relogin_required=False,
+            )
+
+        should_refresh = bool(force_refresh)
+        if not should_refresh and refresh_if_expiring:
+            should_refresh = _codex_access_token_is_expiring(
+                access_token,
+                refresh_skew_seconds,
+            )
+        if should_refresh:
+            if not refresh_token:
+                raise AuthError(
+                    "Fixed Codex route credential cannot be refreshed.",
+                    provider="openai-codex",
+                    code="codex_fixed_route_unavailable",
+                    relogin_required=False,
+                )
+            refreshed = refresh_codex_oauth_pure(
+                access_token,
+                refresh_token,
+                timeout_seconds=refresh_timeout_seconds,
+            )
+            access_token = str(refreshed.get("access_token") or "").strip()
+            new_refresh = str(refreshed.get("refresh_token") or "").strip()
+            if not access_token:
+                raise AuthError(
+                    "Fixed Codex route refresh returned no access token.",
+                    provider="openai-codex",
+                    code="codex_fixed_route_unavailable",
+                    relogin_required=False,
+                )
+            entry["access_token"] = access_token
+            if new_refresh:
+                entry["refresh_token"] = new_refresh
+            last_refresh = datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            )
+            entry["last_refresh"] = last_refresh
+            for key in (
+                "last_status",
+                "last_status_at",
+                "last_error_code",
+                "last_error_reason",
+                "last_error_message",
+                "last_error_reset_at",
+            ):
+                entry[key] = None
+            _save_auth_store(auth_store)
+        else:
+            last_refresh = entry.get("last_refresh")
+
+    base_url = (
+        str(entry.get("inference_base_url") or entry.get("base_url") or "")
+        .strip()
+        .rstrip("/")
+        or os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_CODEX_BASE_URL
+    )
+    return {
+        "provider": "openai-codex",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "credential_pool-fixed",
+        "last_refresh": last_refresh,
+        "auth_mode": "chatgpt",
+    }
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -3631,6 +3789,22 @@ def resolve_codex_runtime_credentials(
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
     """
+    route_policy = _load_codex_runtime_route_policy()
+    if route_policy.get("mode") == "invalid":
+        raise AuthError(
+            "Codex route policy is invalid; credential resolution is blocked.",
+            provider="openai-codex",
+            code="codex_route_policy_invalid",
+            relogin_required=False,
+        )
+    if route_policy.get("mode") == "fixed":
+        return _fixed_codex_runtime_credentials(
+            route_policy,
+            force_refresh=force_refresh,
+            refresh_if_expiring=refresh_if_expiring,
+            refresh_skew_seconds=refresh_skew_seconds,
+        )
+
     read_error: Optional[AuthError] = None
     try:
         data = _read_codex_tokens()

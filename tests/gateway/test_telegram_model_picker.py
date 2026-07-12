@@ -33,6 +33,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import PickerCallbackOutcome
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -180,7 +181,61 @@ class TestTelegramModelPicker:
 
         assert edit_kwargs["parse_mode"] == telegram_mod.ParseMode.MARKDOWN_V2
         assert "`gpt-5`" in edit_kwargs["text"]
+        query.answer.assert_awaited_with(text="Model switched!")
         assert ("12345", 42) not in adapter._model_picker_state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("callback_data", ["mm:0", "mc:0"])
+    @pytest.mark.parametrize(
+        ("status", "expected_toast"),
+        [
+            ("expired", "Picker expired."),
+            ("cancelled", "Switch cancelled."),
+            ("failure", "Switch failed."),
+        ],
+    )
+    async def test_non_success_callback_outcome_never_emits_model_switched_toast(
+        self, monkeypatch, callback_data, status, expected_toast
+    ):
+        adapter = _make_adapter()
+        callback = AsyncMock(
+            return_value=PickerCallbackOutcome(
+                f"callback ended with {status}", status=status
+            )
+        )
+        adapter._model_picker_state[("12345", 42)] = {
+            "providers": [{"slug": "openai", "name": "OpenAI"}],
+            "current_model": "model_1",
+            "current_provider": "openai",
+            "session_key": "s",
+            "on_model_selected": callback,
+            "selected_provider": "openai",
+            "model_list": ["gpt-5"],
+            "msg_id": 42,
+            "owner_user_id": "owner-1",
+            "session_id": "session-1",
+            "session_generation": 1,
+            "created_at": time.monotonic(),
+            "is_session_current": MagicMock(return_value=True),
+        }
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        query = SimpleNamespace(
+            message=SimpleNamespace(message_id=42),
+            from_user=SimpleNamespace(id="owner-1"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await adapter._handle_model_picker_callback(
+            query, callback_data, "12345"
+        )
+
+        callback.assert_awaited_once()
+        query.answer.assert_awaited_with(text=expected_toast)
+        assert query.answer.await_args.kwargs["text"] != "Model switched!"
 
     @pytest.mark.asyncio
     async def test_provider_group_folds_and_drills_down(self, monkeypatch):

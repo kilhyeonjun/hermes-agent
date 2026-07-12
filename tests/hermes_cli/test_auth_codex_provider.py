@@ -50,6 +50,70 @@ def _jwt_with_exp(exp_epoch: int) -> str:
     return f"h.{encoded}.s"
 
 
+def _setup_fixed_route_store(
+    tmp_path,
+    monkeypatch,
+    *,
+    target_status=None,
+    target_reset_at=None,
+):
+    import hermes_cli.auth as auth_mod
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "singleton-opposite-access",
+                    "refresh_token": "singleton-opposite-refresh",
+                }
+            }
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "fixed-target-id",
+                    "label": "company-plus-100",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "priority": 10,
+                    "access_token": "fixed-target-access",
+                    "refresh_token": "fixed-target-refresh",
+                    "last_status": target_status,
+                    "last_error_reset_at": target_reset_at,
+                },
+                {
+                    "id": "opposite-id",
+                    "label": "personal-backup",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "access_token": "opposite-pool-access",
+                    "refresh_token": "opposite-pool-refresh",
+                },
+            ]
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store), encoding="utf-8")
+    policy_path = tmp_path / "codex_route_policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "mode": "fixed",
+                "credential_id": "fixed-target-id",
+                "label": "company-plus-100",
+                "kind": "company",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(auth_mod, "CODEX_ROUTE_POLICY_PATH", policy_path, raising=False)
+    return hermes_home, policy_path
+
+
 def test_read_codex_tokens_success(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home)
@@ -121,6 +185,106 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
 
     assert called["count"] == 1
     assert resolved["api_key"] == "access-forced"
+
+
+def test_fixed_route_resolver_uses_exact_pool_entry_not_singleton(
+    tmp_path, monkeypatch
+):
+    _setup_fixed_route_store(tmp_path, monkeypatch)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "fixed-target-access"
+    assert resolved["source"] == "credential_pool-fixed"
+
+
+def test_fixed_route_resolver_never_falls_to_opposite_when_target_unavailable(
+    tmp_path, monkeypatch
+):
+    _setup_fixed_route_store(
+        tmp_path,
+        monkeypatch,
+        target_status="exhausted",
+        target_reset_at=time.time() + 3600,
+    )
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+
+    assert exc.value.code == "codex_fixed_route_unavailable"
+    assert exc.value.relogin_required is False
+
+
+def test_fixed_route_resolver_rejects_duplicate_exact_pool_id(
+    tmp_path, monkeypatch
+):
+    hermes_home, _policy_path = _setup_fixed_route_store(tmp_path, monkeypatch)
+    auth_path = hermes_home / "auth.json"
+    auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+    private_label = "private-seat-owner@example.invalid"
+    auth_store["credential_pool"]["openai-codex"].append(
+        {
+            "id": "fixed-target-id",
+            "label": private_label,
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 20,
+            "access_token": "duplicate-private-access",
+            "refresh_token": "duplicate-private-refresh",
+        }
+    )
+    auth_path.write_text(json.dumps(auth_store), encoding="utf-8")
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+
+    assert exc.value.code == "codex_fixed_route_unavailable"
+    assert private_label not in str(exc.value)
+    assert "duplicate-private-access" not in str(exc.value)
+
+
+def test_corrupt_route_policy_blocks_singleton_runtime(tmp_path, monkeypatch):
+    _hermes_home, policy_path = _setup_fixed_route_store(tmp_path, monkeypatch)
+    policy_path.write_text('{"mode":', encoding="utf-8")
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+
+    assert exc.value.code == "codex_route_policy_invalid"
+
+
+def test_fixed_route_force_refresh_updates_only_exact_pool_entry(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.auth as auth_mod
+
+    hermes_home, _policy_path = _setup_fixed_route_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        auth_mod,
+        "_refresh_codex_auth_tokens",
+        lambda *_args, **_kwargs: pytest.fail("singleton refresh must not run"),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda access_token, refresh_token, **_kwargs: {
+            "access_token": "fixed-target-access-new",
+            "refresh_token": "fixed-target-refresh-new",
+        },
+    )
+
+    resolved = resolve_codex_runtime_credentials(
+        force_refresh=True,
+        refresh_if_expiring=False,
+    )
+
+    assert resolved["api_key"] == "fixed-target-access-new"
+    saved = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    singleton = saved["providers"]["openai-codex"]["tokens"]
+    rows = {row["id"]: row for row in saved["credential_pool"]["openai-codex"]}
+    assert singleton["access_token"] == "singleton-opposite-access"
+    assert rows["fixed-target-id"]["access_token"] == "fixed-target-access-new"
+    assert rows["opposite-id"]["access_token"] == "opposite-pool-access"
 
 
 def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_empty(tmp_path, monkeypatch):

@@ -1771,16 +1771,26 @@ def _read_codex_access_token() -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
     If a credential pool exists but currently has no selectable runtime entry
-    (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    (for example all pool slots are marked exhausted), automatic routing may
+    fall back to the profile's auth.json token. A fixed or invalid host route
+    must fail closed instead of crossing to a singleton for another account.
     """
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
+
+    try:
+        from hermes_cli.auth import _load_codex_runtime_route_policy
+
+        route_policy = _load_codex_runtime_route_policy()
+    except Exception as exc:
+        logger.debug("Could not read Codex route policy for auxiliary client: %s", exc)
+        return None
+    if route_policy.get("mode") != "auto":
+        logger.debug("Codex singleton fallback blocked by host route policy")
+        return None
 
     try:
         from hermes_cli.auth import _read_codex_tokens

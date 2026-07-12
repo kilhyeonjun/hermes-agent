@@ -32,6 +32,10 @@ CANONICAL_LABELS = {
     "personal": "personal",
     "company": "company",
 }
+ACCOUNT_LABEL_KINDS = {
+    "personal-backup": "personal",
+    "company-plus-100": "company",
+}
 
 
 def canonical_label(kind: str) -> str:
@@ -52,12 +56,8 @@ def credential_rows(auth_path: Path) -> list[dict[str, Any]]:
 
 
 def _kind(row: dict[str, Any]) -> str | None:
-    label = str(row.get("label") or "").lower()
-    if any(part in label for part in ("company", "gameduo", "plus")):
-        return "company"
-    if any(part in label for part in ("personal", "backup")):
-        return "personal"
-    return None
+    label = str(row.get("label") or "").strip().lower()
+    return ACCOUNT_LABEL_KINDS.get(label)
 
 
 def resolve_policy(mode: str, auth_path: Path = DEFAULT_AUTH) -> dict[str, Any]:
@@ -72,27 +72,45 @@ def resolve_policy(mode: str, auth_path: Path = DEFAULT_AUTH) -> dict[str, Any]:
         raise ValueError("지원 모드: auto | personal | company")
 
     rows = credential_rows(auth_path)
-    row = next((item for item in rows if _kind(item) == wanted), None)
-    if row is None and wanted == "personal":
-        row = next((item for item in rows if _kind(item) != "company"), None)
-    if row is None:
+    seen_ids: set[str] = set()
+    for item in rows:
+        candidate_id = str(item.get("id") or "").strip()
+        if not candidate_id:
+            continue
+        if candidate_id in seen_ids:
+            raise ValueError("Codex credential ID가 중복되었습니다")
+        seen_ids.add(candidate_id)
+    matches = [item for item in rows if _kind(item) == wanted]
+    if not matches:
         raise ValueError(f"{wanted} Codex 계정을 찾지 못했습니다")
-    credential_id = str(row.get("id") or "")
+    if len(matches) != 1:
+        raise ValueError(f"{wanted} Codex 계정 매핑이 둘 이상입니다")
+    row = matches[0]
+    credential_id = str(row.get("id") or "").strip()
     if not credential_id:
         raise ValueError(f"{wanted} Codex credential ID가 없습니다")
     return {
         "mode": "fixed",
         "credential_id": credential_id,
         "label": str(row.get("label") or wanted),
+        "kind": wanted,
     }
 
 
 def load_policy() -> dict[str, Any]:
     try:
         policy = load_json(POLICY_PATH)
-    except Exception:
+    except FileNotFoundError:
         return {"mode": "auto"}
-    return policy if isinstance(policy, dict) else {"mode": "auto"}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise ValueError("Codex route policy is invalid") from None
+    if not isinstance(policy, dict) or policy.get("mode") not in {"auto", "fixed"}:
+        raise ValueError("Codex route policy is invalid")
+    if policy.get("mode") == "fixed" and not str(
+        policy.get("credential_id") or ""
+    ).strip():
+        raise ValueError("Codex route policy is invalid")
+    return policy
 
 
 def save_policy(policy: dict[str, Any]) -> None:
@@ -195,8 +213,8 @@ def canonical_row_label(row: dict[str, Any]) -> str:
             default_kind = _kind(default_row)
             if default_kind:
                 return canonical_label(default_kind)
-            return str(default_row.get("label") or credential_id)
-    return str(row.get("label") or credential_id or "unknown")
+            return "unknown"
+    return "unknown"
 
 
 def current_label(auth_path: Path) -> str:

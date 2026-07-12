@@ -1851,6 +1851,39 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+PICKER_CALLBACK_OUTCOME_STATUSES = frozenset(
+    {"success", "expired", "cancelled", "failure"}
+)
+
+
+class PickerCallbackOutcome(str):
+    """User-visible callback text plus machine-readable picker completion state.
+
+    The string subclass preserves compatibility with adapters and tests that
+    historically treated callback results as plain text.  Picker-aware adapters
+    must branch on ``status`` before emitting a success acknowledgement.
+    """
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        status: str = "success",
+        toast: Optional[str] = None,
+    ):
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in PICKER_CALLBACK_OUTCOME_STATUSES:
+            raise ValueError(f"Unsupported picker callback status: {status!r}")
+        value = str.__new__(cls, str(text))
+        value.status = normalized_status
+        value.toast = str(toast) if toast is not None else None
+        return value
+
+    @property
+    def text(self) -> str:
+        return str(self)
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
