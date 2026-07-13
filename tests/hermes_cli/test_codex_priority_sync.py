@@ -2319,3 +2319,51 @@ def test_main_native_apply_failure_compensates_in_reverse_order(
     else:
         assert "rollback failed" not in output.lower()
         assert api.rows == original_rows
+
+
+def test_standalone_main_marks_inherited_host_lock_during_unlocked_run(
+    monkeypatch,
+):
+    module = load_module()
+    monkeypatch.delenv("HERMES_CODEX_ROUTE_LOCK_HELD", raising=False)
+    events = []
+
+    @contextmanager
+    def fake_route_lock(*, path, timeout):
+        assert path == module.ROUTE_LOCK_PATH
+        assert timeout == module.ROUTE_LOCK_TIMEOUT
+        assert "HERMES_CODEX_ROUTE_LOCK_HELD" not in module.os.environ
+        events.append("locked")
+        yield
+        events.append("unlocked")
+
+    def fake_main_unlocked(argv):
+        assert argv == ["--dry-run"]
+        assert module.os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] == "1"
+        events.append("ran")
+        return 0
+
+    monkeypatch.setattr(module, "route_lock", fake_route_lock)
+    monkeypatch.setattr(module, "_main_unlocked", fake_main_unlocked)
+
+    assert module.main(["--dry-run"]) == 0
+    assert events == ["locked", "ran", "unlocked"]
+    assert "HERMES_CODEX_ROUTE_LOCK_HELD" not in module.os.environ
+
+
+def test_inherited_host_lock_marker_bypasses_reacquire(monkeypatch):
+    module = load_module()
+    monkeypatch.setenv("HERMES_CODEX_ROUTE_LOCK_HELD", "1")
+    monkeypatch.setattr(
+        module,
+        "route_lock",
+        lambda **_kwargs: pytest.fail("inherited lock must not be reacquired"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_main_unlocked",
+        lambda argv: 0 if argv == ["--dry-run"] else 1,
+    )
+
+    assert module.main(["--dry-run"]) == 0
+    assert module.os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] == "1"

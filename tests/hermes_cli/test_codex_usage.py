@@ -375,6 +375,49 @@ def test_recommendation_prefers_unstarted_weekly_window_before_known_resets():
     assert rec["label"] == "unstarted"
 
 
+def test_recommendation_treats_absent_weekly_window_as_unstarted():
+    accounts = [
+        {
+            "label": "company",
+            "ok": True,
+            "available": True,
+            "primary_window": {"used_percent": 37},
+            "secondary_window": None,
+        }
+    ]
+
+    rec = compute_recommendation(accounts)
+
+    assert rec is not None
+    assert rec["label"] == "company"
+
+
+def test_recommendation_preserves_zero_priority_as_highest_tie_break():
+    accounts = [
+        {
+            "label": "personal",
+            "ok": True,
+            "available": True,
+            "priority": 0,
+            "primary_window": {"used_percent": 37},
+            "secondary_window": None,
+        },
+        {
+            "label": "company",
+            "ok": True,
+            "available": True,
+            "priority": 10,
+            "primary_window": {"used_percent": 37},
+            "secondary_window": None,
+        },
+    ]
+
+    rec = compute_recommendation(accounts)
+
+    assert rec is not None
+    assert rec["label"] == "personal"
+
+
 def test_annotate_usage_trends_uses_recent_history_for_burn_and_eta():
     payload = {
         "checked_at": "2026-07-06T20:00:00+09:00",

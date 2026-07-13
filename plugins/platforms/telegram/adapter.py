@@ -261,6 +261,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     ProcessingOutcome,
+    PickerCallbackOutcome,
     SendResult,
     classify_send_error,
     cache_image_from_bytes,
@@ -639,6 +640,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
+    _PICKER_TTL_SECONDS = 15 * 60
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
@@ -850,6 +852,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
+        # Native Codex account picker state per Telegram chat + message.
+        self._codex_account_picker_state: Dict[tuple[str, int], dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -5370,6 +5374,132 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_model_picker failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    @staticmethod
+    def _codex_account_keyboard(current_account: str, current_mode: str):
+        personal = "✓ 개인" if current_mode == "fixed" and current_account == "personal" else "개인"
+        company = "✓ 회사" if current_mode == "fixed" and current_account == "company" else "회사"
+        auto = "✓ ⚖️ 자동 추천" if current_mode == "auto" else "⚖️ 자동 추천"
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(personal, callback_data="ca:personal"),
+                InlineKeyboardButton(company, callback_data="ca:company"),
+            ],
+            [InlineKeyboardButton(auto, callback_data="ca:auto")],
+        ])
+
+    async def send_codex_account_picker(
+        self,
+        chat_id: str,
+        current_account: str,
+        current_mode: str,
+        on_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        owner_user_id: str = "",
+    ) -> SendResult:
+        """Send native Codex account controls for this Mac mini."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        thread_id = metadata.get("thread_id") if metadata else None
+        reply_to_id = self._reply_to_message_id_for_send(
+            None, metadata, reply_to_mode=self._reply_to_mode
+        )
+        try:
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=self.format_message(
+                    "🎛 *Native Codex 계정*\n\n"
+                    f"현재: `{current_mode}` · `{current_account}`\n"
+                    "범위: Mac mini의 새 Codex 프로세스"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=self._codex_account_keyboard(current_account, current_mode),
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            state_key = (str(chat_id), msg.message_id)
+            if len(self._codex_account_picker_state) >= 100:
+                self._codex_account_picker_state.pop(next(iter(self._codex_account_picker_state)))
+            self._codex_account_picker_state[state_key] = {
+                "on_selected": on_selected,
+                "owner_user_id": str(owner_user_id or ""),
+                "created_at": time.monotonic(),
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            safe_exc = _redact_telegram_error_text(exc)
+            logger.warning("[%s] send_codex_account_picker failed: %s", self.name, safe_exc)
+            return SendResult(success=False, error=safe_exc)
+
+    async def _handle_codex_account_picker_callback(
+        self, query, data: str, chat_id: str
+    ) -> None:
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        state_key = (str(chat_id), message_id)
+        state = self._codex_account_picker_state.get(state_key)
+        if not state or not isinstance(message_id, int):
+            await query.answer(text="선택이 만료되었습니다. /codex_account를 다시 실행하세요.")
+            return
+        owner = str(state.get("owner_user_id") or "")
+        caller = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+        created_at = state.get("created_at")
+        if not owner or owner != caller:
+            await query.answer(text="⛔ 이 선택기를 연 사용자만 사용할 수 있습니다.")
+            return
+        if not isinstance(created_at, (int, float)) or (
+            time.monotonic() - float(created_at) > self._PICKER_TTL_SECONDS
+        ):
+            self._codex_account_picker_state.pop(state_key, None)
+            await query.answer(text="선택이 만료되었습니다. /codex_account를 다시 실행하세요.")
+            return
+        selected = data.removeprefix("ca:")
+        callback = state.get("on_selected")
+        if selected not in {"personal", "company", "auto"} or not callback:
+            await query.answer(text="잘못된 선택입니다.")
+            return
+        self._codex_account_picker_state.pop(state_key, None)
+        await query.answer(text=f"{selected} 계정 전환 중…")
+        try:
+            raw_outcome = await callback(selected)
+            outcome = (
+                raw_outcome
+                if isinstance(raw_outcome, PickerCallbackOutcome)
+                else PickerCallbackOutcome(str(raw_outcome), status="success")
+            )
+        except Exception as exc:
+            safe_exc = _redact_telegram_error_text(exc)
+            logger.warning("Codex account selection failed: %s", safe_exc)
+            outcome = PickerCallbackOutcome(
+                f"❌ Codex 계정 전환 실패: {safe_exc}", status="failure"
+            )
+        output = outcome.text
+        try:
+            await query.edit_message_text(
+                text=self.format_message(output),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception as markdown_exc:
+            safe_markdown_exc = _redact_telegram_error_text(markdown_exc)
+            try:
+                await query.edit_message_text(
+                    text=output, parse_mode=None, reply_markup=None
+                )
+            except Exception as plain_exc:
+                safe_plain_exc = _redact_telegram_error_text(plain_exc)
+                logger.debug(
+                    "Failed to finalize Codex account picker: markdown=%s; plain=%s",
+                    safe_markdown_exc,
+                    safe_plain_exc,
+                )
+
     _PROVIDER_PAGE_SIZE = 10
 
     async def send_choice_picker(
@@ -5981,6 +6111,23 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Native Codex account picker callbacks ---
+        if data.startswith("ca:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to change this setting.")
+                return
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_codex_account_picker_callback(query, data, chat_id)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

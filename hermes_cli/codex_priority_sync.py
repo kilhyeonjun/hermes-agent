@@ -2108,7 +2108,15 @@ def main(argv: list[str] | None = None) -> int:
         return _main_unlocked(argv)
     try:
         with route_lock(path=ROUTE_LOCK_PATH, timeout=ROUTE_LOCK_TIMEOUT):
-            return _main_unlocked(argv)
+            prior_marker = os.environ.get("HERMES_CODEX_ROUTE_LOCK_HELD")
+            os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] = "1"
+            try:
+                return _main_unlocked(argv)
+            finally:
+                if prior_marker is None:
+                    os.environ.pop("HERMES_CODEX_ROUTE_LOCK_HELD", None)
+                else:
+                    os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] = prior_marker
     except TimeoutError as exc:
         print(f"Codex route sync skipped: {exc}")
         return 1
