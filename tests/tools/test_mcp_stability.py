@@ -105,6 +105,208 @@ class TestStdioPidTracking:
             # Might have residual state from other tests, just check type
             assert isinstance(_stdio_pids, dict)
 
+    def test_parallel_stdio_startup_recycle_never_claims_or_kills_sibling_pid(self):
+        """Recycling one concurrently-started server must not reap its sibling.
+
+        Regression for the PID snapshot ownership race: server A can snapshot
+        before either child exists, then server B starts while A is still
+        entering ``stdio_client``. Without spawn-window serialization, A's
+        after-snapshot includes both children and later lifecycle cleanup
+        marks B's still-live child as an orphan owned by A.
+        """
+        import tools.mcp_tool as mcp_mod
+
+        alpha_pid = 711001
+        beta_pid = 711002
+        pids = {"alpha": alpha_pid, "beta": beta_pid}
+        live_children = set()
+        alpha_entered = asyncio.Event()
+        beta_entered = asyncio.Event()
+        release_alpha_enter = asyncio.Event()
+
+        class FakeStdioContext:
+            def __init__(self, params):
+                self.name = params.args[-1]
+                self.pid = pids[self.name]
+
+            async def __aenter__(self):
+                live_children.add(self.pid)
+                if self.name == "alpha":
+                    alpha_entered.set()
+                    await release_alpha_enter.wait()
+                else:
+                    beta_entered.set()
+                return object(), object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                live_children.discard(self.pid)
+                return False
+
+        class FakeClientSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def initialize(self):
+                return object()
+
+        async def no_discover_tools(self):
+            return None
+
+        async def run_race():
+            alpha = mcp_mod.MCPServerTask("alpha")
+            beta = mcp_mod.MCPServerTask("beta")
+            alpha_task = None
+            beta_task = None
+
+            with mcp_mod._lock:
+                mcp_mod._stdio_pids.clear()
+                mcp_mod._stdio_pgids.clear()
+                mcp_mod._orphan_stdio_pids.clear()
+                mcp_mod._orphan_stdio_pid_servers.clear()
+
+            try:
+                with patch(
+                    "tools.osv_check.check_package_for_malware",
+                    return_value=None,
+                ), patch.object(
+                    mcp_mod,
+                    "_kill_orphaned_mcp_children",
+                ), patch.object(
+                    mcp_mod,
+                    "_snapshot_child_pids",
+                    side_effect=lambda: set(live_children),
+                ), patch.object(
+                    mcp_mod,
+                    "_filter_mcp_children",
+                    side_effect=lambda candidates: set(candidates),
+                ), patch.object(
+                    mcp_mod.os,
+                    "getpgid",
+                    side_effect=lambda pid: pid,
+                ), patch.object(
+                    mcp_mod,
+                    "stdio_client",
+                    side_effect=lambda params, errlog: FakeStdioContext(params),
+                ), patch.object(
+                    mcp_mod,
+                    "ClientSession",
+                    side_effect=lambda *args, **kwargs: FakeClientSession(),
+                ), patch.object(
+                    mcp_mod.MCPServerTask,
+                    "_discover_tools",
+                    no_discover_tools,
+                ), patch(
+                    "gateway.status._pid_exists",
+                    side_effect=lambda pid: pid in live_children,
+                ):
+                    alpha_task = asyncio.create_task(
+                        alpha._run_stdio({"command": "fake", "args": ["alpha"]})
+                    )
+                    await asyncio.wait_for(alpha_entered.wait(), timeout=2)
+
+                    beta_task = asyncio.create_task(
+                        beta._run_stdio({"command": "fake", "args": ["beta"]})
+                    )
+                    # On the buggy implementation beta enters while alpha's
+                    # ownership window is open. A fixed implementation may
+                    # deliberately block beta here, so timeout is expected.
+                    try:
+                        await asyncio.wait_for(beta_entered.wait(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        pass
+                    finally:
+                        release_alpha_enter.set()
+
+                    await asyncio.wait_for(alpha._ready.wait(), timeout=2)
+                    await asyncio.wait_for(beta._ready.wait(), timeout=2)
+
+                    alpha._reconnect_event.set()
+                    assert await asyncio.wait_for(alpha_task, timeout=2) == "reconnect"
+                    alpha_task = None
+
+                # Drive the real scoped orphan reaper. If alpha stole beta's
+                # PID, this is the exact lifecycle-recycle path that signals
+                # the still-live sibling.
+                with patch.object(mcp_mod.os, "kill") as kill_pid, patch.object(
+                    mcp_mod.os, "killpg"
+                ) as kill_pgroup, patch.object(
+                    mcp_mod.os, "getpgrp", return_value=-1
+                ), patch.object(
+                    mcp_mod.time, "sleep"
+                ), patch(
+                    "gateway.status._pid_exists",
+                    side_effect=lambda pid: pid in live_children,
+                ):
+                    mcp_mod._kill_orphaned_mcp_children(server_name="alpha")
+
+                signalled_pids = {
+                    call.args[0]
+                    for call in (*kill_pid.call_args_list, *kill_pgroup.call_args_list)
+                }
+                assert beta_pid not in signalled_pids, (
+                    "alpha lifecycle recycle signalled beta's live stdio child"
+                )
+                with mcp_mod._lock:
+                    assert mcp_mod._stdio_pids.get(beta_pid) == "beta"
+                    assert beta_pid not in mcp_mod._orphan_stdio_pids
+                    assert beta_pid not in mcp_mod._orphan_stdio_pid_servers
+            finally:
+                release_alpha_enter.set()
+                alpha._shutdown_event.set()
+                beta._shutdown_event.set()
+                for task in (alpha_task, beta_task):
+                    if task is not None and not task.done():
+                        await asyncio.wait_for(task, timeout=2)
+                with mcp_mod._lock:
+                    mcp_mod._stdio_pids.clear()
+                    mcp_mod._stdio_pgids.clear()
+                    mcp_mod._orphan_stdio_pids.clear()
+                    mcp_mod._orphan_stdio_pid_servers.clear()
+
+        asyncio.run(run_race())
+
+    def test_stdio_spawn_lock_recreated_across_mcp_loop_restart(self):
+        """A restarted MCP loop must not inherit the old loop-bound lock."""
+        import tools.mcp_tool as mcp_mod
+
+        observed_locks = []
+
+        async def contend_for_spawn_lock():
+            lock = mcp_mod._stdio_spawn_lock
+            assert lock is not None
+            await lock.acquire()
+            waiter = asyncio.create_task(lock.acquire())
+            try:
+                await asyncio.sleep(0)
+                assert not waiter.done()
+                lock.release()
+                await asyncio.wait_for(waiter, timeout=1)
+                lock.release()
+                return lock
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                if lock.locked():
+                    lock.release()
+
+        for _ in range(2):
+            mcp_mod._ensure_mcp_loop()
+            with mcp_mod._lock:
+                loop = mcp_mod._mcp_loop
+            assert loop is not None
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    contend_for_spawn_lock(), loop
+                )
+                observed_locks.append(future.result(timeout=2))
+            finally:
+                mcp_mod._stop_mcp_loop()
+
+        assert observed_locks[0] is not observed_locks[1]
+
     def test_kill_orphaned_noop_when_empty(self):
         """_kill_orphaned_mcp_children does nothing when no PIDs tracked."""
         from tools.mcp_tool import (

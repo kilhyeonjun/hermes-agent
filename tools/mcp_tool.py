@@ -102,6 +102,7 @@ import shutil
 import sys
 import threading
 import time
+from contextlib import AsyncExitStack
 from typing import Callable
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
@@ -2091,8 +2092,6 @@ class MCPServerTask:
         # exist, which would otherwise stall the shared MCP event loop.
         await asyncio.to_thread(_kill_orphaned_mcp_children)
 
-        # Snapshot child PIDs before spawning so we can track the new one.
-        pids_before = _snapshot_child_pids()
         new_pids: set = set()
         # Redirect subprocess stderr into a shared log file so MCP servers
         # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
@@ -2101,37 +2100,44 @@ class MCPServerTask:
         _write_stderr_log_header(self.name)
         _errlog = _get_mcp_stderr_log()
         try:
-            async with stdio_client(server_params, errlog=_errlog) as (
-                read_stream,
-                write_stream,
-            ):
-                # Capture the newly spawned subprocess PID for force-kill cleanup.
-                # Filter out non-MCP children that race into the snapshot window:
-                # slash_worker and LSP servers (jdtls/pyright/yaml-ls) are spawned
-                # directly by the gateway without start_new_session, so their pgid
-                # equals the TUI parent PID. If they leak into _stdio_pgids, the
-                # shutdown sweep's killpg() kills the TUI parent itself.
-                # See agent/lsp/client.py for the complementary start_new_session fix.
-                new_pids = _filter_mcp_children(
-                    _snapshot_child_pids() - pids_before
-                )
-                if new_pids:
-                    # Capture pgid while the child is alive — once it exits we
-                    # can no longer call ``os.getpgid`` on it, and the cleanup
-                    # sweep needs the pgid to reach any reparented descendants
-                    # (e.g. ``claude mcp serve`` spawned by a stdio wrapper).
-                    new_pgids: Dict[int, int] = {}
-                    for _pid in new_pids:
-                        try:
-                            new_pgids[_pid] = os.getpgid(_pid)
-                        except (AttributeError, ProcessLookupError, OSError):
-                            # AttributeError: Windows (os.getpgid is POSIX-only)
-                            # ProcessLookupError: child raced and already exited
-                            pass
-                    with _lock:
+            async with AsyncExitStack() as stdio_stack:
+                # The SDK does not expose the spawned process handle. Keep the
+                # process-wide snapshot window exclusive until this server's
+                # child has been attributed, then release immediately so only
+                # startup (not the long-lived session) is serialized.
+                spawn_lock = _get_stdio_spawn_lock()
+                async with spawn_lock:
+                    pids_before = _snapshot_child_pids()
+                    read_stream, write_stream = await stdio_stack.enter_async_context(
+                        stdio_client(server_params, errlog=_errlog)
+                    )
+                    # Capture the newly spawned subprocess PID for force-kill cleanup.
+                    # Filter out non-MCP children that race into the snapshot window:
+                    # slash_worker and LSP servers (jdtls/pyright/yaml-ls) are spawned
+                    # directly by the gateway without start_new_session, so their pgid
+                    # equals the TUI parent PID. If they leak into _stdio_pgids, the
+                    # shutdown sweep's killpg() kills the TUI parent itself.
+                    # See agent/lsp/client.py for the complementary start_new_session fix.
+                    new_pids = _filter_mcp_children(
+                        _snapshot_child_pids() - pids_before
+                    )
+                    if new_pids:
+                        # Capture pgid while the child is alive — once it exits we
+                        # can no longer call ``os.getpgid`` on it, and the cleanup
+                        # sweep needs the pgid to reach any reparented descendants
+                        # (e.g. ``claude mcp serve`` spawned by a stdio wrapper).
+                        new_pgids: Dict[int, int] = {}
                         for _pid in new_pids:
-                            _stdio_pids[_pid] = self.name
-                        _stdio_pgids.update(new_pgids)
+                            try:
+                                new_pgids[_pid] = os.getpgid(_pid)
+                            except (AttributeError, ProcessLookupError, OSError):
+                                # AttributeError: Windows (os.getpgid is POSIX-only)
+                                # ProcessLookupError: child raced and already exited
+                                pass
+                        with _lock:
+                            for _pid in new_pids:
+                                _stdio_pids[_pid] = self.name
+                            _stdio_pgids.update(new_pgids)
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
@@ -3445,6 +3451,35 @@ _mcp_thread: Optional[threading.Thread] = None
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
 
+# PID ownership is inferred from a process-wide before/after child snapshot.
+# Stdio tasks all run on the dedicated MCP event loop, so serialize only the
+# spawn-and-capture window; sessions continue running concurrently after their
+# direct child has been registered. Without this lock, overlapping windows can
+# attribute server B's child to server A and A's lifecycle cleanup can reap B.
+_stdio_spawn_lock: Optional[asyncio.Lock] = None
+_stdio_spawn_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_stdio_spawn_lock() -> asyncio.Lock:
+    """Return the spawn lock owned by the current MCP event loop.
+
+    The process-wide MCP loop can be stopped and recreated. An asyncio lock
+    that has seen contention is bound to its original loop, so carrying it
+    across that restart makes the next parallel startup fail. Runtime stdio
+    tasks share one MCP loop; direct unit callers may use a temporary loop.
+    """
+    global _stdio_spawn_lock, _stdio_spawn_lock_loop
+    loop = asyncio.get_running_loop()
+    with _lock:
+        if _stdio_spawn_lock is None or _stdio_spawn_lock_loop is not loop:
+            if _stdio_spawn_lock is not None and _stdio_spawn_lock.locked():
+                raise RuntimeError(
+                    "Cannot replace active stdio spawn lock from another event loop"
+                )
+            _stdio_spawn_lock = asyncio.Lock()
+            _stdio_spawn_lock_loop = loop
+        return _stdio_spawn_lock
+
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
 # them on shutdown if the graceful cleanup (SDK context-manager teardown)
 # fails or times out.  PIDs are added after connection and removed on
@@ -3567,10 +3602,13 @@ def _mcp_loop_exception_handler(loop, context):
 def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
     global _mcp_loop, _mcp_thread
+    global _stdio_spawn_lock, _stdio_spawn_lock_loop
     with _lock:
         if _mcp_loop is not None and _mcp_loop.is_running():
             return
         _mcp_loop = asyncio.new_event_loop()
+        _stdio_spawn_lock = asyncio.Lock()
+        _stdio_spawn_lock_loop = _mcp_loop
         _mcp_loop.set_exception_handler(_mcp_loop_exception_handler)
         _mcp_thread = threading.Thread(
             target=_mcp_loop.run_forever,
@@ -5604,6 +5642,7 @@ def _stop_mcp_loop_if_idle() -> bool:
 def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
+    global _stdio_spawn_lock, _stdio_spawn_lock_loop
     with _lock:
         if only_if_idle and (_servers or _server_connecting):
             logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
@@ -5612,6 +5651,8 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         thread = _mcp_thread
         _mcp_loop = None
         _mcp_thread = None
+        _stdio_spawn_lock = None
+        _stdio_spawn_lock_loop = None
     if loop is not None:
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
