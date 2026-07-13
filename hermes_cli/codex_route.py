@@ -151,14 +151,15 @@ def profile_homes() -> list[tuple[str, Path]]:
     return homes
 
 
-def _sync_profile(name: str, home: Path) -> str | None:
+def _sync_profile(
+    name: str, home: Path, extra_args: tuple[str, ...] = ()
+) -> str | None:
     argv = [
         sys.executable,
         "-m",
         PRIORITY_SYNC_MODULE,
+        *extra_args,
     ]
-    if name != "default":
-        argv.append("--skip-cliproxy")
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["HERMES_CODEX_ROUTE_LOCK_HELD"] = "1"
@@ -188,11 +189,37 @@ def sync_all_profiles() -> list[str]:
     homes = profile_homes()
     if not homes:
         return []
+    default = next(
+        ((name, home) for name, home in homes if name == "default"), None
+    )
+    if default is None:
+        return ["default: profile home missing"]
+    policy = load_policy()
+    jobs: list[tuple[str, Path, tuple[str, ...]]] = []
+    if policy.get("mode") == "auto":
+        default_home = default[1]
+        jobs.extend(
+            [
+                (
+                    "default",
+                    default_home,
+                    ("--profile-account", "personal", "--skip-cliproxy"),
+                ),
+                ("global-clients", default_home, ("--skip-hermes",)),
+            ]
+        )
+    else:
+        jobs.append(("default", default[1], ()))
+    jobs.extend(
+        (name, home, ("--skip-cliproxy",))
+        for name, home in homes
+        if name != "default"
+    )
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(len(homes), 4)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(jobs), 4)) as executor:
         futures = {
-            executor.submit(_sync_profile, name, home): name
-            for name, home in homes
+            executor.submit(_sync_profile, name, home, extra_args): name
+            for name, home, extra_args in jobs
         }
         for future in as_completed(futures):
             error = future.result()
