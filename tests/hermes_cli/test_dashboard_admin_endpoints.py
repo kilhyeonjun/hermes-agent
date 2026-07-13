@@ -142,8 +142,10 @@ class TestCredentialPoolEndpoints:
 
         providers = self.client.get("/api/credentials/pool").json()["providers"]
         entry = providers[0]["entries"][0]
-        # API redacts the key but exposes a preview + 1-based index.
+        # API redacts the key; index is display-only and stable ID is the
+        # mutation target.
         assert entry["index"] == 1
+        assert isinstance(entry["id"], str) and entry["id"]
         assert entry["token_preview"] != "sk-or-abcdef1234"
 
         # CLI parity: the raw, usable key is retrievable via the pool API.
@@ -152,8 +154,69 @@ class TestCredentialPoolEndpoints:
         raw = load_pool("openrouter").entries()
         assert raw[0].access_token == "sk-or-abcdef1234"
 
-        assert self.client.delete("/api/credentials/pool/openrouter/1").status_code == 200
-        assert self.client.delete("/api/credentials/pool/openrouter/99").status_code == 404
+        target = entry["id"]
+        assert self.client.delete(
+            f"/api/credentials/pool/openrouter/entries/{target}"
+        ).status_code == 200
+        assert self.client.delete(
+            f"/api/credentials/pool/openrouter/entries/{target}"
+        ).status_code == 404
+
+    def test_remove_uses_captured_id_after_pool_reorder(self):
+        for label in ("first", "second"):
+            response = self.client.post(
+                "/api/credentials/pool",
+                json={
+                    "provider": "openrouter",
+                    "api_key": f"sk-or-{label}-1234",
+                    "label": label,
+                },
+            )
+            assert response.status_code == 200
+
+        entries = self.client.get("/api/credentials/pool").json()["providers"][0]["entries"]
+        ids = {entry["label"]: entry["id"] for entry in entries}
+        assert self.client.delete(
+            "/api/credentials/pool/openrouter/entries/stale-id"
+        ).status_code == 404
+        still_present = self.client.get("/api/credentials/pool").json()["providers"][0]["entries"]
+        assert {entry["id"] for entry in still_present} == set(ids.values())
+        assert self.client.delete(
+            f"/api/credentials/pool/openrouter/entries/{ids['first']}"
+        ).status_code == 200
+        assert self.client.delete(
+            f"/api/credentials/pool/openrouter/entries/{ids['second']}"
+        ).status_code == 200
+        assert self.client.get("/api/credentials/pool").json()["providers"] == []
+
+    def test_remove_accepts_percent_encoded_slash_in_legacy_id(self):
+        from agent.credential_pool import (
+            AUTH_TYPE_API_KEY,
+            SOURCE_MANUAL,
+            PooledCredential,
+            load_pool,
+        )
+
+        pool = load_pool("openrouter")
+        pool.add_entry(
+            PooledCredential(
+                provider="openrouter",
+                id="legacy/id?",
+                label="legacy",
+                auth_type=AUTH_TYPE_API_KEY,
+                priority=0,
+                source=SOURCE_MANUAL,
+                access_token="test-key",
+            )
+        )
+
+        response = self.client.delete(
+            "/api/credentials/pool/openrouter/entries/legacy%2Fid%3F"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["credential_id"] == "legacy/id?"
+        assert load_pool("openrouter").entries() == []
 
     def test_empty_body_rejected(self):
         r = self.client.post(

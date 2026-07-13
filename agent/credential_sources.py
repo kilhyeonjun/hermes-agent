@@ -46,8 +46,9 @@ No more per-source if/elif chain in ``auth_remove_command``.
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 
 @dataclass
@@ -73,6 +74,20 @@ class RemovalResult:
     cleaned: List[str] = field(default_factory=list)
     hints: List[str] = field(default_factory=list)
     suppress: bool = True
+
+
+class CredentialRemovalNotFoundError(LookupError):
+    """The stable credential ID no longer exists in its owning auth store."""
+
+
+@dataclass
+class CredentialRemovalOutcome:
+    """Durable auth-store removal plus best-effort external cleanup result."""
+
+    removed: Any
+    index: int
+    remaining_count: int
+    result: RemovalResult
 
 
 @dataclass
@@ -130,6 +145,326 @@ def find_removal_step(provider: str, source: str) -> Optional[RemovalStep]:
         if step.matches(provider, source):
             return step
     return None
+
+
+def _codex_manual_aliases_singleton(
+    store: Dict[str, Any],
+    removed_entry: Dict[str, Any],
+) -> bool:
+    """Prove whether a manual row is a legacy alias of the singleton."""
+    if str(removed_entry.get("source") or "").strip() != "manual:device_code":
+        return False
+    providers = store.get("providers")
+    state = (
+        providers.get("openai-codex")
+        if isinstance(providers, dict)
+        else None
+    )
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    if not isinstance(tokens, dict):
+        return False
+    row_grant = str(removed_entry.get("grant_id") or "").strip()
+    singleton_grant = str(state.get("grant_id") or "").strip()
+    if row_grant and singleton_grant:
+        return row_grant == singleton_grant
+    row_access = str(removed_entry.get("access_token") or "").strip()
+    row_refresh = str(removed_entry.get("refresh_token") or "").strip()
+    singleton_access = str(tokens.get("access_token") or "").strip()
+    singleton_refresh = str(tokens.get("refresh_token") or "").strip()
+    return bool(
+        row_access
+        and row_refresh
+        and row_access == singleton_access
+        and row_refresh == singleton_refresh
+    )
+
+
+def _auth_store_removal_policy(
+    provider: str,
+    source: str,
+    step: Optional[RemovalStep],
+    *,
+    store: Dict[str, Any],
+    removed_entry: Dict[str, Any],
+) -> tuple[bool, Set[str], bool]:
+    """Return singleton-clear and durable suppression mutations."""
+    if step is None:
+        return False, set(), False
+
+    suppressions = {source}
+    clear_provider = False
+    run_external_cleanup = True
+    if provider == "openai-codex":
+        if source == "device_code":
+            clear_provider = True
+            suppressions.add("device_code")
+        elif source == "manual:device_code" and _codex_manual_aliases_singleton(
+            store,
+            removed_entry,
+        ):
+            clear_provider = True
+            suppressions.add("device_code")
+        else:
+            # Modern manual rows are independent grants. They have no
+            # singleton-backed source to clear or suppress.
+            suppressions = set()
+            run_external_cleanup = False
+    elif provider in {"nous", "xai-oauth"} and source == "device_code":
+        clear_provider = True
+    elif provider == "minimax-oauth" and source == "oauth":
+        clear_provider = True
+    elif provider == "copilot" and (
+        source == "gh_cli" or source.startswith("env:")
+    ):
+        suppressions.update(
+            {
+                "gh_cli",
+                "env:COPILOT_GITHUB_TOKEN",
+                "env:GH_TOKEN",
+                "env:GITHUB_TOKEN",
+            }
+        )
+    return clear_provider, suppressions, run_external_cleanup
+
+
+def _store_pool_entries(store: Dict[str, Any], provider: str) -> List[Dict[str, Any]]:
+    pool = store.get("credential_pool")
+    entries = pool.get(provider) if isinstance(pool, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _credential_pool_source_path(provider: str):
+    """Discover the one profile/root auth.json that owns this provider pool."""
+    from hermes_cli import auth as auth_mod
+
+    active_path = auth_mod._auth_file_path()
+    active = auth_mod._load_auth_store(active_path)
+    if _store_pool_entries(active, provider):
+        return active_path
+    global_path = auth_mod._global_auth_file_path()
+    if global_path is not None:
+        global_store = auth_mod._load_global_auth_store()
+        if _store_pool_entries(global_store, provider):
+            return global_path
+    return active_path
+
+
+def remove_credential_target(
+    provider: str,
+    credential_id: str,
+) -> CredentialRemovalOutcome:
+    """Remove one exact ID in a single auth-store transaction.
+
+    Pool deletion, priority reindexing, singleton cleanup, and suppression
+    become durable together. External files/env cleanup happens only after
+    that commit and is best-effort, so a cleanup failure cannot resurrect the
+    credential on the next pool load.
+    """
+    from agent.credential_pool import PooledCredential
+    from hermes_cli import auth as auth_mod
+
+    provider = str(provider or "").strip().lower()
+    credential_id = str(credential_id or "").strip()
+    if not provider or not credential_id:
+        raise ValueError("provider and credential_id are required")
+
+    source_path = _credential_pool_source_path(provider)
+    resolved_scope: Dict[str, frozenset[str]] = {}
+
+    def _removal_grant_ids() -> frozenset[str]:
+        with auth_mod._auth_store_lock(source_path):
+            snapshot = auth_mod._load_auth_store(source_path, strict=True)
+            rows = _store_pool_entries(snapshot, provider)
+            matches = [
+                row
+                for row in rows
+                if str(row.get("id") or "").strip() == credential_id
+            ]
+            if len(matches) != 1:
+                raise CredentialRemovalNotFoundError(
+                    f'No unique credential matching "{credential_id}" for provider {provider}.'
+                )
+            row = matches[0]
+            grant_ids: set[str] = set()
+            raw_grant = str(row.get("grant_id") or "").strip()
+            if raw_grant:
+                grant_ids.add(
+                    auth_mod._normalize_codex_grant_id(
+                        raw_grant,
+                        allow_missing=False,
+                    )
+                    or ""
+                )
+            if _codex_manual_aliases_singleton(snapshot, row):
+                providers = snapshot.get("providers")
+                state = (
+                    providers.get("openai-codex")
+                    if isinstance(providers, dict)
+                    else None
+                )
+                singleton_grant = (
+                    str(state.get("grant_id") or "").strip()
+                    if isinstance(state, dict)
+                    else ""
+                )
+                if singleton_grant:
+                    grant_ids.add(
+                        auth_mod._normalize_codex_grant_id(
+                            singleton_grant,
+                            allow_missing=False,
+                        )
+                        or ""
+                    )
+            scoped = frozenset(grant_ids)
+            resolved_scope["grant_ids"] = scoped
+            return scoped
+
+    mutation = (
+        auth_mod._codex_auth_store_mutation(
+            reason="explicit_credential_remove",
+            supersede_ambiguous=False,
+            grant_id_resolver=_removal_grant_ids,
+        )
+        if provider == "openai-codex"
+        else nullcontext()
+    )
+    with mutation:
+        with auth_mod._auth_store_lock(source_path):
+            store = auth_mod._load_auth_store(source_path, strict=True)
+            pool = store.get("credential_pool")
+            entries = pool.get(provider) if isinstance(pool, dict) else None
+            if not isinstance(entries, list):
+                raise CredentialRemovalNotFoundError(
+                    f'No credential matching "{credential_id}" for provider {provider}.'
+                )
+            matches = [
+                (index, entry)
+                for index, entry in enumerate(entries)
+                if isinstance(entry, dict)
+                and str(entry.get("id") or "").strip() == credential_id
+            ]
+            if len(matches) != 1:
+                raise CredentialRemovalNotFoundError(
+                    f'No unique credential matching "{credential_id}" for provider {provider}.'
+                )
+            removed_index, removed_dict = matches[0]
+            removed_source = str(removed_dict.get("source") or "").strip()
+            if provider == "openai-codex":
+                current_scope = {
+                    auth_mod._normalize_codex_grant_id(
+                        removed_dict.get("grant_id"),
+                        allow_missing=False,
+                    )
+                    or ""
+                } if removed_dict.get("grant_id") else set()
+                if _codex_manual_aliases_singleton(store, removed_dict):
+                    providers = store.get("providers")
+                    state = (
+                        providers.get("openai-codex")
+                        if isinstance(providers, dict)
+                        else None
+                    )
+                    if isinstance(state, dict) and state.get("grant_id"):
+                        current_scope.add(
+                            auth_mod._normalize_codex_grant_id(
+                                state.get("grant_id"),
+                                allow_missing=False,
+                            )
+                            or ""
+                        )
+                if frozenset(current_scope) != resolved_scope.get(
+                    "grant_ids",
+                    frozenset(),
+                ):
+                    raise auth_mod.AuthStoreConflictError(
+                        "Codex credential grant changed before removal"
+                    )
+            step = find_removal_step(provider, removed_source)
+            (
+                clear_provider,
+                suppressions,
+                run_external_cleanup,
+            ) = _auth_store_removal_policy(
+                provider,
+                removed_source,
+                step,
+                store=store,
+                removed_entry=removed_dict,
+            )
+            if not run_external_cleanup:
+                step = None
+
+            remaining = [
+                dict(entry)
+                for index, entry in enumerate(entries)
+                if index != removed_index and isinstance(entry, dict)
+            ]
+            for priority, entry in enumerate(remaining):
+                entry["priority"] = priority
+            pool[provider] = remaining
+
+            provider_cleared = False
+            providers = store.get("providers")
+            if clear_provider and isinstance(providers, dict):
+                provider_cleared = providers.pop(provider, None) is not None
+
+            if suppressions:
+                suppressed = store.setdefault("suppressed_sources", {})
+                if not isinstance(suppressed, dict):
+                    suppressed = {}
+                    store["suppressed_sources"] = suppressed
+                provider_suppressions = suppressed.setdefault(provider, [])
+                if not isinstance(provider_suppressions, list):
+                    provider_suppressions = []
+                    suppressed[provider] = provider_suppressions
+                for source in sorted(suppressions):
+                    if source and source not in provider_suppressions:
+                        provider_suppressions.append(source)
+
+            before_ids = frozenset(
+                str(entry.get("id") or "").strip()
+                for entry in entries
+                if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+            )
+            intent = None
+            if provider == "openai-codex":
+                intent = auth_mod.AuthMutationIntent(
+                    actor="credential_sources.remove_credential_target",
+                    reason="explicit stable-id credential removal",
+                    provider_id=provider,
+                    operation="remove_ids",
+                    removed_ids=frozenset({credential_id}),
+                    expected_before_ids=before_ids,
+                )
+            auth_mod._save_auth_store(
+                store,
+                target_path=source_path,
+                intent=intent,
+            )
+
+    removed = PooledCredential.from_dict(provider, dict(removed_dict))
+    result = RemovalResult()
+    if provider_cleared:
+        result.cleaned.append(
+            f"Cleared {provider} OAuth tokens from auth store"
+        )
+    if step is not None:
+        try:
+            external = step.remove_fn(provider, removed)
+            result.cleaned.extend(external.cleaned)
+            result.hints.extend(external.hints)
+        except Exception as exc:
+            result.hints.append(
+                f"Credential removal is durable, but external cleanup failed: {exc}"
+            )
+    return CredentialRemovalOutcome(
+        removed=removed,
+        index=removed_index + 1,
+        remaining_count=len(remaining),
+        result=result,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,24 +554,6 @@ def _remove_hermes_pkce(provider: str, removed) -> RemovalResult:
     return result
 
 
-def _clear_auth_store_provider(provider: str) -> bool:
-    """Delete auth_store.providers[provider].  Returns True if deleted."""
-    from hermes_cli.auth import (
-        _auth_store_lock,
-        _load_auth_store,
-        _save_auth_store,
-    )
-
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        providers_dict = auth_store.get("providers")
-        if isinstance(providers_dict, dict) and provider in providers_dict:
-            del providers_dict[provider]
-            _save_auth_store(auth_store)
-            return True
-    return False
-
-
 def _remove_nous_device_code(provider: str, removed) -> RemovalResult:
     """Nous OAuth lives in auth.json providers.nous — clear it and suppress.
 
@@ -246,10 +563,7 @@ def _remove_nous_device_code(provider: str, removed) -> RemovalResult:
     them to go through `hermes auth add nous` to re-engage, which is the
     documented re-add path and clears the suppression atomically.
     """
-    result = RemovalResult()
-    if _clear_auth_store_provider(provider):
-        result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
-    return result
+    return RemovalResult()
 
 
 def _remove_minimax_oauth(provider: str, removed) -> RemovalResult:
@@ -259,10 +573,7 @@ def _remove_minimax_oauth(provider: str, removed) -> RemovalResult:
     Suppression of the `oauth` source ensures the pool reseed path
     (_seed_from_singletons) doesn't instantly undo the removal.
     """
-    result = RemovalResult()
-    if _clear_auth_store_provider(provider):
-        result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
-    return result
+    return RemovalResult()
 
 
 def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
@@ -277,8 +588,6 @@ def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
     by the central dispatcher makes the removal stick.
     """
     result = RemovalResult()
-    if _clear_auth_store_provider(provider):
-        result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     result.hints.append(
         "Run `hermes model` → xAI Grok OAuth (SuperGrok / Premium+) to re-authenticate if needed."
     )
@@ -286,13 +595,12 @@ def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
 
 
 def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
-    """Codex tokens live in TWO places: our auth store AND ~/.codex/auth.json.
+    """Remove one Hermes-owned Codex credential without touching native Codex.
 
-    refresh_codex_oauth_pure() writes both every time, so clearing only
-    the Hermes auth store is not enough — _seed_from_singletons() would
-    re-import from ~/.codex/auth.json on the next load_pool() call and
-    the removal would be instantly undone.  We suppress instead of
-    deleting Codex CLI's file, so the Codex CLI itself keeps working.
+    Hermes OAuth sessions and native Codex CLI sessions are deliberately
+    independent. Refresh, re-auth, and removal never copy token generations
+    between those stores. Suppression prevents the remaining Hermes singleton
+    from immediately re-seeding the removed pool entry.
 
     The canonical source name in ``_seed_from_singletons`` is
     ``"device_code"`` (no prefix).  Entries may show up in the pool as
@@ -302,18 +610,10 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
     that canonical key here; the central dispatcher also suppresses
     ``removed.source`` which is fine — belt-and-suspenders, idempotent.
     """
-    from hermes_cli.auth import suppress_credential_source
-
     result = RemovalResult()
-    if _clear_auth_store_provider(provider):
-        result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
-    # Suppress the canonical re-seed source, not just whatever source the
-    # removed entry had.  Otherwise `manual:device_code` removals wouldn't
-    # block the `device_code` re-seed path.
-    suppress_credential_source(provider, "device_code")
     result.hints.extend([
         "Suppressed openai-codex device_code source — it will not be re-seeded.",
-        "Note: Codex CLI credentials still live in ~/.codex/auth.json",
+        "Native Codex CLI credentials, if any, remain separate and are never imported automatically.",
         "Run `hermes auth add openai-codex` to re-enable if needed.",
     ])
     return result
@@ -345,15 +645,6 @@ def _remove_copilot_gh(provider: str, removed) -> RemovalResult:
     We don't touch the user's gh CLI or shell state — just suppress so
     Hermes stops picking the token up.
     """
-    # Suppress ALL copilot source variants up-front so no path resurrects
-    # the pool entry.  The central dispatcher in auth_remove_command will
-    # ALSO suppress removed.source, but it's idempotent so double-calling
-    # is harmless.
-    from hermes_cli.auth import suppress_credential_source
-    suppress_credential_source(provider, "gh_cli")
-    for env_var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
-        suppress_credential_source(provider, f"env:{env_var}")
-
     return RemovalResult(hints=[
         "Suppressed all copilot token sources (gh_cli + env vars) — they will not be re-seeded.",
         "Note: Your gh CLI / shell environment is unchanged.",
@@ -415,7 +706,7 @@ def _register_all_sources() -> None:
         provider="openai-codex", source_id="device_code",
         match_fn=lambda src: src == "device_code" or src.endswith(":device_code"),
         remove_fn=_remove_codex_device_code,
-        description="auth.json providers.openai-codex + ~/.codex/auth.json",
+        description="auth.json providers.openai-codex (native Codex auth remains separate)",
     ))
     register(RemovalStep(
         provider="xai-oauth", source_id="device_code",

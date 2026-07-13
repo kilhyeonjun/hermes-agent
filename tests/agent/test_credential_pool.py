@@ -69,6 +69,57 @@ def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypat
     assert pool.current().id == "cred-2"
 
 
+def test_codex_profile_affinity_priority_still_fails_over_during_cooldown(
+    tmp_path, monkeypatch
+):
+    """Priority owns profile affinity; cooldown still owns runtime selection."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "personal-id",
+                        "label": "personal-backup",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "personal-access",
+                        "refresh_token": "personal-refresh",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                    },
+                    {
+                        "id": "company-id",
+                        "label": "company-plus-100",
+                        "auth_type": "oauth",
+                        "priority": 10,
+                        "source": "manual:device_code",
+                        "access_token": "company-access",
+                        "refresh_token": "company-refresh",
+                        "last_status": "ok",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.id == "company-id"
+    assert {item.id: item.priority for item in pool.entries()} == {
+        "personal-id": 0,
+        "company-id": 10,
+    }
+
+
 def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -298,11 +349,6 @@ def test_exhausted_401_entry_resets_after_five_minutes(tmp_path, monkeypatch):
 
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    # Prevent auto-seeding from Codex CLI tokens on the host
-    monkeypatch.setattr(
-        "hermes_cli.auth._import_codex_cli_tokens",
-        lambda: None,
-    )
     _write_auth_store(
         tmp_path,
         {
@@ -1396,12 +1442,32 @@ def test_nous_pool_terminal_refresh_removes_device_code_entry(tmp_path, monkeypa
 
     def _terminal_refresh_failure(*_args, **_kwargs):
         refresh_calls["count"] += 1
-        raise AuthError(
+        error = AuthError(
             "Refresh session has been revoked",
             provider="nous",
             code="invalid_grant",
             relogin_required=True,
         )
+
+        def _quarantine(store):
+            state = store["providers"]["nous"]
+            auth_mod._quarantine_nous_oauth_state(
+                state,
+                error,
+                reason="test_resolver_terminal_refresh_failure",
+                auth_path=auth_mod._auth_file_path(),
+            )
+            auth_mod._quarantine_nous_pool_entries(
+                store,
+                error,
+                reason="test_resolver_terminal_refresh_failure",
+            )
+
+        # The runtime resolver owns exact-source quarantine before it surfaces
+        # a terminal error.  The pool wrapper must only reconcile its local
+        # cache and must not perform a second provider write.
+        auth_mod.mutate_auth_store(_quarantine)
+        raise error
 
     pool = load_pool("nous")
     selected = pool.select()
@@ -1814,11 +1880,11 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_env",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     _write_auth_store(
         tmp_path,
@@ -1878,11 +1944,11 @@ def test_thread_safety_concurrent_select(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_env",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     _write_auth_store(
         tmp_path,
@@ -3014,7 +3080,9 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert refresh_calls["count"] == 1
 
 
-def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypatch):
+def test_codex_oauth_ambiguous_refresh_preserves_tokens_and_blocks_replay(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
@@ -3028,7 +3096,10 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
     pool = load_pool("openai-codex")
     assert pool.select() is not None
 
+    refresh_calls = {"count": 0}
+
     def _transient_failure(*_args, **_kwargs):
+        refresh_calls["count"] += 1
         raise AuthError(
             "Rate limited",
             provider="openai-codex",
@@ -3038,13 +3109,28 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
 
     monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _transient_failure)
 
-    pool.try_refresh_current()
+    with pytest.raises(AuthError) as first:
+        pool.try_refresh_current()
+    assert first.value.code == "codex_refresh_failed"
 
     # Tokens must NOT be cleared from auth.json.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     tokens = auth_payload["providers"]["openai-codex"].get("tokens", {})
     assert tokens.get("access_token") == "old-access-token"
     assert tokens.get("refresh_token") == "old-refresh-token"
+    wal_paths = sorted(
+        (tmp_path / "hermes" / "state" / "codex-refresh").glob(
+            "grant-*.wal.json"
+        )
+    )
+    assert len(wal_paths) == 1
+    wal_path = wal_paths[0]
+    assert json.loads(wal_path.read_text(encoding="utf-8"))["state"] == "prepared"
+
+    with pytest.raises(AuthError) as second:
+        pool.try_refresh_current()
+    assert second.value.code == "codex_refresh_ambiguous"
+    assert refresh_calls["count"] == 1
 
 
 def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
@@ -3109,6 +3195,65 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     assert persisted_a["last_status"] == "exhausted"
 
 
+def test_load_pool_retries_reconciliation_without_overwriting_newer_same_id(
+    tmp_path, monkeypatch
+):
+    """Seed/priority normalization must adopt a concurrent token rotation."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    original = {
+        "id": "personal-id",
+        "label": "personal",
+        "auth_type": "oauth",
+        "priority": 5,
+        "source": "manual:device_code",
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+    }
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {"anthropic": [original]},
+        },
+    )
+
+    from agent import credential_pool as pool_mod
+    from hermes_cli import auth as auth_mod
+
+    real_write = pool_mod.write_credential_pool
+    injected = {"done": False}
+
+    def racing_write(provider, entries, **kwargs):
+        if not injected["done"]:
+            injected["done"] = True
+            auth_mod.write_credential_pool(
+                provider,
+                [
+                    {
+                        **original,
+                        "access_token": "new-access",
+                        "refresh_token": "new-refresh",
+                    }
+                ],
+                expected_entry_fingerprints={
+                    "personal-id": auth_mod.credential_entry_fingerprint(original)
+                },
+            )
+        return real_write(provider, entries, **kwargs)
+
+    monkeypatch.setattr(pool_mod, "write_credential_pool", racing_write)
+
+    pool = pool_mod.load_pool("anthropic")
+
+    assert injected["done"] is True
+    assert pool.entries()[0].access_token == "new-access"
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    row = persisted["credential_pool"]["anthropic"][0]
+    assert row["access_token"] == "new-access"
+    assert row["refresh_token"] == "new-refresh"
+    assert row["priority"] == 0
+
+
 def test_remove_index_does_not_resurrect_via_disk_merge(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -3146,6 +3291,103 @@ def test_remove_index_does_not_resurrect_via_disk_merge(tmp_path, monkeypatch):
     final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     final_ids = [entry["id"] for entry in final["credential_pool"]["anthropic"]]
     assert final_ids == ["cred-A"]
+
+
+def test_stale_pool_writer_cannot_resurrect_deleted_credential(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    original = {
+        "id": "deleted-codex",
+        "label": "deleted",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+    }
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {"openai-codex": [original]},
+        },
+    )
+
+    from hermes_cli import auth as auth_mod
+
+    fingerprint = auth_mod.credential_entry_fingerprint(original)
+    auth_mod.write_credential_pool(
+        "openai-codex",
+        [],
+        removed_ids=["deleted-codex"],
+        expected_entry_fingerprints={"deleted-codex": fingerprint},
+    )
+
+    with pytest.raises(auth_mod.AuthStoreConflictError, match="disappeared"):
+        auth_mod.write_credential_pool(
+            "openai-codex",
+            [original],
+            expected_entry_fingerprints={"deleted-codex": fingerprint},
+        )
+
+    saved = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert saved["credential_pool"]["openai-codex"] == []
+
+
+def test_load_pool_local_only_does_not_seed_root_codex_singleton(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    root_store = {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "root-access",
+                    "refresh_token": "root-refresh",
+                },
+                "grant_id": "a" * 32,
+            }
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "root-device",
+                    "label": "root",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "device_code",
+                    "access_token": "root-access",
+                    "refresh_token": "root-refresh",
+                    "grant_id": "a" * 32,
+                }
+            ]
+        },
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "auth.json").write_text(json.dumps(root_store, indent=2))
+    profile_path = profile / "auth.json"
+    profile_path.write_text(
+        json.dumps(
+            {"version": 1, "providers": {}, "credential_pool": {}},
+            indent=2,
+        )
+    )
+    profile_before = profile_path.read_bytes()
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex", local_only=True)
+
+    assert pool.entries() == []
+    assert profile_path.read_bytes() == profile_before
 
 
 # ---------------------------------------------------------------------------

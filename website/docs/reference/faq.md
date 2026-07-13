@@ -607,7 +607,7 @@ No. Each messaging platform (Telegram, Discord, etc.) requires exclusive access 
 
 ### Do profiles share memory or sessions?
 
-No. Each profile has its own memory store, session database, and skills directory. They are completely isolated. If you want to start a new profile with existing memories and sessions, use `hermes profile create newname --clone-all` to copy everything from the current profile, or add `--clone-from <profile>` to copy from a specific source profile.
+No. Each profile has its own memory store, session database, skills directory, environment file, and canonical auth store. To start with existing working configuration and memories, use `hermes profile create newname --clone-all`, optionally with `--clone-from <profile>`. Clone-all deliberately copies the source profile's `.env` secrets, but excludes sessions, history databases, `auth.json`, `auth.lock`, and root `.op.env`; review the copied static keys and authenticate OAuth providers in the new profile instead of sharing refresh tokens.
 
 ### What happens when I run `hermes update`?
 
@@ -754,7 +754,7 @@ Skills with very long descriptions are truncated to 40 characters in the Telegra
    hermes import ~/hermes-backup-<timestamp>.zip
    ```
 
-4. On the new machine, run `hermes setup` to verify API keys and provider config are working.
+4. On the new machine, run `hermes setup` to verify API keys and provider config are working. Codex OAuth generations are intentionally not transplanted to a fresh host, so re-authenticate Codex there.
 
 ### Moving a single profile to another machine
 
@@ -762,13 +762,13 @@ Skills with very long descriptions are truncated to 40 characters in the Telegra
 
 ```bash
 # On the source machine
-hermes profile export work ./work-backup.tar.gz
+hermes profile export work -o ./work-backup.tar.gz
 
 # Copy the file to the target machine, then:
-hermes profile import ./work-backup.tar.gz work
+hermes profile import ./work-backup.tar.gz --name work
 ```
 
-The imported profile will have all config, memories, sessions, and skills from the export. You may need to update paths or re-authenticate with providers if the new machine has a different setup.
+The imported profile will have the portable config, memories, sessions, and skills from the export. Root `auth.json`, `auth.lock`, `.env`, and `.op.env` are excluded; a blank private `.env` is created. Machine-local `home/`, backup/snapshot/checkpoint trees, and symlinks are also excluded or rejected. Nested project files remain, so inspect the archive before sharing it and re-authenticate providers after import.
 
 ### `hermes backup` vs `hermes profile export`
 
@@ -777,7 +777,7 @@ The imported profile will have all config, memories, sessions, and skills from t
 | **Use Case** | **Full machine migration** | **Porting/sharing a specific profile** |
 | **Scope** | Global (entire `~/.hermes` directory) | Local (single profile directory) |
 | **Includes** | All profiles, global config, API keys, sessions | Single profile: SOUL.md, memories, sessions, skills |
-| **Credentials** | **Included** (`.env` and `auth.json`) | **Excluded** (stripped for safe sharing) |
+| **Credentials** | Archive includes `.env` and `auth.json`; import uses the canonical auth transaction, preserves host-local lock/WAL state, and requires fresh-host Codex re-authentication | Root `auth.json`, `auth.lock`, `.env`, and `.op.env` excluded; nested files retained — inspect before sharing |
 | **Format** | `.zip` | `.tar.gz` |
 
 **Manual fallback (rsync):** If you prefer to copy files directly, exclude the code repo:
@@ -786,7 +786,7 @@ rsync -av --exclude='hermes-agent' ~/.hermes/ newmachine:~/.hermes/
 ```
 
 :::tip
-`hermes backup` produces a consistent snapshot even while Hermes is actively running. The restored archive excludes machine-local runtime files like `gateway.pid` and `cron.pid`.
+`hermes backup` produces a consistent snapshot even while Hermes is actively running. Import preserves machine-local runtime files, `auth.lock`, and Codex refresh lock/key/WAL state instead of overwriting them from the archive.
 :::
 
 ### Permission denied when reloading shell after install

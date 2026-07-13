@@ -365,9 +365,9 @@ export default function SystemPage() {
   const credDelete = useConfirmDelete({
     onDelete: useCallback(
       async (key: string) => {
-        const [provider, idxStr] = key.split("|");
+        const [provider, credentialId] = JSON.parse(key) as [string, string];
         try {
-          await api.removeCredentialPoolEntry(provider, Number(idxStr));
+          await api.removeCredentialPoolEntry(provider, credentialId);
           showToast("Credential removed", "success");
           loadAll();
         } catch (e) {
@@ -1179,12 +1179,12 @@ export default function SystemPage() {
                   {prov.provider}
                 </span>
                 {prov.entries.map((entry) => (
-                  <div key={`${prov.provider}-${entry.index}`} className="flex items-center gap-3 border border-border bg-background/40 px-3 py-2">
+                  <div key={`${prov.provider}-${entry.id}`} className="flex items-center gap-3 border border-border bg-background/40 px-3 py-2">
                     <span className="text-sm font-medium">{entry.label}</span>
                     <span className="font-mono text-xs text-muted-foreground">{entry.token_preview}</span>
                     <Badge tone="outline">{entry.auth_type}</Badge>
                     {entry.last_status && <Badge tone="secondary">{entry.last_status}</Badge>}
-                    <Button ghost size="icon" className="ml-auto text-destructive" aria-label="Remove credential" onClick={() => credDelete.requestDelete(`${prov.provider}|${entry.index}`)}>
+                    <Button ghost size="icon" className="ml-auto text-destructive" aria-label="Remove credential" onClick={() => credDelete.requestDelete(JSON.stringify([prov.provider, entry.id]))}>
                       <Trash2 />
                     </Button>
                   </div>

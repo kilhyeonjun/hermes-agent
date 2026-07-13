@@ -14,7 +14,6 @@ from hermes_cli.auth import (
     PROVIDER_REGISTRY,
     _read_codex_tokens,
     _save_codex_tokens,
-    _import_codex_cli_tokens,
     _login_openai_codex,
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
@@ -156,11 +155,17 @@ def test_resolve_codex_runtime_credentials_refreshes_expiring_token(tmp_path, mo
 
     called = {"count": 0}
 
-    def _fake_refresh(tokens, timeout_seconds):
+    def _fake_refresh(access_token, refresh_token, **_kwargs):
         called["count"] += 1
-        return {"access_token": "access-new", "refresh_token": "refresh-new"}
+        assert access_token == expiring_token
+        assert refresh_token == "refresh-old"
+        return {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-13T13:00:00Z",
+        }
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_refresh)
 
     resolved = resolve_codex_runtime_credentials()
 
@@ -175,11 +180,17 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
 
     called = {"count": 0}
 
-    def _fake_refresh(tokens, timeout_seconds):
+    def _fake_refresh(access_token, refresh_token, **_kwargs):
         called["count"] += 1
-        return {"access_token": "access-forced", "refresh_token": "refresh-new"}
+        assert access_token == "access-current"
+        assert refresh_token == "refresh-old"
+        return {
+            "access_token": "access-forced",
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-13T13:00:00Z",
+        }
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_refresh)
 
     resolved = resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
 
@@ -259,11 +270,6 @@ def test_fixed_route_force_refresh_updates_only_exact_pool_entry(
     import hermes_cli.auth as auth_mod
 
     hermes_home, _policy_path = _setup_fixed_route_store(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        auth_mod,
-        "_refresh_codex_auth_tokens",
-        lambda *_args, **_kwargs: pytest.fail("singleton refresh must not run"),
-    )
     monkeypatch.setattr(
         auth_mod,
         "refresh_codex_oauth_pure",
@@ -897,25 +903,6 @@ def test_save_codex_tokens_clears_error_markers_only_on_refreshed_entries(tmp_pa
     assert acctB["last_error_reason"] == "quota_exhausted"
 
 
-def test_import_codex_cli_tokens(tmp_path, monkeypatch):
-    codex_home = tmp_path / "codex-cli"
-    codex_home.mkdir(parents=True, exist_ok=True)
-    (codex_home / "auth.json").write_text(json.dumps({
-        "tokens": {"access_token": "cli-at", "refresh_token": "cli-rt"},
-    }))
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-
-    tokens = _import_codex_cli_tokens()
-    assert tokens is not None
-    assert tokens["access_token"] == "cli-at"
-    assert tokens["refresh_token"] == "cli-rt"
-
-
-def test_import_codex_cli_tokens_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
-    assert _import_codex_cli_tokens() is None
-
-
 def test_codex_tokens_not_written_to_shared_file(tmp_path, monkeypatch):
     """Verify _save_codex_tokens writes only to Hermes auth store, not ~/.codex/."""
     hermes_home = tmp_path / "hermes"
@@ -1069,6 +1056,34 @@ def test_refresh_falls_back_to_generic_message_on_unparseable_body(monkeypatch):
     assert "status 401" in str(err)
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        (
+            {"access_token": "access-new"},
+            "codex_refresh_missing_rotated_refresh_token",
+        ),
+        (
+            {
+                "access_token": "access-new",
+                "refresh_token": "refresh-old",
+            },
+            "codex_refresh_reused_rotated_refresh_token",
+        ),
+    ],
+)
+def test_refresh_requires_a_new_rotated_refresh_token(
+    monkeypatch, payload, expected_code
+):
+    _patch_httpx(monkeypatch, _StubHTTPResponse(200, payload))
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("access-old", "refresh-old")
+
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.relogin_required is True
+
+
 def test_refresh_429_classified_as_quota_not_auth_failure(monkeypatch):
     """429 from the token endpoint is a usage-quota cap, not an auth failure.
 
@@ -1143,10 +1158,6 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_codex_runtime_credentials",
         lambda: {"base_url": DEFAULT_CODEX_BASE_URL},
-    )
-    monkeypatch.setattr(
-        "hermes_cli.auth._import_codex_cli_tokens",
-        lambda: {"access_token": "cli-at", "refresh_token": "cli-rt"},
     )
     monkeypatch.setattr(
         "hermes_cli.auth._codex_device_code_login",
@@ -1337,3 +1348,327 @@ def test_lexical_live_auth_symlink_to_external_target_is_blocked(
 
     assert external_auth.read_bytes() == before
     assert not list(external_auth.parent.glob("external-auth.json.tmp.*"))
+
+
+def _seed_transactional_codex_store(auth_mod, home, rows=None):
+    home.mkdir(parents=True, exist_ok=True)
+    store = auth_mod._load_auth_store(home / "auth.json")
+    store["credential_pool"] = {
+        "openai-codex": rows
+        or [
+            {"id": "personal-id", "label": "personal", "priority": 0},
+            {"id": "company-id", "label": "company", "priority": 10},
+        ]
+    }
+    auth_mod._save_auth_store(store, target_path=home / "auth.json")
+    return home / "auth.json"
+
+
+def test_auth_store_content_revision_rejects_stale_snapshot(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = _seed_transactional_codex_store(auth_mod, home)
+    first = auth_mod._load_auth_store(auth_path)
+    stale = auth_mod._load_auth_store(auth_path)
+    first["active_provider"] = "openai-codex"
+    auth_mod._save_auth_store(first, target_path=auth_path)
+    committed = auth_path.read_bytes()
+    stale["active_provider"] = "other"
+
+    with pytest.raises(auth_mod.AuthStoreConflictError):
+        auth_mod._save_auth_store(stale, target_path=auth_path)
+
+    assert auth_path.read_bytes() == committed
+
+
+def test_auth_store_digest_cas_detects_nonparticipating_writer(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = _seed_transactional_codex_store(auth_mod, home)
+    snapshot = auth_mod._load_auth_store(auth_path)
+    external = json.loads(auth_path.read_text())
+    external["external_field"] = True
+    auth_path.write_text(json.dumps(external) + "\n")
+    external_bytes = auth_path.read_bytes()
+    snapshot["active_provider"] = "openai-codex"
+
+    with pytest.raises(auth_mod.AuthStoreConflictError):
+        auth_mod._save_auth_store(snapshot, target_path=auth_path)
+
+    assert auth_path.read_bytes() == external_bytes
+
+
+def test_auth_store_mutation_fails_closed_on_malformed_current_file(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = home / "auth.json"
+    auth_path.write_text("{not-json\n")
+    before = auth_path.read_bytes()
+
+    with pytest.raises(auth_mod.AuthStoreCorruptError):
+        auth_mod._save_auth_store(
+            {"version": 1, "providers": {}}, target_path=auth_path
+        )
+
+    assert auth_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": 1, "providers": []},
+        {"version": 1, "providers": {}, "credential_pool": []},
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {"openai-codex": {}},
+        },
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {"openai-codex": ["not-an-entry"]},
+        },
+    ],
+)
+def test_auth_store_rejects_malformed_structure_before_mutation(
+    tmp_path, monkeypatch, payload
+):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = home / "auth.json"
+    auth_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = auth_path.read_bytes()
+
+    with pytest.raises(auth_mod.AuthStoreCorruptError):
+        auth_mod.mutate_auth_store(
+            lambda store: store.update({"marker": True}),
+            target_path=auth_path,
+        )
+
+    assert auth_path.read_bytes() == before
+
+
+def test_auth_store_rejects_malformed_proposed_structure(
+    tmp_path,
+    monkeypatch,
+):
+    """A valid current file must not authorize malformed mutator output."""
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = _seed_transactional_codex_store(auth_mod, home)
+    before = auth_path.read_bytes()
+
+    with pytest.raises(auth_mod.AuthStoreCorruptError):
+        auth_mod.mutate_auth_store(
+            lambda store: store.update({"providers": []}),
+            target_path=auth_path,
+        )
+
+    assert auth_path.read_bytes() == before
+
+
+def test_explicit_logout_migrates_and_removes_legacy_idless_codex_rows(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "active_provider": "openai-codex",
+                "providers": {},
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "label": "legacy-personal",
+                            "priority": 0,
+                            "access_token": "legacy-access",
+                            "refresh_token": "legacy-refresh",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first = auth_mod._load_auth_store(auth_path, strict=True)
+    second = auth_mod._load_auth_store(auth_path, strict=True)
+    first_id = first["credential_pool"]["openai-codex"][0]["id"]
+    second_id = second["credential_pool"]["openai-codex"][0]["id"]
+
+    assert first_id.startswith("legacy-")
+    assert second_id == first_id
+    assert auth_mod.clear_provider_auth("openai-codex") is True
+    saved = json.loads(auth_path.read_text())
+    assert "openai-codex" not in saved.get("credential_pool", {})
+
+
+def test_unintended_codex_pool_drop_is_rejected(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = _seed_transactional_codex_store(auth_mod, home)
+    store = auth_mod._load_auth_store(auth_path)
+    store["credential_pool"].pop("openai-codex")
+    before = auth_path.read_bytes()
+
+    with pytest.raises(auth_mod.AuthStoreRemovalError):
+        auth_mod._save_auth_store(store, target_path=auth_path)
+
+    assert auth_path.read_bytes() == before
+
+
+def test_explicit_codex_logout_can_clear_entire_pool(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_path = _seed_transactional_codex_store(auth_mod, home)
+
+    assert auth_mod.clear_provider_auth("openai-codex") is True
+
+    saved = auth_mod._load_auth_store(auth_path)
+    assert "openai-codex" not in saved.get("credential_pool", {})
+
+
+def test_auth_store_locks_are_path_scoped_and_cross_nesting_fails(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    profile_auth = tmp_path / "profiles" / "gameduo" / "auth.json"
+    root_auth = tmp_path / "root" / "auth.json"
+    profile_auth.parent.mkdir(parents=True)
+    root_auth.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_auth.parent))
+
+    with auth_mod._auth_store_lock(profile_auth):
+        with auth_mod._auth_store_lock(profile_auth):
+            pass
+        with pytest.raises(auth_mod.AuthStoreLockOrderError):
+            with auth_mod._auth_store_lock(root_auth):
+                pass
+
+    with auth_mod._auth_store_lock(root_auth):
+        pass
+
+
+def test_write_credential_pool_rejects_stale_same_id_overwrite(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original = {
+        "id": "personal-id",
+        "label": "personal",
+        "priority": 0,
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+    }
+    _seed_transactional_codex_store(auth_mod, home, rows=[original])
+    expected = {
+        "personal-id": auth_mod.credential_entry_fingerprint(original)
+    }
+    rotated = {
+        **original,
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+    }
+    auth_mod.write_credential_pool(
+        "openai-codex",
+        [rotated],
+        expected_entry_fingerprints=expected,
+    )
+    committed = (home / "auth.json").read_bytes()
+    stale = {**original, "priority": 10}
+
+    with pytest.raises(auth_mod.AuthStoreConflictError):
+        auth_mod.write_credential_pool(
+            "openai-codex",
+            [stale],
+            expected_entry_fingerprints=expected,
+        )
+
+    assert (home / "auth.json").read_bytes() == committed
+
+
+def test_write_credential_pool_rejects_stale_same_id_removal(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    personal = {
+        "id": "personal-id",
+        "label": "personal",
+        "priority": 0,
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+    }
+    company = {
+        "id": "company-id",
+        "label": "company",
+        "priority": 10,
+        "access_token": "company-access",
+        "refresh_token": "company-refresh",
+    }
+    _seed_transactional_codex_store(
+        auth_mod,
+        home,
+        rows=[personal, company],
+    )
+    expected = {
+        row["id"]: auth_mod.credential_entry_fingerprint(row)
+        for row in (personal, company)
+    }
+    recovered = {
+        **personal,
+        "access_token": "recovered-access",
+        "refresh_token": "recovered-refresh",
+        "last_status": "ok",
+    }
+    auth_mod.write_credential_pool(
+        "openai-codex",
+        [recovered, company],
+        expected_entry_fingerprints=expected,
+    )
+    committed = (home / "auth.json").read_bytes()
+
+    with pytest.raises(auth_mod.AuthStoreConflictError):
+        auth_mod.write_credential_pool(
+            "openai-codex",
+            [company],
+            removed_ids=["personal-id"],
+            expected_entry_fingerprints=expected,
+            removal_actor="dead_ttl_prune",
+            removal_reason="stale terminal state",
+            removal_operation="dead_ttl_prune",
+        )
+
+    assert (home / "auth.json").read_bytes() == committed

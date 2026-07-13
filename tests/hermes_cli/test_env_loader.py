@@ -2,7 +2,12 @@ import importlib
 import os
 import sys
 
-from hermes_cli.env_loader import load_hermes_dotenv
+import pytest
+
+from hermes_cli.env_loader import (
+    load_hermes_dotenv,
+    reset_secret_source_cache,
+)
 
 
 def test_user_env_overrides_stale_shell_values(tmp_path, monkeypatch):
@@ -67,6 +72,125 @@ def test_user_env_takes_precedence_over_project_env(tmp_path, monkeypatch):
     assert loaded == [user_env, project_env]
     assert os.getenv("OPENAI_BASE_URL") == "https://user.example/v1"
     assert os.getenv("OPENAI_API_KEY") == "project-key"
+
+
+def test_named_profile_does_not_inherit_shell_or_project_credentials(
+    tmp_path, monkeypatch
+):
+    reset_secret_source_cache()
+    home = tmp_path / ".hermes" / "profiles" / "child"
+    home.mkdir(parents=True)
+    user_env = home / ".env"
+    user_env.write_text("# intentionally credential-free\n", encoding="utf-8")
+    project_env = tmp_path / ".env"
+    project_env.write_text("OPENAI_API_KEY=project-secret\n", encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-secret")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "ambient-bot")
+
+    loaded = load_hermes_dotenv(
+        hermes_home=home,
+        project_env=project_env,
+    )
+
+    assert loaded == [user_env]
+    assert "OPENAI_API_KEY" not in os.environ
+    assert "TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_named_profile_loads_only_its_explicit_credentials(tmp_path, monkeypatch):
+    reset_secret_source_cache()
+    home = tmp_path / ".hermes" / "profiles" / "child"
+    home.mkdir(parents=True)
+    user_env = home / ".env"
+    user_env.write_text("OPENAI_API_KEY=profile-secret\n", encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic")
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [user_env]
+    assert os.environ["OPENAI_API_KEY"] == "profile-secret"
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_process_cannot_switch_between_named_profile_secret_authorities(
+    tmp_path, monkeypatch
+):
+    reset_secret_source_cache()
+    first = tmp_path / ".hermes" / "profiles" / "first"
+    second = tmp_path / ".hermes" / "profiles" / "second"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / ".env").write_text("OPENAI_API_KEY=first\n", encoding="utf-8")
+    (second / ".env").write_text("OPENAI_API_KEY=second\n", encoding="utf-8")
+
+    load_hermes_dotenv(hermes_home=first)
+
+    with pytest.raises(RuntimeError, match="secret authority"):
+        load_hermes_dotenv(hermes_home=second)
+
+
+def test_process_cannot_switch_from_named_to_default_secret_authority(
+    tmp_path, monkeypatch
+):
+    reset_secret_source_cache()
+    named = tmp_path / ".hermes" / "profiles" / "child"
+    default = tmp_path / ".hermes"
+    named.mkdir(parents=True)
+    (named / ".env").write_text("OPENAI_API_KEY=named\n", encoding="utf-8")
+    (default / ".env").write_text("OPENAI_API_KEY=default\n", encoding="utf-8")
+
+    load_hermes_dotenv(hermes_home=named)
+
+    with pytest.raises(RuntimeError, match="secret authority"):
+        load_hermes_dotenv(hermes_home=default)
+    assert os.environ["OPENAI_API_KEY"] == "named"
+
+
+def test_named_profile_rejects_symlinked_home_directory(tmp_path, monkeypatch):
+    reset_secret_source_cache()
+    profiles = tmp_path / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    (profiles / "child").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient")
+
+    with pytest.raises(RuntimeError, match="regular directory"):
+        load_hermes_dotenv(hermes_home=profiles / "child")
+
+    assert os.environ["OPENAI_API_KEY"] == "ambient"
+
+
+def test_named_profile_does_not_sanitize_unused_project_env(
+    tmp_path, monkeypatch
+):
+    reset_secret_source_cache()
+    home = tmp_path / ".hermes" / "profiles" / "child"
+    home.mkdir(parents=True)
+    (home / ".env").write_text("# private\n", encoding="utf-8")
+    project_env = tmp_path / "project.env"
+    original = b"OPENAI_API_KEY=project\x00secret\n"
+    project_env.write_bytes(original)
+
+    load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert project_env.read_bytes() == original
+
+
+def test_named_profile_rejects_symlinked_env_file(tmp_path, monkeypatch):
+    reset_secret_source_cache()
+    home = tmp_path / ".hermes" / "profiles" / "child"
+    home.mkdir(parents=True)
+    outside = tmp_path / "outside.env"
+    outside.write_text("OPENAI_API_KEY=outside\n", encoding="utf-8")
+    (home / ".env").symlink_to(outside)
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient")
+
+    with pytest.raises(RuntimeError, match="regular"):
+        load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["OPENAI_API_KEY"] == "ambient"
 
 
 def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):

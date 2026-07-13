@@ -866,14 +866,14 @@ See [Checkpoints and `/rollback`](../user-guide/checkpoints-and-rollback.md) for
 hermes import <zipfile> [options]
 ```
 
-Restore a previously created Hermes backup into your Hermes home directory. All files in the archive overwrite existing files in your Hermes home; `--force` only skips the confirmation prompt that fires when the target already has a Hermes installation.
+Restore a previously created Hermes backup into your Hermes home directory. Regular archive files overwrite their existing counterparts, while `auth.json` is restored through the canonical auth transaction. Host-local `auth.lock`, process/runtime files, and the Codex refresh lock/key/WAL subtree are never overwritten. On a fresh host, imported Codex OAuth generations are removed and require re-authentication; other supported auth state can be restored. `--force` only skips the confirmation prompt that fires when the target already has a Hermes installation.
 
 | Option | Description |
 |--------|-------------|
 | `-f`, `--force` | Skip the existing-installation confirmation prompt. |
 
 :::warning
-Stop the gateway before importing to avoid conflicts with running processes.
+Stop the gateway before importing to avoid conflicts with running processes. After a machine migration, re-authenticate Codex before using that provider.
 :::
 
 ### Examples
@@ -1493,13 +1493,13 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 |------------|-------------|
 | `list` | List all profiles. |
 | `use <name>` | Set a sticky default profile. |
-| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias]` | Create a new profile. `--clone` copies config, `.env`, `SOUL.md`, and skills from the active profile. `--clone-all` copies all state. `--clone-from` specifies a source profile and implies config clone unless paired with `--clone-all`. |
+| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias]` | Create a new profile. `--clone` copies config, `.env`, `SOUL.md`, skills, and curated memory files from the active profile. `--clone-all` also copies working state, including profile `.env` secrets, but excludes canonical `auth.json`/`auth.lock`, root `.op.env`, and per-profile history; re-authenticate OAuth providers in the clone. `--clone-from` specifies a source profile and implies config clone unless paired with `--clone-all`. |
 | `delete <name> [-y]` | Delete a profile. |
 | `show <name>` | Show profile details (home directory, config, etc.). |
 | `alias <name> [--remove] [--name NAME]` | Manage wrapper scripts for quick profile access. |
 | `rename <old> <new>` | Rename a profile. |
-| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive (local backup). |
-| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive (local restore). |
+| `export <name> [-o FILE]` | Export a portable profile `.tar.gz` without root `auth.json`, `auth.lock`, `.env`, `.op.env`, or machine-local state. Symlinks are rejected; nested project files are preserved. |
+| `import <archive> [--name NAME]` | Import a profile archive. Profile-root credentials are rejected, a blank private root `.env` is created, and nested project files are preserved. |
 | `install <source> [--name N] [--alias] [--force] [-y]` | Install a profile distribution from a git URL or local directory. |
 | `update <name> [--force-config] [-y]` | Re-pull a distribution; preserves user data (memories, sessions, auth). |
 | `info <name>` | Show a profile's distribution manifest (version, requirements, source). |

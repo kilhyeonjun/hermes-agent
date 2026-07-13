@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import shlex
 import ssl
@@ -28,20 +29,23 @@ import stat
 import sys
 import base64
 import hashlib
+import hmac
 import subprocess
 import threading
 import time
 import uuid
 import webbrowser
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
+
+_CODEX_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 from hermes_cli.config import (
     get_hermes_home,
@@ -122,6 +126,7 @@ XAI_OAUTH_DEVICE_CODE_URL = f"{XAI_OAUTH_ISSUER}/oauth2/device/code"
 # leaving brief but noisy credential-expiry gaps. Refresh up to one hour
 # early so ordinary runtime calls keep the token warm without user reauth.
 XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600
+XAI_REFRESH_LOCK_GRACE_SECONDS = 5.0
 QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
@@ -997,11 +1002,176 @@ def _load_global_auth_store() -> Dict[str, Any]:
         return {}
 
 
-def _auth_lock_path() -> Path:
-    return _auth_file_path().with_suffix(".lock")
+class AuthStoreConflictError(RuntimeError):
+    """The auth store changed after the caller loaded its snapshot."""
+
+
+class AuthStoreCorruptError(RuntimeError):
+    """A mutation was refused because the current auth store is invalid."""
+
+
+class AuthStoreRemovalError(RuntimeError):
+    """A canonical credential removal lacked an exact mutation intent."""
+
+
+class AuthStoreLockOrderError(RuntimeError):
+    """Different auth stores must never be locked in one thread at once."""
+
+
+@dataclass(frozen=True)
+class AuthMutationIntent:
+    """Non-secret audit and precondition data for canonical pool removals."""
+
+    actor: str
+    reason: str
+    provider_id: str
+    operation: str
+    removed_ids: FrozenSet[str] = frozenset()
+    expected_before_ids: FrozenSet[str] = frozenset()
+
+
+class _AuthStore(dict):
+    """dict-compatible store carrying non-persisted load/CAS evidence."""
+
+    _loaded_digest: Optional[str]
+    _loaded_exists: bool
+
+    def __init__(
+        self,
+        *args: Any,
+        loaded_digest: Optional[str] = None,
+        loaded_exists: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._loaded_digest = loaded_digest
+        self._loaded_exists = loaded_exists
+
+
+AUTH_STORE_REVISION_KEY = "_auth_revision"
+
+
+def _auth_lock_path(auth_file: Optional[Path] = None) -> Path:
+    return (auth_file or _auth_file_path()).with_suffix(".lock")
 
 
 _auth_lock_holder = threading.local()
+
+
+def _open_lock_file_safely(lock_path: Path):
+    """Open one pinned regular lock inode without following path links."""
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(
+            str(lock_path),
+            flags,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+    except OSError as exc:
+        raise AuthStoreCorruptError("Auth lock file cannot be opened safely") from exc
+    try:
+        opened = os.fstat(fd)
+        linked = lock_path.lstat()
+        reparse_flag = int(
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        linked_attributes = int(getattr(linked, "st_file_attributes", 0))
+        opened_attributes = int(getattr(opened, "st_file_attributes", 0))
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or bool(linked_attributes & reparse_flag)
+            or bool(opened_attributes & reparse_flag)
+            or getattr(opened, "st_nlink", 1) != 1
+            or getattr(linked, "st_nlink", 1) != 1
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise AuthStoreCorruptError("Auth lock file is unsafe")
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            raise AuthStoreCorruptError("Auth lock file owner is invalid")
+        if not _is_native_windows():
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+            if stat.S_IMODE(os.fstat(fd).st_mode) != (
+                stat.S_IRUSR | stat.S_IWUSR
+            ):
+                raise AuthStoreCorruptError(
+                    "Auth lock file permissions are unsafe"
+                )
+        if msvcrt and opened.st_size == 0:
+            os.write(fd, b" ")
+            os.fsync(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+        fd = -1
+        return handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _validate_auth_store_structure(raw: Dict[str, Any]) -> None:
+    """Reject container shapes that a mutation would otherwise normalize away."""
+    version = raw.get("version")
+    if version is not None and (
+        isinstance(version, bool) or not isinstance(version, int)
+    ):
+        raise AuthStoreCorruptError("Auth store version must be an integer")
+    providers = raw.get("providers")
+    if providers is not None and not isinstance(providers, dict):
+        raise AuthStoreCorruptError("Auth store providers must be an object")
+    pool = raw.get("credential_pool")
+    if pool is None:
+        return
+    if not isinstance(pool, dict):
+        raise AuthStoreCorruptError("Auth store credential_pool must be an object")
+    for provider_id, entries in pool.items():
+        if not isinstance(provider_id, str) or not isinstance(entries, list):
+            raise AuthStoreCorruptError(
+                "Credential pool providers must map to entry lists"
+            )
+        if any(not isinstance(entry, dict) for entry in entries):
+            raise AuthStoreCorruptError(
+                "Credential pool entries must be objects"
+            )
+
+
+def _migrate_legacy_credential_ids(raw: Dict[str, Any]) -> None:
+    """Assign stable, non-secret IDs to legacy pool rows missing ``id``."""
+    pool = raw.get("credential_pool")
+    if not isinstance(pool, dict):
+        return
+    for provider_id, entries in pool.items():
+        if not isinstance(provider_id, str) or not isinstance(entries, list):
+            continue
+        used_ids = {
+            str(entry.get("id") or "").strip()
+            for entry in entries
+            if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+        }
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or str(entry.get("id") or "").strip():
+                continue
+            encoded = json.dumps(
+                {
+                    "provider": provider_id,
+                    "index": index,
+                    "entry": entry,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            width = 12
+            candidate = f"legacy-{digest[:width]}"
+            while candidate in used_ids and width < len(digest):
+                width += 2
+                candidate = f"legacy-{digest[:width]}"
+            entry["id"] = candidate
+            used_ids.add(candidate)
 
 
 @contextmanager
@@ -1010,6 +1180,8 @@ def _file_lock(
     holder: threading.local,
     timeout_seconds: float,
     timeout_message: str,
+    *,
+    reentrancy_key: Optional[str] = None,
 ):
     """Cross-process advisory flock helper.
 
@@ -1020,30 +1192,45 @@ def _file_lock(
     state — that would let one lock's reentrant acquisition silently skip
     the other's kernel-level flock.
     """
-    if getattr(holder, "depth", 0) > 0:
-        holder.depth += 1
+    if reentrancy_key is None:
+        depth = getattr(holder, "depth", 0)
+    else:
+        depths = getattr(holder, "depth_by_key", {})
+        depth = int(depths.get(reentrancy_key, 0))
+    if depth > 0:
+        if reentrancy_key is None:
+            holder.depth += 1
+        else:
+            depths[reentrancy_key] = depth + 1
+            holder.depth_by_key = depths
         try:
             yield
         finally:
-            holder.depth -= 1
+            if reentrancy_key is None:
+                holder.depth -= 1
+            else:
+                depths[reentrancy_key] -= 1
         return
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     if fcntl is None and msvcrt is None:
-        holder.depth = 1
+        if reentrancy_key is None:
+            holder.depth = 1
+        else:
+            depths = getattr(holder, "depth_by_key", {})
+            depths[reentrancy_key] = 1
+            holder.depth_by_key = depths
         try:
             yield
         finally:
-            holder.depth = 0
+            if reentrancy_key is None:
+                holder.depth = 0
+            else:
+                depths[reentrancy_key] = 0
         return
 
-    # On Windows, msvcrt.locking needs the file to have content and the
-    # file pointer at position 0. Ensure the lock file has at least 1 byte.
-    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-        lock_path.write_text(" ", encoding="utf-8")
-
-    with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
+    with _open_lock_file_safely(lock_path) as lock_file:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
         while True:
             try:
@@ -1058,11 +1245,19 @@ def _file_lock(
                     raise TimeoutError(timeout_message)
                 time.sleep(0.05)
 
-        holder.depth = 1
+        if reentrancy_key is None:
+            holder.depth = 1
+        else:
+            depths = getattr(holder, "depth_by_key", {})
+            depths[reentrancy_key] = 1
+            holder.depth_by_key = depths
         try:
             yield
         finally:
-            holder.depth = 0
+            if reentrancy_key is None:
+                holder.depth = 0
+            else:
+                depths[reentrancy_key] = 0
             if fcntl:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -1077,7 +1272,10 @@ def _file_lock(
 
 
 @contextmanager
-def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+def _auth_store_lock(
+    auth_file: Optional[Path] = None,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
     """Cross-process advisory lock for auth.json reads+writes.  Reentrant.
 
     Lock ordering invariant: when this lock is held together with
@@ -1086,24 +1284,46 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     refresh paths follow this order; violating it risks deadlock
     against a concurrent import on the shared store.
     """
+    target = auth_file or _auth_file_path()
+    _assert_test_path_not_live(target)
+    key = str(target.expanduser().resolve(strict=False))
+    depths = getattr(_auth_lock_holder, "depth_by_key", {})
+    held = {held_key for held_key, depth in depths.items() if depth > 0}
+    if held and key not in held:
+        raise AuthStoreLockOrderError(
+            "Refusing nested locks for different auth stores"
+        )
     with _file_lock(
-        _auth_lock_path(),
+        _auth_lock_path(target),
         _auth_lock_holder,
         timeout_seconds,
         "Timed out waiting for auth store lock",
+        reentrancy_key=key,
     ):
         yield
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+def _load_auth_store(
+    auth_file: Optional[Path] = None,
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     _assert_test_path_not_live(auth_file)
     if not auth_file.exists():
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        return _AuthStore(
+            {"version": AUTH_STORE_VERSION, "providers": {}},
+            loaded_exists=False,
+        )
 
     try:
-        raw = json.loads(auth_file.read_text())
+        raw_bytes = auth_file.read_bytes()
+        raw = json.loads(raw_bytes)
     except Exception as exc:
+        if strict:
+            raise AuthStoreCorruptError(
+                "Refusing to mutate an unreadable auth store"
+            ) from exc
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
             import shutil
@@ -1115,16 +1335,45 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             "Corrupt file preserved at %s",
             auth_file, exc, corrupt_path,
         )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        return _AuthStore(
+            {"version": AUTH_STORE_VERSION, "providers": {}},
+            loaded_exists=True,
+        )
+
+    loaded_digest = hashlib.sha256(raw_bytes).hexdigest()
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
         or isinstance(raw.get("credential_pool"), dict)
+        or (
+            isinstance(raw.get("version"), int)
+            and not isinstance(raw.get("version"), bool)
+        )
     ):
+        if strict:
+            _validate_auth_store_structure(raw)
+        else:
+            try:
+                _validate_auth_store_structure(raw)
+            except AuthStoreCorruptError:
+                pass
+        _migrate_legacy_credential_ids(raw)
         raw.setdefault("providers", {})
         if isinstance(raw.get("providers"), dict):
             _migrate_stale_nous_portal_url(raw["providers"])
-        return raw
+        revision = raw.get(AUTH_STORE_REVISION_KEY, 0)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            if strict:
+                raise AuthStoreCorruptError(
+                    "Refusing to mutate an auth store with invalid revision"
+                )
+            revision = 0
+        raw[AUTH_STORE_REVISION_KEY] = revision
+        return _AuthStore(
+            raw,
+            loaded_digest=loaded_digest,
+            loaded_exists=True,
+        )
 
     # Migrate from PR's "systems" format if present
     if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):
@@ -1132,13 +1381,136 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         providers = {}
         if "nous_portal" in systems:
             providers["nous"] = systems["nous_portal"]
-        return {"version": AUTH_STORE_VERSION, "providers": providers,
-                "active_provider": "nous" if providers else None}
+        return _AuthStore(
+            {"version": AUTH_STORE_VERSION, "providers": providers,
+             "active_provider": "nous" if providers else None,
+             AUTH_STORE_REVISION_KEY: 0},
+            loaded_digest=loaded_digest,
+            loaded_exists=True,
+        )
 
-    return {"version": AUTH_STORE_VERSION, "providers": {}}
+    if strict:
+        raise AuthStoreCorruptError("Refusing to mutate an invalid auth store")
+    return _AuthStore(
+        {"version": AUTH_STORE_VERSION, "providers": {}},
+        loaded_digest=loaded_digest,
+        loaded_exists=True,
+    )
 
 
-def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
+def _canonical_pool_entries(
+    auth_store: Dict[str, Any], provider_id: str
+) -> List[Dict[str, Any]]:
+    pool = auth_store.get("credential_pool")
+    entries = pool.get(provider_id) if isinstance(pool, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _canonical_pool_ids(
+    auth_store: Dict[str, Any], provider_id: str
+) -> FrozenSet[str]:
+    return frozenset(
+        str(entry.get("id") or "").strip()
+        for entry in _canonical_pool_entries(auth_store, provider_id)
+        if str(entry.get("id") or "").strip()
+    )
+
+
+def credential_entry_fingerprint(entry: Dict[str, Any]) -> str:
+    """Return an internal CAS fingerprint; never emit it to logs or UI."""
+    encoded = json.dumps(
+        entry,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def oauth_token_pair_fingerprint(
+    access_token: Any,
+    refresh_token: Any,
+) -> str:
+    """Fingerprint one OAuth generation without exposing credential values."""
+    return credential_entry_fingerprint(
+        {
+            "access_token": str(access_token or ""),
+            "refresh_token": str(refresh_token or ""),
+        }
+    )
+
+
+def provider_oauth_token_pair_fingerprint(
+    provider_id: str,
+    state: Dict[str, Any],
+) -> str:
+    """Return the persisted OAuth pair fingerprint for one provider state."""
+    tokens: Any = state
+    if provider_id in {"openai-codex", "xai-oauth"}:
+        tokens = state.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
+    return oauth_token_pair_fingerprint(
+        tokens.get("access_token"),
+        tokens.get("refresh_token"),
+    )
+
+
+def _validate_canonical_pool_removal(
+    current: Dict[str, Any],
+    proposed: Dict[str, Any],
+    intent: Optional[AuthMutationIntent],
+) -> None:
+    provider_id = "openai-codex"
+    before_entries = _canonical_pool_entries(current, provider_id)
+    after_entries = _canonical_pool_entries(proposed, provider_id)
+    if not before_entries:
+        return
+    before_ids = _canonical_pool_ids(current, provider_id)
+    after_ids = _canonical_pool_ids(proposed, provider_id)
+    removed_ids = before_ids - after_ids
+    count_dropped = len(after_entries) < len(before_entries)
+    if not removed_ids and not count_dropped:
+        return
+    valid = bool(
+        intent is not None
+        and intent.provider_id == provider_id
+        and intent.operation
+        in {
+            "clear_provider",
+            "remove_ids",
+            "terminal_refresh",
+            "dead_ttl_prune",
+            "source_reconcile",
+        }
+        and intent.removed_ids == removed_ids
+        and intent.expected_before_ids == before_ids
+        and len(before_ids) == len(before_entries)
+    )
+    if not valid:
+        raise AuthStoreRemovalError(
+            "Refusing canonical credential removal without exact intent"
+        )
+    logger.warning(
+        "auth_store canonical_pool_removal actor=%s reason=%s "
+        "operation=%s before_count=%d removed_count=%d",
+        intent.actor,
+        intent.reason,
+        intent.operation,
+        len(before_entries),
+        len(removed_ids),
+    )
+
+
+def _save_auth_store(
+    auth_store: Dict[str, Any],
+    target_path: Optional[Path] = None,
+    *,
+    expected_revision: Optional[int] = None,
+    intent: Optional[AuthMutationIntent] = None,
+) -> Path:
     # target_path=None preserves the existing contract (write the active
     # store at _auth_file_path()). An explicit path lets callers persist a
     # specific store — e.g. the global-root write-through for rotating xAI
@@ -1146,51 +1518,357 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
     _assert_test_path_not_live(auth_file)
-    auth_file.parent.mkdir(parents=True, exist_ok=True)
-    # Tighten parent dir to 0o700 so siblings can't traverse to creds.
-    # No-op on Windows (POSIX mode bits not enforced); ignore failures.
-    # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
-    secure_parent_dir(auth_file)
-    auth_store["version"] = AUTH_STORE_VERSION
-    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(auth_store, indent=2) + "\n"
-    tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
-        # the TOCTOU window where default umask (often 0o644) briefly exposed
-        # OAuth tokens to other local users between open() and chmod().
-        # Mirrors agent/google_oauth.py (#19673) and tools/mcp_oauth.py (#21148).
-        fd = os.open(
-            str(tmp_path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            stat.S_IRUSR | stat.S_IWUSR,
+    with _auth_store_lock(auth_file):
+        current_exists = auth_file.exists()
+        current = _load_auth_store(auth_file, strict=True)
+        current_revision = int(current.get(AUTH_STORE_REVISION_KEY, 0))
+        proposed_revision = (
+            int(expected_revision)
+            if expected_revision is not None
+            else int(auth_store.get(AUTH_STORE_REVISION_KEY, 0))
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        atomic_replace(tmp_path, auth_file)
+        loaded_exists = getattr(auth_store, "_loaded_exists", False)
+        loaded_digest = getattr(auth_store, "_loaded_digest", None)
+        current_digest = getattr(current, "_loaded_digest", None)
+        if bool(loaded_exists) != bool(current_exists):
+            raise AuthStoreConflictError("Auth store existence changed")
+        if current_exists and loaded_digest is None:
+            raise AuthStoreConflictError(
+                "Auth store mutation lacks load revision evidence"
+            )
+        if current_exists and loaded_digest != current_digest:
+            raise AuthStoreConflictError("Auth store changed since load")
+        if proposed_revision != current_revision:
+            raise AuthStoreConflictError("Auth store revision changed")
+        _validate_auth_store_structure(auth_store)
+        _validate_canonical_pool_removal(current, auth_store, intent)
+
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        # Tighten parent dir to 0o700 so siblings can't traverse to creds.
+        # No-op on Windows (POSIX mode bits not enforced); ignore failures.
+        # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
+        secure_parent_dir(auth_file)
+        auth_store["version"] = AUTH_STORE_VERSION
+        auth_store[AUTH_STORE_REVISION_KEY] = current_revision + 1
+        auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(auth_store, indent=2) + "\n"
+        tmp_path = auth_file.with_name(
+            f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        )
         try:
-            dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
+            # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
+            # the TOCTOU window where default umask (often 0o644) briefly exposed
+            # OAuth tokens to other local users between open() and chmod().
+            fd = os.open(
+                str(tmp_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_path, auth_file)
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-    finally:
+                dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
         try:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             pass
-    # Restrict file permissions to owner only
+        if isinstance(auth_store, _AuthStore):
+            auth_store._loaded_exists = True
+            auth_store._loaded_digest = hashlib.sha256(
+                payload.encode("utf-8")
+            ).hexdigest()
+        return auth_file
+
+
+def mutate_auth_store(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    target_path: Optional[Path] = None,
+    intent: Optional[AuthMutationIntent] = None,
+) -> Path:
+    """Apply a field-scoped mutation to a fresh, target-locked auth store."""
+    auth_file = target_path if target_path is not None else _auth_file_path()
+    with _auth_store_lock(auth_file):
+        store = _load_auth_store(auth_file, strict=True)
+        mutator(store)
+        return _save_auth_store(store, target_path=auth_file, intent=intent)
+
+
+def _codex_grant_ids_in_store(auth_store: Dict[str, Any]) -> set[str]:
+    """Return every explicit Codex grant owned by one auth store."""
+    raw_grants: List[Any] = []
+    providers = auth_store.get("providers")
+    state = (
+        providers.get("openai-codex")
+        if isinstance(providers, dict)
+        else None
+    )
+    if isinstance(state, dict):
+        raw_grants.append(state.get("grant_id"))
+    pool = auth_store.get("credential_pool")
+    rows = pool.get("openai-codex") if isinstance(pool, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict):
+            raw_grants.append(row.get("grant_id"))
+    return {
+        normalized
+        for raw in raw_grants
+        if raw not in (None, "")
+        for normalized in [
+            _normalize_codex_grant_id(raw, allow_missing=False) or ""
+        ]
+    }
+
+
+def _exclude_codex_oauth_from_auth_snapshot(
+    auth_store: Dict[str, Any],
+) -> bool:
+    """Remove non-portable single-use Codex OAuth state from a snapshot."""
+    removed = False
+    providers = auth_store.get("providers")
+    if isinstance(providers, dict) and "openai-codex" in providers:
+        providers.pop("openai-codex", None)
+        removed = True
+    pool = auth_store.get("credential_pool")
+    if isinstance(pool, dict) and "openai-codex" in pool:
+        pool.pop("openai-codex", None)
+        removed = True
+    suppressed = auth_store.get("suppressed_sources")
+    if isinstance(suppressed, dict):
+        suppressed.pop("openai-codex", None)
+    if auth_store.get("active_provider") == "openai-codex":
+        auth_store.pop("active_provider", None)
+    return removed
+
+
+def _assert_snapshot_does_not_restore_prepared_codex_generation(
+    candidate: Dict[str, Any],
+) -> None:
+    """Reject backup material that could replay an in-flight generation.
+
+    The check runs while the host Codex mutation lock is held, before an
+    explicit restore is allowed to recover or supersede any WAL. Matching the
+    stable grant, the observed old refresh-token HMAC, or the durable rotated
+    pair is sufficient to fail closed; legacy snapshots may not carry a grant
+    identifier yet.
+    """
+    records = list(_iter_codex_oauth_records(candidate))
+    if not records:
+        return
+    for grant_id in _codex_refresh_wal_grant_ids():
+        payload = _read_codex_refresh_wal(grant_id)
+        if payload is None:
+            continue
+        old_refresh_hmac = str(payload.get("old_refresh_hmac") or "")
+        new_pair_hmac = str(payload.get("new_pair_hmac") or "")
+        for _kind, _credential_id, record, tokens in records:
+            candidate_grant = _normalize_codex_grant_id(
+                record.get("grant_id")
+            )
+            same_grant = candidate_grant == grant_id
+            same_refresh = hmac.compare_digest(
+                _codex_refresh_token_hmac(tokens.get("refresh_token")),
+                old_refresh_hmac,
+            )
+            same_rotated_pair = bool(
+                _is_hex_digest(new_pair_hmac)
+                and hmac.compare_digest(
+                    _codex_pair_hmac(
+                        tokens.get("access_token"),
+                        tokens.get("refresh_token"),
+                    ),
+                    new_pair_hmac,
+                )
+            )
+            if same_grant or same_refresh or same_rotated_pair:
+                raise AuthStoreConflictError(
+                    "Auth snapshot contains an ambiguous Codex refresh "
+                    "generation; re-authenticate instead of restoring it"
+                )
+
+
+def _assert_snapshot_does_not_roll_back_current_codex_grant(
+    candidate: Dict[str, Any],
+    current: Dict[str, Any],
+) -> None:
+    """Reject a stale token pair reusing a live stable grant identifier."""
+    current_pairs: Dict[str, set[tuple[str, str]]] = {}
+    for _kind, _credential_id, record, tokens in _iter_codex_oauth_records(
+        current
+    ):
+        grant_id = _normalize_codex_grant_id(record.get("grant_id"))
+        if not grant_id:
+            continue
+        current_pairs.setdefault(grant_id, set()).add(
+            (
+                str(tokens.get("access_token") or ""),
+                str(tokens.get("refresh_token") or ""),
+            )
+        )
+    for _kind, _credential_id, record, tokens in _iter_codex_oauth_records(
+        candidate
+    ):
+        grant_id = _normalize_codex_grant_id(record.get("grant_id"))
+        if not grant_id or grant_id not in current_pairs:
+            continue
+        pair = (
+            str(tokens.get("access_token") or ""),
+            str(tokens.get("refresh_token") or ""),
+        )
+        if pair not in current_pairs[grant_id]:
+            raise AuthStoreConflictError(
+                "Auth snapshot contains an older Codex generation for a "
+                "live grant; re-authenticate instead of rolling it back"
+            )
+
+
+def replace_auth_store_from_snapshot(
+    candidate: Any,
+    *,
+    target_path: Optional[Path] = None,
+    actor: str,
+    reason: str,
+    expected_revision: Optional[int] = None,
+    require_absent: bool = False,
+    supersede_ambiguous: Optional[bool] = None,
+    allow_same_host_codex_oauth: bool = False,
+) -> Path:
+    """Validate and atomically replace one auth store from backup material.
+
+    Archive revisions are never trusted. Codex OAuth is excluded by default:
+    its refresh token is single-use and a detached backup cannot prove that
+    the generation is still current. Internal same-host recovery callers may
+    opt into the stricter WAL/current-generation proof path explicitly.
+    The live store is loaded strictly
+    under its canonical lock, its current revision/digest evidence is retained,
+    and every Codex pool removal receives an exact intent before the standard
+    0600 + fsync + atomic-replace writer commits the candidate. Create-only
+    callers never supersede an ambiguous Codex refresh: a PREPARED WAL must be
+    resolved explicitly before first-boot material can be introduced.
+    """
+    auth_file = target_path if target_path is not None else _auth_file_path()
+    effective_supersede = (
+        not require_absent
+        if supersede_ambiguous is None
+        else bool(supersede_ambiguous)
+    )
+    if require_absent and effective_supersede:
+        raise ValueError(
+            "Create-only auth snapshot writes cannot supersede ambiguous Codex refreshes"
+        )
     try:
-        auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    return auth_file
+        if isinstance(candidate, bytes):
+            parsed = json.loads(candidate.decode("utf-8"))
+        elif isinstance(candidate, str):
+            parsed = json.loads(candidate)
+        elif isinstance(candidate, dict):
+            parsed = json.loads(json.dumps(candidate))
+        else:
+            raise TypeError("unsupported auth snapshot type")
+    except (TypeError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise AuthStoreCorruptError("Auth snapshot is not valid JSON") from exc
+
+    if not isinstance(parsed, dict) or not (
+        isinstance(parsed.get("providers"), dict)
+        or isinstance(parsed.get("credential_pool"), dict)
+        or (
+            isinstance(parsed.get("version"), int)
+            and not isinstance(parsed.get("version"), bool)
+        )
+    ):
+        raise AuthStoreCorruptError("Auth snapshot has an invalid top-level shape")
+    _validate_auth_store_structure(parsed)
+    _migrate_legacy_credential_ids(parsed)
+    parsed.setdefault("providers", {})
+    if (
+        not allow_same_host_codex_oauth
+        and _exclude_codex_oauth_from_auth_snapshot(parsed)
+    ):
+        logger.warning(
+            "Codex OAuth credentials were excluded from auth snapshot "
+            "restore; re-authentication is required"
+        )
+
+    codex_entries = _canonical_pool_entries(parsed, "openai-codex")
+    codex_ids = [str(entry.get("id") or "").strip() for entry in codex_entries]
+    if any(not item for item in codex_ids) or len(set(codex_ids)) != len(
+        codex_ids
+    ):
+        raise AuthStoreCorruptError(
+            "Auth snapshot has invalid or duplicate Codex credential IDs"
+        )
+
+    candidate_grant_ids = _codex_grant_ids_in_store(parsed)
+
+    def _snapshot_grant_ids() -> set[str]:
+        with _auth_store_lock(auth_file):
+            current = _load_auth_store(auth_file, strict=True)
+            _assert_snapshot_does_not_roll_back_current_codex_grant(
+                parsed,
+                current,
+            )
+            scoped_grants = (
+                _codex_grant_ids_in_store(current) | candidate_grant_ids
+            )
+        _assert_snapshot_does_not_restore_prepared_codex_generation(parsed)
+        return scoped_grants
+
+    with _codex_auth_store_mutation(
+        reason="snapshot_restore" if effective_supersede else "snapshot_create",
+        supersede_ambiguous=effective_supersede,
+        grant_id_resolver=_snapshot_grant_ids,
+    ):
+        with _auth_store_lock(auth_file):
+            if require_absent and auth_file.exists():
+                raise AuthStoreConflictError("Auth store already exists")
+            current = _load_auth_store(auth_file, strict=True)
+            current_revision = int(current.get(AUTH_STORE_REVISION_KEY, 0))
+            if (
+                expected_revision is not None
+                and int(expected_revision) != current_revision
+            ):
+                raise AuthStoreConflictError("Auth store revision changed")
+
+            before_ids = _canonical_pool_ids(current, "openai-codex")
+            after_ids = frozenset(codex_ids)
+            removed_ids = before_ids - after_ids
+            intent = None
+            if removed_ids:
+                intent = AuthMutationIntent(
+                    actor=str(actor or "snapshot_restore"),
+                    reason=str(reason or "explicit auth snapshot restore"),
+                    provider_id="openai-codex",
+                    operation="source_reconcile",
+                    removed_ids=removed_ids,
+                    expected_before_ids=before_ids,
+                )
+
+            parsed.pop(AUTH_STORE_REVISION_KEY, None)
+            current.clear()
+            current.update(parsed)
+            current[AUTH_STORE_REVISION_KEY] = current_revision
+            return _save_auth_store(
+                current,
+                target_path=auth_file,
+                expected_revision=current_revision,
+                intent=intent,
+            )
 
 
 def _load_provider_state_with_source(
@@ -1223,6 +1901,41 @@ def _load_provider_state_with_source(
     return None, None
 
 
+@contextmanager
+def _locked_provider_auth_store(
+    provider_id: str,
+    *,
+    source_auth_path: Optional[Path] = None,
+):
+    """Lock only the auth store that owns a provider singleton.
+
+    Source discovery is read-only.  The selected store is then reloaded under
+    its own path-scoped lock before any refresh or write.  This prevents a
+    named profile from holding its profile lock while persisting a fallback
+    singleton to the global root, which would violate the cross-store lock
+    order and can deadlock with another writer.
+    """
+    if source_auth_path is None:
+        active_snapshot = _load_auth_store()
+        _candidate_state, discovered_path = _load_provider_state_with_source(
+            active_snapshot,
+            provider_id,
+        )
+        locked_path = discovered_path or _auth_file_path()
+    else:
+        locked_path = source_auth_path
+    with _auth_store_lock(locked_path):
+        auth_store = _load_auth_store(locked_path, strict=True)
+        providers = auth_store.get("providers")
+        raw_state = (
+            providers.get(provider_id)
+            if isinstance(providers, dict)
+            else None
+        )
+        state = dict(raw_state) if isinstance(raw_state, dict) else None
+        yield auth_store, state, locked_path if state is not None else None
+
+
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
     """Return a provider's persisted state.
 
@@ -1236,6 +1949,15 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     """
     state, _source_path = _load_provider_state_with_source(auth_store, provider_id)
     return state
+
+
+def _load_local_provider_state(
+    auth_store: Dict[str, Any], provider_id: str
+) -> Optional[Dict[str, Any]]:
+    """Return only state owned by this auth store, with no root fallback."""
+    providers = auth_store.get("providers")
+    state = providers.get(provider_id) if isinstance(providers, dict) else None
+    return state if isinstance(state, dict) else None
 
 
 def _save_provider_state(auth_store: Dict[str, Any], provider_id: str, state: Dict[str, Any]) -> None:
@@ -1254,21 +1976,19 @@ def _save_provider_state_to_source(
     source_path: Optional[Path],
 ) -> None:
     """Persist provider state back to the auth store it was read from."""
-    active_path = _auth_file_path()
     if source_path is None:
-        source_path = active_path
-    try:
-        same_store = source_path.resolve(strict=False) == active_path.resolve(strict=False)
-    except Exception:
-        same_store = source_path == active_path
-    if same_store:
-        _save_provider_state(auth_store, provider_id, state)
-        _save_auth_store(auth_store)
-        return
-
-    source_store = _load_auth_store(source_path)
-    _save_provider_state(source_store, provider_id, state)
-    _save_auth_store(source_store, target_path=source_path)
+        source_path = _auth_file_path()
+    # ``_locked_provider_auth_store`` already loaded this exact source under
+    # its path-scoped lock.  Preserve every mutation made to that snapshot
+    # (including terminal pool quarantine) instead of reloading and saving
+    # only providers.<id>.
+    _store_provider_state(
+        auth_store,
+        provider_id,
+        state,
+        set_active=False,
+    )
+    _save_auth_store(auth_store, target_path=source_path)
 
 
 def _store_provider_state(
@@ -1356,19 +2076,104 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             merged[gp_key] = list(gp_entries)
         return merged
 
-    provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
-    # Profile has no entries for this provider — fall back to global.
-    global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    entries, _source_path = read_credential_pool_with_source(provider_id)
+    return entries
 
 
-def write_credential_pool(
+def read_credential_pool_with_source(
+    provider_id: str,
+    *,
+    allow_global_fallback: bool = True,
+) -> tuple[List[Dict[str, Any]], Path]:
+    """Return one provider slice and the auth.json that owns it.
+
+    A provider singleton in the active profile claims that provider even when
+    its pool has not been materialized yet.  Falling through to a root pool in
+    that state would combine profile tokens with a root-owned destination on
+    the next ``load_pool()`` reconciliation.
+    """
+    active_path = _auth_file_path()
+    active_store = _load_auth_store(active_path)
+    active_pool = active_store.get("credential_pool")
+    active_entries = (
+        active_pool.get(provider_id)
+        if isinstance(active_pool, dict)
+        else None
+    )
+    if isinstance(active_entries, list) and active_entries:
+        return list(active_entries), active_path
+
+    active_providers = active_store.get("providers")
+    if (
+        isinstance(active_providers, dict)
+        and isinstance(active_providers.get(provider_id), dict)
+    ):
+        return (
+            list(active_entries) if isinstance(active_entries, list) else [],
+            active_path,
+        )
+
+    if not allow_global_fallback:
+        return (
+            list(active_entries) if isinstance(active_entries, list) else [],
+            active_path,
+        )
+
+    global_path = _global_auth_file_path()
+    global_store = _load_global_auth_store()
+    global_pool = global_store.get("credential_pool")
+    global_entries = (
+        global_pool.get(provider_id)
+        if isinstance(global_pool, dict)
+        else None
+    )
+    global_providers = global_store.get("providers")
+    global_provider_state = (
+        global_providers.get(provider_id)
+        if isinstance(global_providers, dict)
+        else None
+    )
+    if (
+        global_path is not None
+        and (
+            (isinstance(global_entries, list) and global_entries)
+            or isinstance(global_provider_state, dict)
+        )
+    ):
+        return (
+            list(global_entries) if isinstance(global_entries, list) else [],
+            global_path,
+        )
+    return [], active_path
+
+
+def assert_credential_pool_source(
+    provider_id: str,
+    expected_path: Optional[Path],
+) -> None:
+    """Reject a stale pool after profile/root ownership has changed."""
+    if expected_path is None:
+        return
+    _entries, selected_path = read_credential_pool_with_source(provider_id)
+    expected = expected_path.expanduser().resolve(strict=False)
+    selected = selected_path.expanduser().resolve(strict=False)
+    if selected != expected:
+        raise AuthStoreConflictError(
+            f"Credential pool source changed for {provider_id}; reload the pool"
+        )
+
+
+def _write_credential_pool_uncoordinated(
     provider_id: str,
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    removal_actor: str = "write_credential_pool",
+    removal_reason: str = "explicit removed_ids",
+    removal_operation: str = "remove_ids",
+    expected_entry_fingerprints: Optional[Dict[str, str]] = None,
+    expected_auth_revision: Optional[int] = None,
+    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1385,8 +2190,17 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    auth_path = target_path or _auth_file_path()
+    with _auth_store_lock(auth_path):
+        auth_store = _load_auth_store(auth_path, strict=True)
+        current_revision = int(auth_store.get(AUTH_STORE_REVISION_KEY, 0))
+        if (
+            expected_auth_revision is not None
+            and int(expected_auth_revision) != current_revision
+        ):
+            raise AuthStoreConflictError(
+                "Auth store revision changed since pool source discovery"
+            )
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1398,6 +2212,42 @@ def write_credential_pool(
         ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
+        existing_by_id = {
+            str(entry.get("id") or "").strip(): entry
+            for entry in existing_list
+            if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+        }
+        if expected_entry_fingerprints is not None:
+            for incoming in sanitized_entries:
+                if not isinstance(incoming, dict):
+                    continue
+                incoming_id = str(incoming.get("id") or "").strip()
+                if not incoming_id:
+                    continue
+                if incoming_id not in existing_by_id:
+                    if incoming_id in expected_entry_fingerprints:
+                        raise AuthStoreConflictError(
+                            "Credential entry disappeared since pool load"
+                        )
+                    continue
+                current_fp = credential_entry_fingerprint(
+                    existing_by_id[incoming_id]
+                )
+                expected_fp = expected_entry_fingerprints.get(incoming_id)
+                incoming_fp = credential_entry_fingerprint(incoming)
+                if expected_fp != current_fp and incoming_fp != current_fp:
+                    raise AuthStoreConflictError(
+                        "Credential entry changed since pool load"
+                    )
+            for removed_id in removed:
+                current_entry = existing_by_id.get(removed_id)
+                if current_entry is None:
+                    continue
+                current_fp = credential_entry_fingerprint(current_entry)
+                if expected_entry_fingerprints.get(removed_id) != current_fp:
+                    raise AuthStoreConflictError(
+                        "Credential entry changed before removal"
+                    )
         new_ids = {
             entry.get("id")
             for entry in sanitized_entries
@@ -1412,7 +2262,93 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        before_ids = frozenset(
+            str(entry.get("id") or "").strip()
+            for entry in existing_list
+            if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+        )
+        after_ids = frozenset(
+            str(entry.get("id") or "").strip()
+            for entry in merged
+            if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+        )
+        actual_removed = before_ids - after_ids
+        intent = None
+        if provider_id == "openai-codex" and actual_removed:
+            intent = AuthMutationIntent(
+                actor=removal_actor,
+                reason=removal_reason,
+                provider_id=provider_id,
+                operation=removal_operation,
+                removed_ids=actual_removed,
+                expected_before_ids=before_ids,
+            )
+        return _save_auth_store(
+            auth_store,
+            target_path=auth_path,
+            intent=intent,
+        )
+
+
+def write_credential_pool(
+    provider_id: str,
+    entries: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Iterable[str]] = None,
+    removal_actor: str = "write_credential_pool",
+    removal_reason: str = "explicit removed_ids",
+    removal_operation: str = "remove_ids",
+    expected_entry_fingerprints: Optional[Dict[str, str]] = None,
+    expected_auth_revision: Optional[int] = None,
+    target_path: Optional[Path] = None,
+) -> Path:
+    """Coordinate Codex row removal before entering the auth-store writer."""
+    removed = tuple(rid for rid in (removed_ids or ()) if rid)
+    auth_path = target_path or _auth_file_path()
+
+    def _removed_codex_grant_ids() -> set[str]:
+        with _auth_store_lock(auth_path):
+            store = _load_auth_store(auth_path, strict=True)
+            rows = _canonical_pool_entries(store, "openai-codex")
+            removed_set = set(removed)
+            return {
+                grant_id
+                for row in rows
+                if str(row.get("id") or "").strip() in removed_set
+                for grant_id in [
+                    _normalize_codex_grant_id(row.get("grant_id"))
+                ]
+                if grant_id
+            }
+
+    if provider_id == "openai-codex" and removed:
+        with _codex_auth_store_mutation(
+            reason=removal_operation,
+            supersede_ambiguous=True,
+            grant_id_resolver=_removed_codex_grant_ids,
+        ):
+            return _write_credential_pool_uncoordinated(
+                provider_id,
+                entries,
+                removed_ids=removed,
+                removal_actor=removal_actor,
+                removal_reason=removal_reason,
+                removal_operation=removal_operation,
+                expected_entry_fingerprints=expected_entry_fingerprints,
+                expected_auth_revision=expected_auth_revision,
+                target_path=auth_path,
+            )
+    return _write_credential_pool_uncoordinated(
+        provider_id,
+        entries,
+        removed_ids=removed,
+        removal_actor=removal_actor,
+        removal_reason=removal_reason,
+        removal_operation=removal_operation,
+        expected_entry_fingerprints=expected_entry_fingerprints,
+        expected_auth_revision=expected_auth_revision,
+        target_path=auth_path,
+    )
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -1565,38 +2501,74 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
     If provider_id is None, clears the active provider.
     Returns True if something was cleared.
     """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        target = provider_id or auth_store.get("active_provider")
+    auth_file = _auth_file_path()
+    target = str(provider_id or "").strip().lower() or None
+    if not target:
+        with _auth_store_lock(auth_file):
+            auth_store = _load_auth_store(auth_file, strict=True)
+            target = auth_store.get("active_provider")
         if not target:
             return False
 
-        providers = auth_store.get("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            auth_store["providers"] = providers
+    def _clear_target() -> bool:
+        with _auth_store_lock(auth_file):
+            auth_store = _load_auth_store(auth_file, strict=True)
 
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            pool = {}
-            auth_store["credential_pool"] = pool
+            providers = auth_store.get("providers", {})
+            if not isinstance(providers, dict):
+                providers = {}
+                auth_store["providers"] = providers
 
-        cleared = False
-        if target in providers:
-            del providers[target]
-            cleared = True
-        if target in pool:
-            del pool[target]
-            cleared = True
+            pool = auth_store.get("credential_pool")
+            if not isinstance(pool, dict):
+                pool = {}
+                auth_store["credential_pool"] = pool
 
-        if auth_store.get("active_provider") == target:
-            auth_store["active_provider"] = None
-            cleared = True
+            cleared = False
+            if target in providers:
+                del providers[target]
+                cleared = True
+            before_pool_ids = _canonical_pool_ids(auth_store, target)
+            if target in pool:
+                del pool[target]
+                cleared = True
 
-        if not cleared:
-            return False
-        _save_auth_store(auth_store)
-    return True
+            if auth_store.get("active_provider") == target:
+                auth_store["active_provider"] = None
+                cleared = True
+
+            if not cleared:
+                return False
+            intent = None
+            if target == "openai-codex" and before_pool_ids:
+                intent = AuthMutationIntent(
+                    actor="logout",
+                    reason="explicit provider logout",
+                    provider_id=target,
+                    operation="clear_provider",
+                    removed_ids=before_pool_ids,
+                    expected_before_ids=before_pool_ids,
+                )
+            _save_auth_store(
+                auth_store,
+                target_path=auth_file,
+                intent=intent,
+            )
+        return True
+
+    if target == "openai-codex":
+        def _logout_grant_ids() -> set[str]:
+            with _auth_store_lock(auth_file):
+                store = _load_auth_store(auth_file, strict=True)
+                return _codex_grant_ids_in_store(store)
+
+        with _codex_auth_store_mutation(
+            reason="explicit_logout",
+            supersede_ambiguous=True,
+            grant_id_resolver=_logout_grant_ids,
+        ):
+            return _clear_target()
+    return _clear_target()
 
 
 def deactivate_provider() -> None:
@@ -3227,18 +4199,7 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
-def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
-    """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
-    Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
-    Raises AuthError if no Codex tokens are stored.
-    """
-    if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-    else:
-        auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+def _codex_data_from_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3271,9 +4232,37 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             relogin_required=True,
         )
     return {
-        "tokens": tokens,
+        "tokens": dict(tokens),
         "last_refresh": state.get("last_refresh"),
     }
+
+
+def _read_codex_tokens_with_source() -> tuple[Dict[str, Any], Path]:
+    """Read the Codex singleton under the lock of its actual owning store."""
+    active_snapshot = _load_auth_store()
+    _state, source_path = _load_provider_state_with_source(
+        active_snapshot,
+        "openai-codex",
+    )
+    locked_path = source_path or _auth_file_path()
+    with _auth_store_lock(locked_path):
+        auth_store = _load_auth_store(locked_path, strict=True)
+        providers = auth_store.get("providers")
+        state = (
+            providers.get("openai-codex")
+            if isinstance(providers, dict)
+            else None
+        )
+        return _codex_data_from_state(
+            dict(state) if isinstance(state, dict) else None
+        ), locked_path
+
+
+def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+    """Read Codex OAuth tokens from their exact profile/root source."""
+    del _lock  # Retained for compatibility; source locking is always required.
+    data, _source_path = _read_codex_tokens_with_source()
+    return data
 
 
 def _sync_codex_pool_entries(
@@ -3281,6 +4270,9 @@ def _sync_codex_pool_entries(
     tokens: Dict[str, str],
     last_refresh: Optional[str],
     previous_singleton_tokens: Optional[Dict[str, str]] = None,
+    *,
+    grant_id: Optional[str] = None,
+    previous_grant_id: Optional[str] = None,
 ) -> None:
     """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
 
@@ -3341,8 +4333,10 @@ def _sync_codex_pool_entries(
     # is the right default for first-ever-save or a freshly initialized
     # auth.json).
     prev_at = None
+    prev_rt = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+        prev_rt = previous_singleton_tokens.get("refresh_token") or None
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -3356,8 +4350,26 @@ def _sync_codex_pool_entries(
             # singleton from the #33000 workaround era).  An entry with its
             # own distinct token material is an independent account and must
             # be left alone (#39236).
+            entry_grant = str(entry.get("grant_id") or "").strip()
             refresh_this_entry = bool(
-                prev_at and entry.get("access_token") == prev_at
+                (previous_grant_id and entry_grant == previous_grant_id)
+                or (
+                    prev_at
+                    and prev_rt
+                    and entry.get("access_token") == prev_at
+                    and entry.get("refresh_token") == prev_rt
+                )
+                or (
+                    not entry_grant
+                    and prev_rt
+                    and entry.get("refresh_token") == prev_rt
+                )
+                or (
+                    not entry_grant
+                    and prev_at
+                    and entry.get("access_token") == prev_at
+                    and not entry.get("refresh_token")
+                )
             )
         else:
             # ``manual:api_key`` and any future non-device-code sources.
@@ -3367,6 +4379,8 @@ def _sync_codex_pool_entries(
         entry["access_token"] = access_token
         if refresh_token:
             entry["refresh_token"] = refresh_token
+        if grant_id:
+            entry["grant_id"] = grant_id
         if last_refresh:
             entry["last_refresh"] = last_refresh
         entry["last_status"] = None
@@ -3381,44 +4395,54 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
-        # Capture the previous singleton tokens BEFORE overwriting them.  The
-        # pool-sync step uses this to distinguish legacy singleton-aliases
-        # (which should be refreshed) from independent accounts that
-        # ``hermes auth add openai-codex`` created (which must not be
-        # overwritten — see #39236).
-        previous_singleton_tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else None
-        state["tokens"] = tokens
-        state["last_refresh"] = last_refresh
-        state["auth_mode"] = "chatgpt"
-        if label and str(label).strip():
-            state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
-        _sync_codex_pool_entries(
-            auth_store,
-            tokens,
-            last_refresh,
-            previous_singleton_tokens=previous_singleton_tokens,
-        )
-        _save_auth_store(auth_store)
 
+    def _previous_singleton_grants() -> set[str]:
+        with _auth_store_lock():
+            before_store = _load_auth_store()
+            before_state = _load_local_provider_state(
+                before_store, "openai-codex"
+            ) or {}
+            previous_grant_id = _normalize_codex_grant_id(
+                before_state.get("grant_id")
+            )
+            return {previous_grant_id} if previous_grant_id else set()
 
-def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
-    """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
-    imported = _import_codex_cli_tokens()
-    # Require BOTH tokens before adopting: persisting a payload without a
-    # usable refresh_token would only break the next refresh cycle.
-    if not (
-        imported
-        and str(imported.get("access_token", "") or "").strip()
-        and str(imported.get("refresh_token", "") or "").strip()
+    with _codex_auth_store_mutation(
+        reason="fresh_login",
+        supersede_ambiguous=True,
+        grant_id_resolver=_previous_singleton_grants,
     ):
-        return None
-    logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
-    return dict(imported)
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            state = _load_local_provider_state(
+                auth_store, "openai-codex"
+            ) or {}
+            # Capture the previous singleton tokens BEFORE overwriting them.  The
+            # pool-sync step uses this to distinguish legacy singleton-aliases
+            # (which should be refreshed) from independent accounts that
+            # ``hermes auth add openai-codex`` created (which must not be
+            # overwritten — see #39236).
+            previous_singleton_tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else None
+            previous_grant_id = _normalize_codex_grant_id(
+                state.get("grant_id")
+            )
+            grant_id = uuid.uuid4().hex
+            state["tokens"] = tokens
+            state["last_refresh"] = last_refresh
+            state["auth_mode"] = "chatgpt"
+            state["grant_id"] = grant_id
+            if label and str(label).strip():
+                state["label"] = str(label).strip()
+            _save_provider_state(auth_store, "openai-codex", state)
+            _sync_codex_pool_entries(
+                auth_store,
+                tokens,
+                last_refresh,
+                previous_singleton_tokens=previous_singleton_tokens,
+                grant_id=grant_id,
+                previous_grant_id=previous_grant_id,
+            )
+            _save_auth_store(auth_store)
 
 
 def refresh_codex_oauth_pure(
@@ -3508,9 +4532,8 @@ def refresh_codex_oauth_pure(
         if code == "refresh_token_reused":
             message = (
                 "Codex refresh token was already consumed by another client "
-                "(e.g. Codex CLI or VS Code extension). "
-                "Run `codex` in your terminal to generate fresh tokens, "
-                "then run `hermes auth` to re-authenticate."
+                "or process. Run `hermes auth` to create a fresh, "
+                "Hermes-owned session."
             )
             relogin_required = True
         # A 401/403 from the token endpoint always means the refresh token
@@ -3544,93 +4567,2108 @@ def refresh_codex_oauth_pure(
             relogin_required=True,
         )
 
-    updated = {
+    next_refresh = refresh_payload.get("refresh_token")
+    if not isinstance(next_refresh, str) or not next_refresh.strip():
+        raise AuthError(
+            "Codex token refresh response was missing a rotated refresh_token.",
+            provider="openai-codex",
+            code="codex_refresh_missing_rotated_refresh_token",
+            relogin_required=True,
+        )
+    if next_refresh.strip() == refresh_token.strip():
+        raise AuthError(
+            "Codex token refresh response reused the consumed refresh_token.",
+            provider="openai-codex",
+            code="codex_refresh_reused_rotated_refresh_token",
+            relogin_required=True,
+        )
+    return {
         "access_token": refreshed_access.strip(),
-        "refresh_token": refresh_token.strip(),
+        "refresh_token": next_refresh.strip(),
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    next_refresh = refresh_payload.get("refresh_token")
-    if isinstance(next_refresh, str) and next_refresh.strip():
-        updated["refresh_token"] = next_refresh.strip()
-    return updated
 
 
-def _refresh_codex_auth_tokens(
-    tokens: Dict[str, str],
-    timeout_seconds: float,
-) -> Dict[str, str]:
-    """Refresh Codex access token using the refresh token.
-    
-    Saves the new tokens to Hermes auth store automatically.
-    """
-    try:
-        refreshed = refresh_codex_oauth_pure(
-            str(tokens.get("access_token", "") or ""),
-            str(tokens.get("refresh_token", "") or ""),
-            timeout_seconds=timeout_seconds,
-        )
-    except AuthError as exc:
-        # Self-heal cross-store refresh_token rotation. Hermes keeps its OWN
-        # Codex OAuth token (per profile + top-level), separate from the Codex
-        # CLI's ~/.codex/auth.json. OAuth refresh_tokens are single-use, so when
-        # the Codex CLI (or another Hermes process) rotates the shared token,
-        # this frozen copy's refresh_token goes stale and the refresh fails with
-        # a relogin-required error (invalid_grant / refresh_token_reused / 401).
-        # Before surfacing that as a hard 401 to the turn, adopt the canonical
-        # fresh token from ~/.codex/auth.json (the Codex CLI keeps it current) so
-        # idle profiles / desktop sessions recover automatically instead of
-        # 401'ing until a manual re-auth. Transient failures (e.g. 429 quota)
-        # keep relogin_required=False — the stored token is still valid there, so
-        # we never self-heal those and re-raise unchanged.
-        if not getattr(exc, "relogin_required", False):
-            raise
-        imported = _recover_codex_tokens_from_cli(
-            f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}"
-        )
-        if not imported:
-            raise
-        return imported
-
-    updated_tokens = dict(tokens)
-    updated_tokens["access_token"] = refreshed["access_token"]
-    updated_tokens["refresh_token"] = refreshed["refresh_token"]
-
-    _save_codex_tokens(updated_tokens)
-    return updated_tokens
+CODEX_REFRESH_WAL_VERSION = 1
+CODEX_REFRESH_LOCK_GRACE_SECONDS = 5.0
+_codex_refresh_lock_holder = threading.local()
+_codex_grant_lock_holder = threading.local()
 
 
-def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
-    """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
-    
-    Returns tokens dict if valid and not expired, None otherwise.
-    Does NOT write to the shared file.
-    """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if not codex_home:
-        codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
-    if not auth_path.is_file():
-        return None
-    try:
-        payload = json.loads(auth_path.read_text())
-        tokens = payload.get("tokens")
-        if not isinstance(tokens, dict):
-            return None
-        access_token = tokens.get("access_token")
-        refresh_token = tokens.get("refresh_token")
-        if not access_token or not refresh_token:
-            return None
-        # Reject expired tokens — importing stale tokens from ~/.codex/
-        # that can't be refreshed leaves the user stuck with "Login successful!"
-        # but no working credentials.
-        if _codex_access_token_is_expiring(access_token, 0):
-            logger.debug(
-                "Codex CLI tokens at %s are expired — skipping import.", auth_path,
+@dataclass(frozen=True)
+class _CodexOauthLocator:
+    auth_path: Path
+    kind: str
+    credential_id: Optional[str] = None
+    grant_id: Optional[str] = None
+
+
+def _codex_refresh_state_dir() -> Path:
+    override = os.getenv("HERMES_CODEX_REFRESH_STATE_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    root_auth = _global_auth_file_path() or _auth_file_path()
+    return root_auth.parent / "state" / "codex-refresh"
+
+
+def _is_native_windows() -> bool:
+    return os.name == "nt"
+
+
+def _is_windows_reparse_point(entry_stat: os.stat_result) -> bool:
+    if not _is_native_windows():
+        return False
+    attributes = int(getattr(entry_stat, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & reparse_flag)
+
+
+def _codex_private_mode_matches(st_mode: int, expected_mode: int) -> bool:
+    # Windows chmod exposes only the read-only attribute, not POSIX 0600/0700.
+    # ACL inheritance from the private user profile remains the access boundary.
+    return _is_native_windows() or stat.S_IMODE(st_mode) == expected_mode
+
+
+def _fsync_directory(path: Path) -> None:
+    if _is_native_windows():
+        try:
+            entry_stat = path.lstat()
+        except OSError as exc:
+            raise AuthStoreCorruptError(
+                "Codex refresh state directory cannot be validated"
+            ) from exc
+        if (
+            not stat.S_ISDIR(entry_stat.st_mode)
+            or stat.S_ISLNK(entry_stat.st_mode)
+            or _is_windows_reparse_point(entry_stat)
+        ):
+            raise AuthStoreCorruptError(
+                "Codex refresh state directory is unsafe"
             )
-            return None
-        return dict(tokens)
-    except Exception:
+        # The Microsoft CRT rejects directory paths passed to os.open().
+        # File contents are flushed independently, and WAL publication uses
+        # MoveFileExW(MOVEFILE_WRITE_THROUGH) below.
+        return
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+    except OSError as exc:
+        raise AuthStoreCorruptError(
+            "Codex refresh state directory cannot be synced"
+        ) from exc
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _ensure_codex_private_dir() -> Path:
+    state_dir = _codex_refresh_state_dir()
+    missing: List[Path] = []
+    cursor = state_dir
+    while not os.path.lexists(cursor):
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            raise AuthStoreCorruptError(
+                "Codex refresh state directory has no existing parent"
+            )
+        cursor = parent
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, stat.S_IRWXU)
+            created = True
+        except FileExistsError:
+            created = False
+        if created:
+            try:
+                os.chmod(directory, stat.S_IRWXU)
+                _fsync_directory(directory)
+                _fsync_directory(directory.parent)
+            except OSError as exc:
+                raise AuthStoreCorruptError(
+                    "Codex refresh state directory cannot be persisted"
+                ) from exc
+    st = state_dir.lstat()
+    if (
+        not stat.S_ISDIR(st.st_mode)
+        or stat.S_ISLNK(st.st_mode)
+        or _is_windows_reparse_point(st)
+    ):
+        raise AuthStoreCorruptError("Codex refresh state directory is unsafe")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise AuthStoreCorruptError(
+            "Codex refresh state directory owner is invalid"
+        )
+    try:
+        state_dir.chmod(stat.S_IRWXU)
+    except OSError:
+        pass
+    st = state_dir.lstat()
+    if not _codex_private_mode_matches(st.st_mode, stat.S_IRWXU):
+        raise AuthStoreCorruptError(
+            "Codex refresh state directory permissions are unsafe"
+        )
+    return state_dir
+
+
+def _validate_codex_private_file(path: Path) -> None:
+    st = path.lstat()
+    if (
+        not stat.S_ISREG(st.st_mode)
+        or stat.S_ISLNK(st.st_mode)
+        or _is_windows_reparse_point(st)
+    ):
+        raise AuthStoreCorruptError("Codex refresh state file is unsafe")
+    if getattr(st, "st_nlink", 1) != 1:
+        raise AuthStoreCorruptError("Codex refresh state file has hard links")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise AuthStoreCorruptError("Codex refresh state file owner is invalid")
+    try:
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    st = path.lstat()
+    if not _codex_private_mode_matches(
+        st.st_mode,
+        stat.S_IRUSR | stat.S_IWUSR,
+    ):
+        raise AuthStoreCorruptError(
+            "Codex refresh state file permissions are unsafe"
+        )
+
+
+def _read_codex_private_file(path: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise AuthStoreCorruptError(
+            "Codex refresh state file cannot be opened safely"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or getattr(st, "st_nlink", 1) != 1
+            or _is_windows_reparse_point(st)
+        ):
+            raise AuthStoreCorruptError("Codex refresh state file is unsafe")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise AuthStoreCorruptError(
+                "Codex refresh state file owner is invalid"
+            )
+        if not _codex_private_mode_matches(
+            st.st_mode,
+            stat.S_IRUSR | stat.S_IWUSR,
+        ):
+            raise AuthStoreCorruptError(
+                "Codex refresh state file permissions are unsafe"
+            )
+        chunks: List[bytes] = []
+        while True:
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _create_codex_private_file(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(path.parent)
+
+
+def _ensure_codex_private_file(path: Path, initial: bytes = b"") -> None:
+    _ensure_codex_private_dir()
+    try:
+        _create_codex_private_file(path, initial)
+    except FileExistsError:
+        pass
+    _validate_codex_private_file(path)
+
+
+def _codex_refresh_lock_path() -> Path:
+    return _codex_refresh_state_dir() / "refresh.lock"
+
+
+def _codex_grant_lock_path(grant_id: str) -> Path:
+    normalized = _normalize_codex_grant_id(
+        grant_id, allow_missing=False
+    ) or ""
+    return _codex_refresh_state_dir() / f"grant-{normalized}.lock"
+
+
+def _codex_refresh_wal_path(grant_id: str) -> Path:
+    normalized = _normalize_codex_grant_id(
+        grant_id, allow_missing=False
+    ) or ""
+    return _codex_refresh_state_dir() / f"grant-{normalized}.wal.json"
+
+
+def _codex_refresh_wal_grant_ids() -> List[str]:
+    state_dir = _ensure_codex_private_dir()
+    legacy = state_dir / "refresh.wal.json"
+    if legacy.exists():
+        raise AuthStoreCorruptError(
+            "Legacy Codex refresh WAL requires explicit recovery before upgrade"
+        )
+    grant_ids: List[str] = []
+    try:
+        candidates = list(state_dir.glob("grant-*.wal.json"))
+    except OSError as exc:
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL inventory cannot be scanned"
+        ) from exc
+    for path in candidates:
+        _validate_codex_private_file(path)
+        name = path.name
+        grant_ids.append(
+            _normalize_codex_grant_id(
+                name[len("grant-") : -len(".wal.json")],
+                allow_missing=False,
+            )
+            or ""
+        )
+    if len(set(grant_ids)) != len(grant_ids):
+        raise AuthStoreCorruptError("Codex refresh WAL inventory is duplicated")
+    return sorted(grant_ids)
+
+
+def _codex_refresh_key_path() -> Path:
+    return _codex_refresh_state_dir() / "refresh.hmac.key"
+
+
+class _CodexInventoryLockScope:
+    """Own the inventory lock and optionally hand it off to grant locks."""
+
+    def __init__(
+        self,
+        inventory_context: Any,
+        *,
+        reentrant: bool,
+    ) -> None:
+        self._inventory_context = inventory_context
+        self._inventory_held = True
+        self._reentrant = reentrant
+        self._grant_stack = ExitStack()
+
+    def handoff_to_grants(
+        self,
+        grant_ids: Iterable[str],
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        if not self._inventory_held:
+            raise AuthStoreLockOrderError(
+                "Codex inventory lock was already handed off"
+            )
+        if self._reentrant:
+            raise AuthStoreLockOrderError(
+                "A reentrant Codex inventory lock cannot be handed off"
+            )
+        normalized = sorted(
+            {
+                _normalize_codex_grant_id(item, allow_missing=False) or ""
+                for item in grant_ids
+            }
+        )
+        if not normalized:
+            raise AuthStoreLockOrderError(
+                "Codex inventory handoff requires at least one grant"
+            )
+        # Stable grant IDs were selected while the inventory lock was held.
+        # Release that short host-wide lock before a potentially contended
+        # grant wait; otherwise a second waiter for grant A convoys an
+        # independent grant B behind A's network request.
+        self._inventory_context.__exit__(None, None, None)
+        self._inventory_held = False
+        for grant_id in normalized:
+            self._grant_stack.enter_context(
+                _codex_grant_lock(
+                    grant_id,
+                    timeout_seconds=timeout_seconds,
+                )
+            )
+
+    def retain_inventory_and_lock_grants(
+        self,
+        grant_ids: Iterable[str],
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        """Quiesce structural mutations without opening an identity race."""
+        if not self._inventory_held:
+            raise AuthStoreLockOrderError(
+                "Codex inventory lock was already handed off"
+            )
+        normalized = sorted(
+            {
+                _normalize_codex_grant_id(item, allow_missing=False) or ""
+                for item in grant_ids
+            }
+        )
+        if not normalized:
+            raise AuthStoreLockOrderError(
+                "Codex inventory retention requires at least one grant"
+            )
+        # Explicit login/logout/snapshot/profile operations are rare and alter
+        # grant identity or auth-store topology. Keep the inventory stable while
+        # waiting for every affected grant so a stale resolver can never mutate
+        # a replacement generation selected during the wait.
+        for grant_id in normalized:
+            self._grant_stack.enter_context(
+                _codex_grant_lock(
+                    grant_id,
+                    timeout_seconds=timeout_seconds,
+                )
+            )
+
+    def close(self) -> None:
+        self._grant_stack.close()
+        if self._inventory_held:
+            self._inventory_context.__exit__(None, None, None)
+            self._inventory_held = False
+
+
+@contextmanager
+def _codex_refresh_lock(*, timeout_seconds: float):
+    auth_depths = getattr(_auth_lock_holder, "depth_by_key", {})
+    if any(depth > 0 for depth in auth_depths.values()):
+        raise AuthStoreLockOrderError(
+            "Codex refresh lock must be acquired before any auth store lock"
+        )
+    grant_depths = getattr(_codex_grant_lock_holder, "depth_by_key", {})
+    if any(depth > 0 for depth in grant_depths.values()):
+        raise AuthStoreLockOrderError(
+            "Codex inventory lock must be acquired before any grant lock"
+        )
+    lock_path = _codex_refresh_lock_path()
+    _ensure_codex_private_file(lock_path)
+    key = str(lock_path.expanduser().resolve(strict=False))
+    depths = getattr(_codex_refresh_lock_holder, "depth_by_key", {})
+    was_reentrant = int(depths.get(key, 0)) > 0
+    inventory_context = _file_lock(
+        lock_path,
+        _codex_refresh_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for host-wide Codex refresh lock",
+        reentrancy_key=key,
+    )
+    inventory_context.__enter__()
+    scope = _CodexInventoryLockScope(
+        inventory_context,
+        reentrant=was_reentrant,
+    )
+    try:
+        yield scope
+    finally:
+        scope.close()
+
+
+@contextmanager
+def _codex_grant_lock(grant_id: str, *, timeout_seconds: float):
+    """Serialize one OAuth grant after the host inventory lock selected it."""
+    auth_depths = getattr(_auth_lock_holder, "depth_by_key", {})
+    if any(depth > 0 for depth in auth_depths.values()):
+        raise AuthStoreLockOrderError(
+            "Codex grant lock must be acquired before any auth store lock"
+        )
+    lock_path = _codex_grant_lock_path(grant_id)
+    _ensure_codex_private_file(lock_path)
+    key = str(lock_path.expanduser().resolve(strict=False))
+    with _file_lock(
+        lock_path,
+        _codex_grant_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for grant-scoped Codex refresh lock",
+        reentrancy_key=key,
+    ):
+        yield
+
+
+def _codex_refresh_hmac_key(*, create_if_missing: bool = True) -> bytes:
+    key_path = _codex_refresh_key_path()
+    state_dir = _ensure_codex_private_dir()
+    if not key_path.exists():
+        if not create_if_missing:
+            raise AuthStoreCorruptError(
+                "Codex refresh HMAC key is missing while a WAL exists"
+            )
+        try:
+            wal_material_exists = any(
+                item.name == "refresh.wal.json"
+                or (
+                    item.name.startswith("grant-")
+                    and ".wal." in item.name
+                )
+                for item in state_dir.iterdir()
+            )
+        except OSError as exc:
+            raise AuthStoreCorruptError(
+                "Codex refresh WAL inventory cannot be checked before key creation"
+            ) from exc
+        if wal_material_exists:
+            raise AuthStoreCorruptError(
+                "Codex refresh HMAC key is missing while WAL material exists"
+            )
+        try:
+            _create_codex_private_file(key_path, os.urandom(32))
+        except FileExistsError:
+            pass
+    _validate_codex_private_file(key_path)
+    key = _read_codex_private_file(key_path)
+    if len(key) != 32:
+        raise AuthStoreCorruptError("Codex refresh HMAC key is invalid")
+    return key
+
+
+def _codex_refresh_key_id(key: bytes) -> str:
+    return hashlib.sha256(b"codex-refresh-key-v1\0" + key).hexdigest()
+
+
+def _codex_wal_mac(payload: Dict[str, Any], key: bytes) -> str:
+    unsigned = dict(payload)
+    unsigned.pop("wal_mac", None)
+    encoded = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(
+        key,
+        b"codex-refresh-wal-v1\0" + encoded,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _codex_pair_hmac(access_token: Any, refresh_token: Any) -> str:
+    access = str(access_token or "").encode("utf-8")
+    refresh = str(refresh_token or "").encode("utf-8")
+    framed = (
+        b"codex-pair-v1\0"
+        + len(access).to_bytes(8, "big")
+        + access
+        + len(refresh).to_bytes(8, "big")
+        + refresh
+    )
+    return hmac.new(
+        _codex_refresh_hmac_key(),
+        framed,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _codex_refresh_token_hmac(refresh_token: Any) -> str:
+    refresh = str(refresh_token or "").encode("utf-8")
+    framed = b"codex-refresh-token-v1\0" + len(refresh).to_bytes(8, "big") + refresh
+    return hmac.new(
+        _codex_refresh_hmac_key(),
+        framed,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _normalize_codex_grant_id(value: Any, *, allow_missing: bool = True) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text and allow_missing:
         return None
+    if len(text) != 32 or any(char not in "0123456789abcdef" for char in text):
+        raise AuthStoreCorruptError("Codex OAuth grant identifier is invalid")
+    return text
+
+
+def _codex_locator_fingerprint(
+    locator: _CodexOauthLocator,
+    grant_id: str,
+) -> str:
+    canonical = str(locator.auth_path.expanduser().resolve(strict=False))
+    raw = "\0".join(
+        (
+            "codex-locator-v1",
+            canonical,
+            locator.kind,
+            locator.credential_id or "",
+            grant_id,
+        )
+    ).encode("utf-8")
+    return hmac.new(
+        _codex_refresh_hmac_key(),
+        raw,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _windows_durable_replace(source: Path, destination: Path) -> None:
+    """Atomically publish one file with the Windows write-through primitive."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    move_file_ex = kernel32.MoveFileExW
+    move_file_ex.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    ]
+    move_file_ex.restype = wintypes.BOOL
+    movefile_replace_existing = 0x00000001
+    movefile_write_through = 0x00000008
+    if move_file_ex(
+        os.path.abspath(str(source)),
+        os.path.abspath(str(destination)),
+        movefile_replace_existing | movefile_write_through,
+    ):
+        return
+    error_number = ctypes.get_last_error()
+    raise OSError(
+        error_number,
+        ctypes.FormatError(error_number),
+        str(destination),
+    )
+
+
+def _replace_codex_private_file(source: Path, destination: Path) -> None:
+    if _is_native_windows():
+        _windows_durable_replace(source, destination)
+        return
+    os.replace(source, destination)
+
+
+def _write_codex_refresh_wal(payload: Dict[str, Any]) -> None:
+    state_dir = _ensure_codex_private_dir()
+    grant_id = _normalize_codex_grant_id(
+        payload.get("grant_id"), allow_missing=False
+    ) or ""
+    wal_path = _codex_refresh_wal_path(grant_id)
+    if wal_path.exists():
+        _validate_codex_private_file(wal_path)
+    key = _codex_refresh_hmac_key(create_if_missing=not wal_path.exists())
+    signed = dict(payload)
+    signed["key_id"] = _codex_refresh_key_id(key)
+    signed["wal_mac"] = _codex_wal_mac(signed, key)
+    _validate_codex_refresh_wal_payload(signed)
+    payload["key_id"] = signed["key_id"]
+    payload["wal_mac"] = signed["wal_mac"]
+    encoded = (json.dumps(signed, sort_keys=True, indent=2) + "\n").encode(
+        "utf-8"
+    )
+    tmp_path = state_dir / (
+        f"grant-{grant_id}.wal.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    _create_codex_private_file(tmp_path, encoded)
+    try:
+        _replace_codex_private_file(tmp_path, wal_path)
+        try:
+            wal_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        _validate_codex_private_file(wal_path)
+        _fsync_directory(state_dir)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _read_codex_refresh_wal(grant_id: str) -> Optional[Dict[str, Any]]:
+    grant_id = _normalize_codex_grant_id(
+        grant_id, allow_missing=False
+    ) or ""
+    wal_path = _codex_refresh_wal_path(grant_id)
+    if not wal_path.exists():
+        return None
+    _validate_codex_private_file(wal_path)
+    try:
+        payload = json.loads(
+            _read_codex_private_file(wal_path).decode("utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AuthStoreCorruptError("Codex refresh WAL is malformed") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != CODEX_REFRESH_WAL_VERSION
+        or payload.get("state")
+        not in {
+            "prepared",
+            "retryable",
+            "rotated",
+            "committing",
+            "rejected",
+            "committed",
+        }
+    ):
+        raise AuthStoreCorruptError("Codex refresh WAL has an unknown schema")
+    key = _codex_refresh_hmac_key(create_if_missing=False)
+    key_id = str(payload.get("key_id") or "")
+    if not hmac.compare_digest(key_id, _codex_refresh_key_id(key)):
+        raise AuthStoreCorruptError("Codex refresh WAL HMAC key does not match")
+    stored_mac = str(payload.get("wal_mac") or "")
+    expected_mac = _codex_wal_mac(payload, key)
+    if not stored_mac or not hmac.compare_digest(stored_mac, expected_mac):
+        raise AuthStoreCorruptError("Codex refresh WAL MAC is invalid")
+    _validate_codex_refresh_wal_payload(payload)
+    if payload.get("grant_id") != grant_id:
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL filename does not match its grant"
+        )
+    return payload
+
+
+def _clear_codex_refresh_wal(grant_id: str) -> None:
+    wal_path = _codex_refresh_wal_path(grant_id)
+    try:
+        wal_path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(wal_path.parent)
+
+
+def _codex_pool_tokens_by_id(
+    auth_store: Dict[str, Any],
+    credential_id: str,
+) -> Optional[Dict[str, str]]:
+    pool = auth_store.get("credential_pool")
+    entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+    matches = [
+        entry
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and str(entry.get("id") or "").strip() == credential_id
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    access = str(row.get("access_token") or "").strip()
+    refresh = str(row.get("refresh_token") or "").strip()
+    if not access or not refresh:
+        return None
+    return {"access_token": access, "refresh_token": refresh}
+
+
+def _codex_singleton_tokens(auth_store: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    providers = auth_store.get("providers")
+    state = (
+        providers.get("openai-codex")
+        if isinstance(providers, dict)
+        else None
+    )
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    access = str(tokens.get("access_token") or "").strip()
+    refresh = str(tokens.get("refresh_token") or "").strip()
+    if not access or not refresh:
+        return None
+    return {"access_token": access, "refresh_token": refresh}
+
+
+def _iter_codex_oauth_records(
+    auth_store: Dict[str, Any],
+) -> Iterator[tuple[str, Optional[str], Dict[str, Any], Dict[str, str]]]:
+    providers = auth_store.get("providers")
+    state = (
+        providers.get("openai-codex")
+        if isinstance(providers, dict)
+        else None
+    )
+    singleton = _codex_singleton_tokens(auth_store)
+    if isinstance(state, dict) and singleton is not None:
+        yield "singleton", None, state, singleton
+
+    pool = auth_store.get("credential_pool")
+    entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+    for row in entries if isinstance(entries, list) else []:
+        if not isinstance(row, dict):
+            continue
+        credential_id = str(row.get("id") or "").strip()
+        access = str(row.get("access_token") or "").strip()
+        refresh = str(row.get("refresh_token") or "").strip()
+        if credential_id and access and refresh:
+            yield (
+                "pool",
+                credential_id,
+                row,
+                {"access_token": access, "refresh_token": refresh},
+            )
+
+
+def _codex_grant_id_for_locator(
+    auth_store: Dict[str, Any],
+    locator: _CodexOauthLocator,
+) -> Optional[str]:
+    for kind, credential_id, record, _tokens in _iter_codex_oauth_records(
+        auth_store
+    ):
+        if kind == locator.kind and credential_id == locator.credential_id:
+            return _normalize_codex_grant_id(record.get("grant_id"))
+    return None
+
+
+def _codex_tokens_for_locator(
+    auth_store: Dict[str, Any],
+    locator: _CodexOauthLocator,
+) -> Optional[Dict[str, str]]:
+    if locator.kind == "pool" and locator.credential_id:
+        return _codex_pool_tokens_by_id(auth_store, locator.credential_id)
+    return _codex_singleton_tokens(auth_store)
+
+
+def _assert_codex_auth_inventory_file_safe(path: Path) -> None:
+    """Reject linked or non-regular auth inventory files before token use."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AuthStoreConflictError(
+            "Codex auth inventory file could not be inspected"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise AuthStoreConflictError(
+            "Codex auth inventory file cannot be a symlink"
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AuthStoreConflictError(
+            "Codex auth inventory file is not a regular file"
+        )
+    if metadata.st_nlink != 1:
+        raise AuthStoreConflictError(
+            "Codex auth inventory file cannot use hard links"
+        )
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = path.expanduser().resolve(strict=False)
+    if resolved != lexical:
+        raise AuthStoreConflictError(
+            "Codex auth inventory path contains a symlink"
+        )
+
+
+def _discover_codex_oauth_locator(
+    credential_id: Optional[str] = None,
+    *,
+    source_auth_path: Optional[Path] = None,
+) -> _CodexOauthLocator:
+    if source_auth_path is not None:
+        candidates = [source_auth_path]
+    else:
+        candidates = [_auth_file_path()]
+        global_path = _global_auth_file_path()
+        if global_path is not None:
+            candidates.append(global_path)
+
+    seen: set[str] = set()
+    for path in candidates:
+        _assert_codex_auth_inventory_file_safe(path)
+        key = str(path.expanduser().resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        store = _load_auth_store(path)
+        if credential_id is not None:
+            if _codex_pool_tokens_by_id(store, credential_id):
+                return _CodexOauthLocator(path, "pool", credential_id)
+            continue
+        if _codex_singleton_tokens(store):
+            return _CodexOauthLocator(path, "singleton", None)
+
+    if source_auth_path is not None:
+        raise AuthStoreConflictError(
+            "Codex credential source changed; reload the credential pool"
+        )
+    raise AuthError(
+        "No Codex credentials stored. Run `hermes auth` to authenticate.",
+        provider="openai-codex",
+        code="codex_auth_missing",
+        relogin_required=True,
+    )
+
+
+def _codex_candidate_auth_paths(primary_path: Path) -> List[Path]:
+    candidates = [primary_path, _auth_file_path()]
+    global_path = _global_auth_file_path()
+    if global_path is not None:
+        candidates.append(global_path)
+    root_auth = global_path or _auth_file_path()
+    profiles_dir = root_auth.parent / "profiles"
+    try:
+        profiles_stat = profiles_dir.lstat()
+    except FileNotFoundError:
+        profiles_stat = None
+    except OSError as exc:
+        raise AuthStoreConflictError(
+            "Codex profile credential inventory could not be scanned"
+        ) from exc
+    if profiles_stat is not None:
+        if stat.S_ISLNK(profiles_stat.st_mode):
+            raise AuthStoreConflictError(
+                "Codex profile credential inventory cannot be a symlink"
+            )
+        if not stat.S_ISDIR(profiles_stat.st_mode):
+            raise AuthStoreConflictError(
+                "Codex profile credential inventory is not a directory"
+            )
+        try:
+            for profile_dir in profiles_dir.iterdir():
+                if not _CODEX_PROFILE_ID_RE.fullmatch(profile_dir.name):
+                    continue
+                profile_stat = profile_dir.lstat()
+                if stat.S_ISLNK(profile_stat.st_mode):
+                    raise AuthStoreConflictError(
+                        "Codex profile credential inventory contains a symlink"
+                    )
+                if not stat.S_ISDIR(profile_stat.st_mode):
+                    continue
+                candidate = profile_dir / "auth.json"
+                try:
+                    candidate_stat = candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(candidate_stat.st_mode):
+                    raise AuthStoreConflictError(
+                        "Codex profile auth inventory cannot be a symlink"
+                    )
+                if not stat.S_ISREG(candidate_stat.st_mode):
+                    raise AuthStoreConflictError(
+                        "Codex profile auth inventory is not a regular file"
+                    )
+                if candidate_stat.st_nlink != 1:
+                    raise AuthStoreConflictError(
+                        "Codex profile auth inventory cannot use hard links"
+                    )
+                if not _codex_wal_target_is_allowed(
+                    candidate,
+                    primary_path,
+                ):
+                    raise AuthStoreConflictError(
+                        "Codex profile auth inventory is outside the allowed root"
+                    )
+                candidates.append(candidate)
+        except AuthStoreConflictError:
+            raise
+        except (NotADirectoryError, PermissionError, OSError) as exc:
+            raise AuthStoreConflictError(
+                "Codex profile credential inventory could not be scanned"
+            ) from exc
+
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        _assert_codex_auth_inventory_file_safe(path)
+        key = str(path.expanduser().resolve(strict=False))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _auth_store_has_codex_pair(
+    auth_store: Dict[str, Any],
+    pair_hmac: str,
+) -> bool:
+    singleton = _codex_singleton_tokens(auth_store)
+    if singleton and _codex_pair_hmac(
+        singleton.get("access_token"), singleton.get("refresh_token")
+    ) == pair_hmac:
+        return True
+    pool = auth_store.get("credential_pool")
+    entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if _codex_pair_hmac(
+            entry.get("access_token"), entry.get("refresh_token")
+        ) == pair_hmac:
+            return True
+    return False
+
+
+def _auth_store_has_codex_grant(
+    auth_store: Dict[str, Any],
+    grant_id: str,
+) -> bool:
+    for _kind, _credential_id, record, _tokens in _iter_codex_oauth_records(
+        auth_store
+    ):
+        if _normalize_codex_grant_id(record.get("grant_id")) == grant_id:
+            return True
+    return False
+
+
+def _auth_store_has_codex_grant_pair(
+    auth_store: Dict[str, Any],
+    grant_id: str,
+    pair_hmac: str,
+) -> bool:
+    for _kind, _credential_id, record, tokens in _iter_codex_oauth_records(
+        auth_store
+    ):
+        if (
+            _normalize_codex_grant_id(record.get("grant_id")) == grant_id
+            and hmac.compare_digest(
+                _codex_pair_hmac(
+                    tokens.get("access_token"), tokens.get("refresh_token")
+                ),
+                pair_hmac,
+            )
+        ):
+            return True
+    return False
+
+
+def _auth_store_has_codex_grant_refresh(
+    auth_store: Dict[str, Any],
+    grant_id: str,
+    refresh_hmac: str,
+) -> bool:
+    for _kind, _credential_id, record, tokens in _iter_codex_oauth_records(
+        auth_store
+    ):
+        if (
+            _normalize_codex_grant_id(record.get("grant_id")) == grant_id
+            and hmac.compare_digest(
+                _codex_refresh_token_hmac(tokens.get("refresh_token")),
+                refresh_hmac,
+            )
+        ):
+            return True
+    return False
+
+
+def _ensure_codex_stable_grant(
+    locator: _CodexOauthLocator,
+    tokens: Dict[str, str],
+) -> tuple[_CodexOauthLocator, List[str], str]:
+    """Bind every legacy alias of one refresh token to one stable grant ID.
+
+    This runs while the host-wide Codex mutation lock is held. Inventory is
+    scanned completely before any write. A grant ID already attached to a
+    different refresh token is a conflict, not an alias hint.
+    """
+    refresh_hmac = _codex_refresh_token_hmac(tokens.get("refresh_token"))
+    primary_path = str(locator.auth_path.expanduser().resolve(strict=False))
+    inventory: List[Dict[str, Any]] = []
+    for path in _codex_candidate_auth_paths(locator.auth_path):
+        if not path.exists():
+            continue
+        canonical = str(path.expanduser().resolve(strict=False))
+        with _auth_store_lock(path):
+            store = _load_auth_store(path, strict=True)
+            for kind, credential_id, record, record_tokens in _iter_codex_oauth_records(
+                store
+            ):
+                inventory.append(
+                    {
+                        "path": canonical,
+                        "kind": kind,
+                        "credential_id": credential_id,
+                        "grant_id": _normalize_codex_grant_id(
+                            record.get("grant_id")
+                        ),
+                        "refresh_hmac": _codex_refresh_token_hmac(
+                            record_tokens.get("refresh_token")
+                        ),
+                    }
+                )
+
+    primary_records = [
+        item
+        for item in inventory
+        if item["path"] == primary_path
+        and item["kind"] == locator.kind
+        and item["credential_id"] == locator.credential_id
+    ]
+    if len(primary_records) != 1 or not hmac.compare_digest(
+        str(primary_records[0]["refresh_hmac"] if primary_records else ""),
+        refresh_hmac,
+    ):
+        raise AuthStoreConflictError(
+            "Codex source changed during stable grant discovery"
+        )
+
+    aliases = [
+        item
+        for item in inventory
+        if hmac.compare_digest(str(item["refresh_hmac"]), refresh_hmac)
+    ]
+    existing_ids = {
+        str(item["grant_id"]) for item in aliases if item["grant_id"]
+    }
+    if len(existing_ids) > 1:
+        raise AuthStoreConflictError(
+            "Codex aliases disagree on the stable OAuth grant identifier"
+        )
+    grant_id = next(iter(existing_ids), uuid.uuid4().hex)
+    for item in inventory:
+        if item["grant_id"] == grant_id and not hmac.compare_digest(
+            str(item["refresh_hmac"]), refresh_hmac
+        ):
+            raise AuthStoreConflictError(
+                "Codex OAuth grant identifier is attached to distinct credentials"
+            )
+
+    target_paths = sorted({str(item["path"]) for item in aliases})
+    if primary_path not in target_paths:
+        raise AuthStoreConflictError("Codex source changed before grant migration")
+    target_paths = [
+        primary_path,
+        *[path for path in target_paths if path != primary_path],
+    ]
+
+    for raw_path in target_paths:
+        path = Path(raw_path)
+        with _auth_store_lock(path):
+            store = _load_auth_store(path, strict=True)
+            changed = False
+            saw_alias = False
+            for _kind, _credential_id, record, record_tokens in _iter_codex_oauth_records(
+                store
+            ):
+                record_refresh = _codex_refresh_token_hmac(
+                    record_tokens.get("refresh_token")
+                )
+                record_grant = _normalize_codex_grant_id(record.get("grant_id"))
+                if record_grant == grant_id and not hmac.compare_digest(
+                    record_refresh, refresh_hmac
+                ):
+                    raise AuthStoreConflictError(
+                        "Codex OAuth grant identifier changed during migration"
+                    )
+                if not hmac.compare_digest(record_refresh, refresh_hmac):
+                    continue
+                saw_alias = True
+                if record_grant not in {None, grant_id}:
+                    raise AuthStoreConflictError(
+                        "Codex alias grant changed during migration"
+                    )
+                if record_grant is None:
+                    record["grant_id"] = grant_id
+                    changed = True
+            if not saw_alias:
+                raise AuthStoreConflictError(
+                    "Codex alias disappeared during grant migration"
+                )
+            if changed:
+                _save_auth_store(store, target_path=path)
+
+    return (
+        _CodexOauthLocator(
+            locator.auth_path,
+            locator.kind,
+            locator.credential_id,
+            grant_id,
+        ),
+        target_paths,
+        refresh_hmac,
+    )
+
+
+def _discover_codex_refresh_targets(
+    primary_path: Path,
+    grant_id: str,
+) -> List[str]:
+    targets: List[str] = []
+    for path in _codex_candidate_auth_paths(primary_path):
+        if not path.exists():
+            continue
+        with _auth_store_lock(path):
+            store = _load_auth_store(path, strict=True)
+            if _auth_store_has_codex_grant(store, grant_id):
+                targets.append(str(path.expanduser().resolve(strict=False)))
+    primary = str(primary_path.expanduser().resolve(strict=False))
+    if primary not in targets:
+        raise AuthStoreConflictError("Codex source changed before refresh")
+    return [primary, *[path for path in targets if path != primary]]
+
+
+def _is_hex_digest(value: Any) -> bool:
+    text = str(value or "")
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _codex_wal_target_is_allowed(target: Path, primary: Path) -> bool:
+    resolved = target.expanduser().resolve(strict=False)
+    primary_resolved = primary.expanduser().resolve(strict=False)
+    if resolved == primary_resolved:
+        return True
+
+    active_auth = _auth_file_path().expanduser().resolve(strict=False)
+    global_auth = _global_auth_file_path()
+    global_resolved = (
+        global_auth.expanduser().resolve(strict=False)
+        if global_auth is not None
+        else None
+    )
+    if resolved == active_auth or (
+        global_resolved is not None and resolved == global_resolved
+    ):
+        return True
+
+    root_auth = global_resolved or active_auth
+    profiles_dir = root_auth.parent / "profiles"
+    try:
+        relative = resolved.relative_to(profiles_dir)
+    except ValueError:
+        return False
+    return len(relative.parts) == 2 and relative.parts[-1] == "auth.json"
+
+
+def _validate_codex_refresh_wal_payload(payload: Dict[str, Any]) -> None:
+    state = payload.get("state")
+    if not isinstance(payload.get("operation_id"), str) or not payload[
+        "operation_id"
+    ]:
+        raise AuthStoreCorruptError("Codex refresh WAL operation is invalid")
+    if not _is_hex_digest(payload.get("old_pair_hmac")):
+        raise AuthStoreCorruptError("Codex refresh WAL old pair is invalid")
+    if not _is_hex_digest(payload.get("old_refresh_hmac")):
+        raise AuthStoreCorruptError("Codex refresh WAL old refresh token is invalid")
+    grant_id = _normalize_codex_grant_id(
+        payload.get("grant_id"), allow_missing=False
+    )
+
+    locator = payload.get("locator")
+    if not isinstance(locator, dict):
+        raise AuthStoreCorruptError("Codex refresh WAL locator is invalid")
+    raw_primary = locator.get("auth_path")
+    kind = locator.get("kind")
+    if (
+        not isinstance(raw_primary, str)
+        or not raw_primary
+        or not Path(raw_primary).is_absolute()
+        or kind not in {"singleton", "pool"}
+    ):
+        raise AuthStoreCorruptError("Codex refresh WAL locator is invalid")
+    if kind == "pool" and not str(locator.get("credential_id") or "").strip():
+        raise AuthStoreCorruptError("Codex refresh WAL pool locator is invalid")
+    if _normalize_codex_grant_id(
+        locator.get("grant_id"), allow_missing=False
+    ) != grant_id:
+        raise AuthStoreCorruptError("Codex refresh WAL locator grant is invalid")
+    primary = Path(raw_primary).expanduser().resolve(strict=False)
+    if str(primary) != raw_primary:
+        raise AuthStoreCorruptError("Codex refresh WAL locator is not canonical")
+    validated_locator = _CodexOauthLocator(
+        primary,
+        str(kind),
+        str(locator.get("credential_id") or "").strip() or None,
+        grant_id,
+    )
+    expected_locator_fingerprint = _codex_locator_fingerprint(
+        validated_locator,
+        grant_id,
+    )
+    if not hmac.compare_digest(
+        str(locator.get("fingerprint") or ""),
+        expected_locator_fingerprint,
+    ):
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL locator fingerprint is invalid"
+        )
+
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise AuthStoreCorruptError("Codex refresh WAL targets are invalid")
+    normalized_targets: List[str] = []
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, str) or not Path(raw_target).is_absolute():
+            raise AuthStoreCorruptError("Codex refresh WAL target is invalid")
+        target = Path(raw_target).expanduser().resolve(strict=False)
+        if str(target) != raw_target:
+            raise AuthStoreCorruptError(
+                "Codex refresh WAL target is not canonical"
+            )
+        if not _codex_wal_target_is_allowed(target, primary):
+            raise AuthStoreCorruptError(
+                "Codex refresh WAL target is outside the auth inventory"
+            )
+        normalized_targets.append(str(target))
+    if len(set(normalized_targets)) != len(normalized_targets):
+        raise AuthStoreCorruptError("Codex refresh WAL targets are duplicated")
+    if normalized_targets[0] != str(primary):
+        raise AuthStoreCorruptError("Codex refresh WAL primary target is invalid")
+
+    applied = payload.get("applied_targets", [])
+    if not isinstance(applied, list) or any(
+        not isinstance(item, str) or item not in normalized_targets
+        for item in applied
+    ):
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL applied targets are invalid"
+        )
+    if len(set(applied)) != len(applied):
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL applied targets are duplicated"
+        )
+
+    commit_kind = payload.get("commit_kind")
+    if state == "rotated" and commit_kind != "rotated":
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL rotated commit kind is invalid"
+        )
+    if state == "rejected" and commit_kind != "rejected":
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL rejected commit kind is invalid"
+        )
+    if state in {"committing", "committed"} and commit_kind not in {
+        "rotated",
+        "rejected",
+    }:
+        raise AuthStoreCorruptError(
+            "Codex refresh WAL commit kind is invalid"
+        )
+
+    has_new_generation = commit_kind == "rotated" and state in {
+        "rotated",
+        "committing",
+        "committed",
+    }
+    if has_new_generation:
+        raw_tokens = payload.get("new_tokens")
+        if not isinstance(raw_tokens, dict):
+            raise AuthStoreCorruptError("Codex refresh WAL tokens are invalid")
+        access = str(raw_tokens.get("access_token") or "").strip()
+        refresh = str(raw_tokens.get("refresh_token") or "").strip()
+        if not access or not refresh:
+            raise AuthStoreCorruptError("Codex refresh WAL tokens are incomplete")
+        calculated = _codex_pair_hmac(access, refresh)
+        if not hmac.compare_digest(
+            str(payload.get("new_pair_hmac") or ""), calculated
+        ):
+            raise AuthStoreCorruptError(
+                "Codex refresh WAL new pair HMAC is inconsistent"
+            )
+    elif state == "retryable" or (
+        commit_kind == "rejected"
+        and state in {"rejected", "committing", "committed"}
+    ):
+        if not str(payload.get("reject_code") or "").strip():
+            raise AuthStoreCorruptError(
+                "Codex refresh WAL rejection metadata is invalid"
+            )
+        if payload.get("new_tokens") is not None:
+            raise AuthStoreCorruptError(
+                "Codex rejected WAL cannot contain a new generation"
+            )
+
+
+def _apply_codex_generation_to_path(
+    auth_path: Path,
+    *,
+    grant_id: str,
+    old_pair_hmac: str,
+    old_refresh_hmac: str,
+    new_tokens: Optional[Dict[str, str]] = None,
+    last_refresh: Optional[str] = None,
+    reject_code: Optional[str] = None,
+) -> str:
+    """Patch or quarantine one stable Codex grant in one auth store."""
+    grant_id = _normalize_codex_grant_id(
+        grant_id, allow_missing=False
+    ) or ""
+    new_pair_hmac = (
+        _codex_pair_hmac(
+            new_tokens.get("access_token"),
+            new_tokens.get("refresh_token"),
+        )
+        if new_tokens is not None
+        else None
+    )
+    with _auth_store_lock(auth_path):
+        auth_store = _load_auth_store(auth_path, strict=True)
+        before_ids = _canonical_pool_ids(auth_store, "openai-codex")
+        states: Dict[tuple[str, Optional[str]], str] = {}
+        for kind, credential_id, record, record_tokens in _iter_codex_oauth_records(
+            auth_store
+        ):
+            if _normalize_codex_grant_id(record.get("grant_id")) != grant_id:
+                continue
+            pair = _codex_pair_hmac(
+                record_tokens.get("access_token"),
+                record_tokens.get("refresh_token"),
+            )
+            refresh = _codex_refresh_token_hmac(
+                record_tokens.get("refresh_token")
+            )
+            if new_pair_hmac and hmac.compare_digest(pair, new_pair_hmac):
+                states[(kind, credential_id)] = "new"
+            elif hmac.compare_digest(refresh, old_refresh_hmac):
+                states[(kind, credential_id)] = "old"
+            else:
+                raise AuthStoreConflictError(
+                    "Codex grant points at an unexpected token generation"
+                )
+
+        saw_old = any(value == "old" for value in states.values())
+        saw_new = any(value == "new" for value in states.values())
+        if not saw_old:
+            if new_tokens is not None and saw_new:
+                return "already_applied"
+            if new_tokens is None and not states:
+                return "superseded"
+            raise AuthStoreConflictError(
+                "Codex refresh target no longer has the expected generation"
+            )
+
+        changed = False
+
+        providers = auth_store.get("providers")
+        provider_state = (
+            providers.get("openai-codex")
+            if isinstance(providers, dict)
+            else None
+        )
+        provider_tokens = (
+            provider_state.get("tokens")
+            if isinstance(provider_state, dict)
+            else None
+        )
+        if (
+            isinstance(provider_tokens, dict)
+            and states.get(("singleton", None)) == "old"
+        ):
+                state = dict(provider_state)
+                tokens = dict(provider_tokens)
+                if new_tokens is not None:
+                    tokens["access_token"] = new_tokens["access_token"]
+                    tokens["refresh_token"] = new_tokens["refresh_token"]
+                    state["tokens"] = tokens
+                    state["last_refresh"] = last_refresh
+                    state["grant_id"] = grant_id
+                    state.pop("last_auth_error", None)
+                else:
+                    tokens.pop("access_token", None)
+                    tokens.pop("refresh_token", None)
+                    state["tokens"] = tokens
+                    state.pop("grant_id", None)
+                    state["last_auth_error"] = {
+                        "provider": "openai-codex",
+                        "code": reject_code or "codex_refresh_failed",
+                        "message": "Codex OAuth refresh generation rejected",
+                        "reason": "coordinated_refresh_failure",
+                        "relogin_required": True,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                _store_provider_state(
+                    auth_store,
+                    "openai-codex",
+                    state,
+                    set_active=False,
+                )
+                changed = True
+
+        pool = auth_store.get("credential_pool")
+        entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+        removed_ids: set[str] = set()
+        if isinstance(entries, list):
+            next_entries: List[Any] = []
+            for raw_entry in entries:
+                if not isinstance(raw_entry, dict):
+                    next_entries.append(raw_entry)
+                    continue
+                entry_id = str(raw_entry.get("id") or "").strip() or None
+                if states.get(("pool", entry_id)) != "old":
+                    next_entries.append(raw_entry)
+                    continue
+                changed = True
+                if new_tokens is None:
+                    if entry_id:
+                        removed_ids.add(entry_id)
+                    continue
+                patched = dict(raw_entry)
+                patched["access_token"] = new_tokens["access_token"]
+                patched["refresh_token"] = new_tokens["refresh_token"]
+                patched["grant_id"] = grant_id
+                if last_refresh:
+                    patched["last_refresh"] = last_refresh
+                for key in (
+                    "last_status",
+                    "last_status_at",
+                    "last_error_code",
+                    "last_error_reason",
+                    "last_error_message",
+                    "last_error_reset_at",
+                ):
+                    patched[key] = None
+                next_entries.append(patched)
+            if changed:
+                pool["openai-codex"] = next_entries
+
+        if not changed:
+            raise AuthStoreConflictError(
+                "Codex refresh target could not apply its expected generation"
+            )
+
+        intent = None
+        if removed_ids:
+            intent = AuthMutationIntent(
+                actor="codex_refresh_coordinator",
+                reason="terminal OAuth refresh failure",
+                provider_id="openai-codex",
+                operation="terminal_refresh",
+                removed_ids=frozenset(removed_ids),
+                expected_before_ids=before_ids,
+            )
+        _save_auth_store(
+            auth_store,
+            target_path=auth_path,
+            intent=intent,
+        )
+        return "applied"
+
+
+def _codex_wal_targets(payload: Dict[str, Any]) -> List[Path]:
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise AuthStoreCorruptError("Codex refresh WAL targets are invalid")
+    targets = []
+    for raw in raw_targets:
+        if not isinstance(raw, str) or not raw.strip():
+            raise AuthStoreCorruptError("Codex refresh WAL target is invalid")
+        targets.append(Path(raw))
+    return targets
+
+
+def _finish_codex_wal_commit(
+    payload: Dict[str, Any],
+    *,
+    new_tokens: Optional[Dict[str, str]],
+    last_refresh: Optional[str],
+    reject_code: Optional[str],
+) -> None:
+    grant_id = _normalize_codex_grant_id(
+        payload.get("grant_id"), allow_missing=False
+    ) or ""
+    expected_kind = "rotated" if new_tokens is not None else "rejected"
+    existing_kind = payload.get("commit_kind")
+    if existing_kind not in {None, expected_kind}:
+        raise AuthStoreCorruptError(
+            "Codex WAL commit outcome changed during recovery"
+        )
+    payload["commit_kind"] = expected_kind
+    applied = {
+        str(item)
+        for item in payload.get("applied_targets", [])
+        if isinstance(item, str)
+    }
+    for target in _codex_wal_targets(payload):
+        target_key = str(target)
+        if not target.is_file():
+            raise AuthStoreConflictError(
+                "Codex refresh WAL target is missing during commit"
+            )
+        # `applied_targets` is progress metadata, never authority. Re-run the
+        # idempotent old/new check for every target so a forged or torn marker
+        # cannot skip an uncommitted credential store.
+        _apply_codex_generation_to_path(
+            target,
+            grant_id=str(payload.get("grant_id") or ""),
+            old_pair_hmac=str(payload.get("old_pair_hmac") or ""),
+            old_refresh_hmac=str(payload.get("old_refresh_hmac") or ""),
+            new_tokens=new_tokens,
+            last_refresh=last_refresh,
+            reject_code=reject_code,
+        )
+        applied.add(target_key)
+        payload["state"] = "committing"
+        payload["applied_targets"] = sorted(applied)
+        _write_codex_refresh_wal(payload)
+    payload["state"] = "committed"
+    _write_codex_refresh_wal(payload)
+    _verify_codex_committed_wal_targets(
+        payload,
+        new_tokens=new_tokens,
+    )
+    _clear_codex_refresh_wal(grant_id)
+
+
+def _verify_codex_committed_wal_targets(
+    payload: Dict[str, Any],
+    *,
+    new_tokens: Optional[Dict[str, str]],
+) -> None:
+    grant_id = _normalize_codex_grant_id(
+        payload.get("grant_id"), allow_missing=False
+    ) or ""
+    old_refresh_hmac = str(payload.get("old_refresh_hmac") or "")
+    new_pair_hmac = (
+        _codex_pair_hmac(
+            new_tokens.get("access_token"),
+            new_tokens.get("refresh_token"),
+        )
+        if new_tokens is not None
+        else None
+    )
+    for target in _codex_wal_targets(payload):
+        if not target.is_file():
+            raise AuthStoreConflictError(
+                "Codex committed WAL target is missing"
+            )
+        with _auth_store_lock(target):
+            store = _load_auth_store(target, strict=True)
+            if _auth_store_has_codex_grant_refresh(
+                store, grant_id, old_refresh_hmac
+            ):
+                raise AuthStoreConflictError(
+                    "Codex committed WAL target still has the old generation"
+                )
+            if new_pair_hmac and not _auth_store_has_codex_grant_pair(
+                store, grant_id, new_pair_hmac
+            ):
+                raise AuthStoreConflictError(
+                    "Codex committed WAL target is missing the new generation"
+                )
+
+
+def _recover_codex_refresh_wal_locked(grant_id: str) -> None:
+    grant_id = _normalize_codex_grant_id(
+        grant_id, allow_missing=False
+    ) or ""
+    payload = _read_codex_refresh_wal(grant_id)
+    if payload is None:
+        return
+    state = payload["state"]
+    if state == "committed":
+        raw_tokens = payload.get("new_tokens")
+        committed_tokens = (
+            {
+                "access_token": str(raw_tokens.get("access_token") or ""),
+                "refresh_token": str(raw_tokens.get("refresh_token") or ""),
+            }
+            if isinstance(raw_tokens, dict)
+            else None
+        )
+        _verify_codex_committed_wal_targets(
+            payload,
+            new_tokens=committed_tokens,
+        )
+        _clear_codex_refresh_wal(grant_id)
+        return
+    old_pair_hmac = str(payload.get("old_pair_hmac") or "")
+    if len(old_pair_hmac) != 64:
+        raise AuthStoreCorruptError("Codex refresh WAL pair HMAC is invalid")
+
+    if state == "retryable":
+        grant_id = _normalize_codex_grant_id(
+            payload.get("grant_id"), allow_missing=False
+        ) or ""
+        old_refresh_hmac = str(payload.get("old_refresh_hmac") or "")
+        if payload.get("reject_code") != CODEX_RATE_LIMITED_CODE:
+            raise AuthStoreCorruptError(
+                "Codex retryable WAL reason is invalid"
+            )
+        for target in _codex_wal_targets(payload):
+            if not target.is_file():
+                raise AuthStoreConflictError(
+                    "Codex retryable WAL target is missing"
+                )
+            with _auth_store_lock(target):
+                store = _load_auth_store(target, strict=True)
+                if not _auth_store_has_codex_grant_refresh(
+                    store, grant_id, old_refresh_hmac
+                ):
+                    raise AuthStoreConflictError(
+                        "Codex retryable WAL target changed"
+                    )
+        _clear_codex_refresh_wal(grant_id)
+        return
+
+    if state == "prepared":
+        grant_id = _normalize_codex_grant_id(
+            payload.get("grant_id"), allow_missing=False
+        ) or ""
+        old_refresh_hmac = str(payload.get("old_refresh_hmac") or "")
+        for target in _codex_wal_targets(payload):
+            if not target.is_file():
+                raise AuthStoreConflictError(
+                    "Codex prepared WAL target is missing"
+                )
+            with _auth_store_lock(target):
+                store = _load_auth_store(target, strict=True)
+                if not _auth_store_has_codex_grant_refresh(
+                    store, grant_id, old_refresh_hmac
+                ):
+                    raise AuthStoreConflictError(
+                        "Codex prepared WAL target no longer has the observed generation"
+                    )
+        raise AuthError(
+            "A previous Codex refresh has an ambiguous upstream outcome; "
+            "the old refresh token will not be replayed. Re-authenticate.",
+            provider="openai-codex",
+            code="codex_refresh_ambiguous",
+            relogin_required=True,
+        )
+
+    if state in {"rotated", "committing"}:
+        if payload.get("commit_kind") == "rejected":
+            _finish_codex_wal_commit(
+                payload,
+                new_tokens=None,
+                last_refresh=None,
+                reject_code=str(
+                    payload.get("reject_code") or "codex_refresh_failed"
+                ),
+            )
+            return
+        raw_tokens = payload.get("new_tokens")
+        if not isinstance(raw_tokens, dict):
+            raise AuthStoreCorruptError("Codex refresh WAL tokens are invalid")
+        access = str(raw_tokens.get("access_token") or "").strip()
+        refresh = str(raw_tokens.get("refresh_token") or "").strip()
+        if not access or not refresh:
+            raise AuthStoreCorruptError("Codex refresh WAL tokens are incomplete")
+        _finish_codex_wal_commit(
+            payload,
+            new_tokens={"access_token": access, "refresh_token": refresh},
+            last_refresh=str(payload.get("last_refresh") or ""),
+            reject_code=None,
+        )
+        return
+
+    if state == "rejected":
+        _finish_codex_wal_commit(
+            payload,
+            new_tokens=None,
+            last_refresh=None,
+            reject_code=str(payload.get("reject_code") or "codex_refresh_failed"),
+        )
+        return
+
+    raise AuthStoreCorruptError("Codex refresh WAL cannot be recovered")
+
+
+def _prepare_codex_auth_store_mutation_locked(
+    *,
+    reason: str,
+    supersede_ambiguous: bool,
+    grant_ids: Optional[Iterable[str]] = None,
+) -> None:
+    scoped_ids = (
+        _codex_refresh_wal_grant_ids()
+        if grant_ids is None
+        else sorted(
+            {
+                _normalize_codex_grant_id(item, allow_missing=False) or ""
+                for item in grant_ids
+            }
+        )
+    )
+    for grant_id in scoped_ids:
+        payload = _read_codex_refresh_wal(grant_id)
+        if payload is None:
+            continue
+        if supersede_ambiguous and payload.get("state") == "prepared":
+            payload["state"] = "rejected"
+            payload["commit_kind"] = "rejected"
+            payload["reject_code"] = (
+                "codex_refresh_superseded_by_explicit_" + reason
+            )
+            _write_codex_refresh_wal(payload)
+            _finish_codex_wal_commit(
+                payload,
+                new_tokens=None,
+                last_refresh=None,
+                reject_code=str(payload["reject_code"]),
+            )
+            continue
+        _recover_codex_refresh_wal_locked(grant_id)
+
+
+@contextmanager
+def _codex_auth_store_mutation(
+    *,
+    reason: str,
+    supersede_ambiguous: bool = False,
+    grant_ids: Optional[Iterable[str]] = None,
+    grant_id_resolver: Optional[Callable[[], Iterable[str]]] = None,
+):
+    """Serialize every Codex token-store mutation with refresh/recovery."""
+    if grant_ids is not None and grant_id_resolver is not None:
+        raise ValueError("Specify grant_ids or grant_id_resolver, not both")
+    timeout = max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        CODEX_REFRESH_LOCK_GRACE_SECONDS,
+    )
+    with _codex_refresh_lock(timeout_seconds=timeout) as lock_scope:
+        resolved = (
+            tuple(grant_id_resolver())
+            if grant_id_resolver is not None
+            else grant_ids
+        )
+        scoped_grant_ids = (
+            None
+            if resolved is None
+            else tuple(
+                sorted(
+                    {
+                        _normalize_codex_grant_id(item, allow_missing=False)
+                        or ""
+                        for item in resolved
+                    }
+                )
+            )
+        )
+        if scoped_grant_ids:
+            lock_scope.retain_inventory_and_lock_grants(
+                scoped_grant_ids,
+                timeout_seconds=timeout,
+            )
+        _prepare_codex_auth_store_mutation_locked(
+            reason=reason,
+            supersede_ambiguous=supersede_ambiguous,
+            grant_ids=scoped_grant_ids,
+        )
+        # Structural token-store mutations keep inventory plus their sorted
+        # grant locks across the write. Unknown/new-grant mutations keep the
+        # inventory lock, which prevents discovery until the write completes.
+        yield
+
+
+@contextmanager
+def _retire_codex_auth_store(
+    auth_path: Path,
+    *,
+    reason: str,
+):
+    """Recover/quarantine scoped Codex WALs before an auth store disappears.
+
+    The caller keeps this context open through the atomic filesystem rename
+    that retires the store, so no coordinator can publish a WAL targeting a
+    path after its grant inventory was reconciled.
+    """
+    pinned_path = Path(os.path.abspath(auth_path.expanduser()))
+
+    def _profile_grant_ids() -> set[str]:
+        _assert_codex_auth_inventory_file_safe(pinned_path)
+        with _auth_store_lock(pinned_path):
+            store = _load_auth_store(pinned_path, strict=True)
+            grant_ids = _codex_grant_ids_in_store(store)
+
+        # A terminal commit removes a grant before recording per-target WAL
+        # progress. If the process crashes in that gap, the retiring store no
+        # longer identifies the grant even though its validated WAL still
+        # targets this path. Include those WAL-owned grants so retirement waits
+        # for their grant locks and completes recovery before moving the file.
+        pinned_key = str(pinned_path)
+        for wal_grant_id in _codex_refresh_wal_grant_ids():
+            payload = _read_codex_refresh_wal(wal_grant_id)
+            if payload is None:
+                continue
+            if any(
+                str(target) == pinned_key
+                for target in _codex_wal_targets(payload)
+            ):
+                grant_ids.add(wal_grant_id)
+        return grant_ids
+
+    with _codex_auth_store_mutation(
+        reason=reason,
+        supersede_ambiguous=True,
+        grant_id_resolver=_profile_grant_ids,
+    ):
+        yield
+
+
+def _codex_locator_last_refresh(
+    auth_store: Dict[str, Any],
+    locator: _CodexOauthLocator,
+) -> Optional[str]:
+    if locator.kind == "pool" and locator.credential_id:
+        pool = auth_store.get("credential_pool")
+        entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+        for row in entries if isinstance(entries, list) else []:
+            if (
+                isinstance(row, dict)
+                and str(row.get("id") or "").strip() == locator.credential_id
+            ):
+                return row.get("last_refresh")
+        return None
+    providers = auth_store.get("providers")
+    state = (
+        providers.get("openai-codex")
+        if isinstance(providers, dict)
+        else None
+    )
+    return state.get("last_refresh") if isinstance(state, dict) else None
+
+
+def _recover_codex_wal_for_expected_generation_locked(
+    *,
+    expected_refresh_token: str,
+    source_auth_path: Optional[Path],
+) -> Optional[tuple[str, Optional[str]]]:
+    """Recover a matching WAL before credential-source discovery.
+
+    A terminal commit can remove the credential from its primary source before
+    a crash.  In that state locator discovery cannot identify the grant that
+    owns the remaining WAL, so recovery must first key off the caller's
+    observed refresh-token generation and (when supplied) source path.
+
+    The host-wide refresh lock must be held by the caller. Only one valid WAL
+    with the expected generation and source may be recovered. Because the
+    source is already missing, the complete WAL inventory is deliberately
+    validated fail-closed; an unsafe or corrupt unrelated WAL blocks this rare
+    fallback rather than being silently skipped without an authenticated grant
+    identity. Normal locatable grants use grant-scoped recovery and remain
+    isolated from unrelated WAL corruption.
+    """
+    expected_refresh_hmac = _codex_refresh_token_hmac(expected_refresh_token)
+    expected_source = (
+        source_auth_path.expanduser().resolve(strict=False)
+        if source_auth_path is not None
+        else None
+    )
+    matching_wals: List[tuple[str, Dict[str, Any]]] = []
+    for grant_id in _codex_refresh_wal_grant_ids():
+        payload = _read_codex_refresh_wal(grant_id)
+        if payload is None or not hmac.compare_digest(
+            str(payload.get("old_refresh_hmac") or ""),
+            expected_refresh_hmac,
+        ):
+            continue
+        if expected_source is not None:
+            targets = {
+                target.expanduser().resolve(strict=False)
+                for target in _codex_wal_targets(payload)
+            }
+            if expected_source not in targets:
+                continue
+        matching_wals.append((grant_id, payload))
+
+    if len(matching_wals) > 1:
+        raise AuthStoreConflictError(
+            "Multiple Codex refresh WALs match the observed credential generation"
+        )
+    if not matching_wals:
+        return None
+    grant_id, payload = matching_wals[0]
+    commit_kind = str(payload.get("commit_kind") or "")
+    reject_code = (
+        str(payload.get("reject_code") or "").strip() or None
+        if commit_kind == "rejected"
+        else None
+    )
+    _recover_codex_refresh_wal_locked(grant_id)
+    return commit_kind, reject_code
+
+
+def refresh_codex_oauth_coordinated(
+    *,
+    expected_access_token: str,
+    expected_refresh_token: str,
+    credential_id: Optional[str] = None,
+    source_auth_path: Optional[Path] = None,
+    timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    """Single-flight one Codex grant across all Hermes profiles on the host."""
+    lock_timeout = max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        float(timeout_seconds) + CODEX_REFRESH_LOCK_GRACE_SECONDS,
+    )
+    with _codex_refresh_lock(timeout_seconds=lock_timeout) as lock_scope:
+        try:
+            locator = _discover_codex_oauth_locator(
+                credential_id,
+                source_auth_path=source_auth_path,
+            )
+        except (AuthError, AuthStoreConflictError):
+            # A terminal crash can remove the source before WAL cleanup. Only
+            # then fall back to generation-wide discovery. Normal, locatable
+            # grants recover their own WAL below so a corrupt unrelated WAL
+            # cannot block every Codex account on the host.
+            recovered = _recover_codex_wal_for_expected_generation_locked(
+                expected_refresh_token=expected_refresh_token,
+                source_auth_path=source_auth_path,
+            )
+            if recovered is not None and recovered[0] == "rejected":
+                reject_code = recovered[1] or "codex_refresh_failed"
+                if reject_code not in {
+                    "codex_refresh_failed",
+                    "codex_auth_missing_refresh_token",
+                    "invalid_grant",
+                    "invalid_token",
+                    "refresh_token_reused",
+                }:
+                    reject_code = "codex_refresh_failed"
+                raise AuthError(
+                    "A previous Codex refresh terminally rejected this grant. "
+                    "Re-authenticate.",
+                    provider="openai-codex",
+                    code=reject_code,
+                    relogin_required=True,
+                )
+            if recovered is None:
+                raise
+            locator = _discover_codex_oauth_locator(
+                credential_id,
+                source_auth_path=source_auth_path,
+            )
+        expected_hmac = _codex_pair_hmac(
+            expected_access_token,
+            expected_refresh_token,
+        )
+        with _auth_store_lock(locator.auth_path):
+            store = _load_auth_store(locator.auth_path, strict=True)
+            tokens = _codex_tokens_for_locator(store, locator)
+            if not tokens:
+                raise AuthStoreConflictError(
+                    "Codex credential disappeared before refresh"
+                )
+            current_hmac = _codex_pair_hmac(
+                tokens.get("access_token"), tokens.get("refresh_token")
+            )
+            current_last_refresh = _codex_locator_last_refresh(store, locator)
+
+        locator, _initial_targets, _initial_refresh_hmac = _ensure_codex_stable_grant(
+            locator,
+            tokens,
+        )
+        grant_id = locator.grant_id or ""
+        lock_scope.handoff_to_grants(
+            (grant_id,),
+            timeout_seconds=lock_timeout,
+        )
+        _recover_codex_refresh_wal_locked(grant_id)
+        with _auth_store_lock(locator.auth_path):
+            store = _load_auth_store(locator.auth_path, strict=True)
+            tokens = _codex_tokens_for_locator(store, locator)
+            if not tokens:
+                raise AuthStoreConflictError(
+                    "Codex credential disappeared during WAL recovery"
+                )
+            if _codex_grant_id_for_locator(store, locator) != grant_id:
+                raise AuthStoreConflictError(
+                    "Codex grant identity changed while waiting for its refresh lock"
+                )
+            current_hmac = _codex_pair_hmac(
+                tokens.get("access_token"), tokens.get("refresh_token")
+            )
+            current_last_refresh = _codex_locator_last_refresh(store, locator)
+        locator, targets, old_refresh_hmac = _ensure_codex_stable_grant(
+            locator,
+            tokens,
+        )
+        if current_hmac != expected_hmac:
+            return {
+                "tokens": dict(tokens),
+                "last_refresh": current_last_refresh,
+                "adopted": True,
+                "auth_path": str(locator.auth_path),
+                "credential_id": locator.credential_id,
+                "grant_id": grant_id,
+            }
+
+        wal: Dict[str, Any] = {
+            "version": CODEX_REFRESH_WAL_VERSION,
+            "state": "prepared",
+            "operation_id": uuid.uuid4().hex,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "old_pair_hmac": expected_hmac,
+            "old_refresh_hmac": old_refresh_hmac,
+            "grant_id": grant_id,
+            "locator": {
+                "auth_path": str(locator.auth_path.expanduser().resolve(strict=False)),
+                "kind": locator.kind,
+                "credential_id": locator.credential_id,
+                "grant_id": grant_id,
+                "fingerprint": _codex_locator_fingerprint(locator, grant_id),
+            },
+            "targets": targets,
+            "applied_targets": [],
+        }
+        _write_codex_refresh_wal(wal)
+
+        try:
+            refreshed = refresh_codex_oauth_pure(
+                str(tokens.get("access_token") or ""),
+                str(tokens.get("refresh_token") or ""),
+                timeout_seconds=timeout_seconds,
+            )
+        except AuthError as exc:
+            if exc.code == CODEX_RATE_LIMITED_CODE:
+                wal["state"] = "retryable"
+                wal["reject_code"] = CODEX_RATE_LIMITED_CODE
+                _write_codex_refresh_wal(wal)
+                _clear_codex_refresh_wal(grant_id)
+            elif _is_terminal_codex_oauth_refresh_error(exc):
+                wal["state"] = "rejected"
+                wal["commit_kind"] = "rejected"
+                wal["reject_code"] = exc.code or "codex_refresh_failed"
+                _write_codex_refresh_wal(wal)
+                _finish_codex_wal_commit(
+                    wal,
+                    new_tokens=None,
+                    last_refresh=None,
+                    reject_code=wal["reject_code"],
+                )
+            # All other outcomes are ambiguous. Keep PREPARED so the old
+            # single-use token is never replayed automatically.
+            raise
+
+        new_tokens = {
+            "access_token": str(refreshed.get("access_token") or "").strip(),
+            "refresh_token": str(refreshed.get("refresh_token") or "").strip(),
+        }
+        if not new_tokens["access_token"] or not new_tokens["refresh_token"]:
+            raise AuthError(
+                "Codex refresh returned an incomplete rotated generation.",
+                provider="openai-codex",
+                code="codex_refresh_incomplete_generation",
+                relogin_required=True,
+            )
+        last_refresh = str(refreshed.get("last_refresh") or "")
+        wal["state"] = "rotated"
+        wal["commit_kind"] = "rotated"
+        wal["new_tokens"] = new_tokens
+        wal["new_pair_hmac"] = _codex_pair_hmac(
+            new_tokens["access_token"], new_tokens["refresh_token"]
+        )
+        wal["last_refresh"] = last_refresh
+        _write_codex_refresh_wal(wal)
+        _finish_codex_wal_commit(
+            wal,
+            new_tokens=new_tokens,
+            last_refresh=last_refresh,
+            reject_code=None,
+        )
+
+        with _auth_store_lock(locator.auth_path):
+            committed_store = _load_auth_store(locator.auth_path, strict=True)
+            committed = _codex_tokens_for_locator(committed_store, locator)
+        if not committed or _codex_pair_hmac(
+            committed.get("access_token"), committed.get("refresh_token")
+        ) != _codex_pair_hmac(
+            new_tokens["access_token"], new_tokens["refresh_token"]
+        ):
+            raise AuthStoreConflictError(
+                "Codex source did not retain the committed generation"
+            )
+        return {
+            "tokens": new_tokens,
+            "last_refresh": last_refresh,
+            "adopted": False,
+            "auth_path": str(locator.auth_path),
+            "credential_id": locator.credential_id,
+            "grant_id": grant_id,
+        }
 
 
 def _load_codex_runtime_route_policy() -> Dict[str, Any]:
@@ -3670,105 +6708,75 @@ def _fixed_codex_runtime_credentials(
     """Resolve and optionally refresh only the policy-selected pool entry."""
     credential_id = str(policy.get("credential_id") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
-    lock_timeout = max(
-        float(AUTH_LOCK_TIMEOUT_SECONDS),
-        float(refresh_timeout_seconds) + 5.0,
-    )
-    with _auth_store_lock(timeout_seconds=lock_timeout):
-        auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        entries = pool.get("openai-codex") if isinstance(pool, dict) else None
-        matches = []
-        if isinstance(entries, list):
-            matches = [
-                item
-                for item in entries
-                if isinstance(item, dict)
-                and str(item.get("id") or "").strip() == credential_id
-            ]
-        if len(matches) != 1:
+    entries, source_path = read_credential_pool_with_source("openai-codex")
+    matches = [
+        item
+        for item in entries
+        if isinstance(item, dict)
+        and str(item.get("id") or "").strip() == credential_id
+    ]
+    if len(matches) != 1:
+        raise AuthError(
+            "Fixed Codex route credential is unavailable.",
+            provider="openai-codex",
+            code="codex_fixed_route_unavailable",
+            relogin_required=False,
+        )
+    entry = matches[0]
+
+    status = str(entry.get("last_status") or "ok").strip().lower()
+    reset_at = entry.get("last_error_reset_at")
+    try:
+        reset_epoch = float(reset_at) if reset_at not in (None, "") else None
+    except (TypeError, ValueError):
+        reset_epoch = None
+    if status == "dead" or (
+        status == "exhausted"
+        and (reset_epoch is None or reset_epoch > time.time())
+    ):
+        raise AuthError(
+            "Fixed Codex route credential is unavailable.",
+            provider="openai-codex",
+            code="codex_fixed_route_unavailable",
+            relogin_required=False,
+        )
+
+    access_token = str(entry.get("access_token") or "").strip()
+    refresh_token = str(entry.get("refresh_token") or "").strip()
+    if not access_token:
+        raise AuthError(
+            "Fixed Codex route credential is unavailable.",
+            provider="openai-codex",
+            code="codex_fixed_route_unavailable",
+            relogin_required=False,
+        )
+
+    should_refresh = bool(force_refresh)
+    if not should_refresh and refresh_if_expiring:
+        should_refresh = _codex_access_token_is_expiring(
+            access_token,
+            refresh_skew_seconds,
+        )
+    if should_refresh:
+        if not refresh_token:
             raise AuthError(
-                "Fixed Codex route credential is unavailable.",
+                "Fixed Codex route credential cannot be refreshed.",
                 provider="openai-codex",
                 code="codex_fixed_route_unavailable",
                 relogin_required=False,
             )
-        entry = matches[0]
-
-        status = str(entry.get("last_status") or "ok").strip().lower()
-        reset_at = entry.get("last_error_reset_at")
-        try:
-            reset_epoch = float(reset_at) if reset_at not in (None, "") else None
-        except (TypeError, ValueError):
-            reset_epoch = None
-        if status == "dead" or (
-            status == "exhausted"
-            and (reset_epoch is None or reset_epoch > time.time())
-        ):
-            raise AuthError(
-                "Fixed Codex route credential is unavailable.",
-                provider="openai-codex",
-                code="codex_fixed_route_unavailable",
-                relogin_required=False,
-            )
-
-        access_token = str(entry.get("access_token") or "").strip()
-        refresh_token = str(entry.get("refresh_token") or "").strip()
-        if not access_token:
-            raise AuthError(
-                "Fixed Codex route credential is unavailable.",
-                provider="openai-codex",
-                code="codex_fixed_route_unavailable",
-                relogin_required=False,
-            )
-
-        should_refresh = bool(force_refresh)
-        if not should_refresh and refresh_if_expiring:
-            should_refresh = _codex_access_token_is_expiring(
-                access_token,
-                refresh_skew_seconds,
-            )
-        if should_refresh:
-            if not refresh_token:
-                raise AuthError(
-                    "Fixed Codex route credential cannot be refreshed.",
-                    provider="openai-codex",
-                    code="codex_fixed_route_unavailable",
-                    relogin_required=False,
-                )
-            refreshed = refresh_codex_oauth_pure(
-                access_token,
-                refresh_token,
-                timeout_seconds=refresh_timeout_seconds,
-            )
-            access_token = str(refreshed.get("access_token") or "").strip()
-            new_refresh = str(refreshed.get("refresh_token") or "").strip()
-            if not access_token:
-                raise AuthError(
-                    "Fixed Codex route refresh returned no access token.",
-                    provider="openai-codex",
-                    code="codex_fixed_route_unavailable",
-                    relogin_required=False,
-                )
-            entry["access_token"] = access_token
-            if new_refresh:
-                entry["refresh_token"] = new_refresh
-            last_refresh = datetime.now(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            )
-            entry["last_refresh"] = last_refresh
-            for key in (
-                "last_status",
-                "last_status_at",
-                "last_error_code",
-                "last_error_reason",
-                "last_error_message",
-                "last_error_reset_at",
-            ):
-                entry[key] = None
-            _save_auth_store(auth_store)
-        else:
-            last_refresh = entry.get("last_refresh")
+        outcome = refresh_codex_oauth_coordinated(
+            expected_access_token=access_token,
+            expected_refresh_token=refresh_token,
+            credential_id=credential_id,
+            source_auth_path=source_path,
+            timeout_seconds=refresh_timeout_seconds,
+        )
+        tokens = dict(outcome["tokens"])
+        access_token = str(tokens.get("access_token") or "").strip()
+        last_refresh = outcome.get("last_refresh")
+    else:
+        last_refresh = entry.get("last_refresh")
 
     base_url = (
         str(entry.get("inference_base_url") or entry.get("base_url") or "")
@@ -3821,22 +6829,12 @@ def resolve_codex_runtime_credentials(
         )
 
     read_error: Optional[AuthError] = None
+    source_path: Optional[Path] = None
     try:
-        data = _read_codex_tokens()
+        data, source_path = _read_codex_tokens_with_source()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
-            if imported:
-                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
-            else:
-                data = None
-        else:
-            data = None
+        data = None
 
     if data is None:
         pool_token = _pool_codex_access_token()
@@ -3890,19 +6888,18 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_codex_tokens(_lock=False)
-            tokens = dict(data["tokens"])
-            access_token = str(tokens.get("access_token", "") or "").strip()
-
-            should_refresh = bool(force_refresh)
-            if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
-
-            if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
-                access_token = str(tokens.get("access_token", "") or "").strip()
+        outcome = refresh_codex_oauth_coordinated(
+            expected_access_token=str(tokens.get("access_token") or ""),
+            expected_refresh_token=str(tokens.get("refresh_token") or ""),
+            source_auth_path=source_path,
+            timeout_seconds=refresh_timeout_seconds,
+        )
+        tokens = dict(outcome["tokens"])
+        access_token = str(tokens.get("access_token", "") or "").strip()
+        data = {
+            "tokens": tokens,
+            "last_refresh": outcome.get("last_refresh"),
+        }
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
@@ -4036,15 +7033,26 @@ def _pool_codex_access_token() -> str:
 # xAI Grok OAuth — tokens stored in ~/.hermes/auth.json
 # =============================================================================
 
-def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return usable xAI OAuth state from provider state or credential pool."""
-    state = _load_provider_state(auth_store, "xai-oauth")
+def _xai_oauth_state_with_pool_id(
+    auth_store: Dict[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Return xAI state and the exact pool-row ID when pool-backed."""
+    # Inspect only the supplied store.  Cross-profile fallback is selected by
+    # the caller so refresh paths can retain the exact source auth.json and
+    # write a rotated single-use refresh token back to its owner.
+    providers = auth_store.get("providers")
+    raw_state = (
+        providers.get("xai-oauth")
+        if isinstance(providers, dict)
+        else None
+    )
+    state = dict(raw_state) if isinstance(raw_state, dict) else None
     tokens = state.get("tokens") if isinstance(state, dict) else None
     if isinstance(tokens, dict):
         access_token = str(tokens.get("access_token", "") or "").strip()
         refresh_token = str(tokens.get("refresh_token", "") or "").strip()
         if access_token and refresh_token:
-            return state
+            return state, None
 
     credential_pool = auth_store.get("credential_pool")
     entries = (
@@ -4069,9 +7077,88 @@ def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str
             if entry.get("last_refresh"):
                 merged["last_refresh"] = entry.get("last_refresh")
             merged.setdefault("auth_mode", "oauth_pkce")
-            return merged
+            entry_id = str(entry.get("id") or "").strip()
+            return merged, entry_id or None
 
-    return state if isinstance(state, dict) else None
+    return (state if isinstance(state, dict) else None), None
+
+
+def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return usable xAI OAuth state from exactly the supplied store."""
+    state, _pool_id = _xai_oauth_state_with_pool_id(auth_store)
+    return state
+
+
+def _patch_xai_oauth_pool_generation(
+    auth_store: Dict[str, Any],
+    *,
+    expected_token_pair_fingerprint: str,
+    source_pool_id: Optional[str],
+    updated_tokens: Optional[Dict[str, Any]] = None,
+    last_refresh: Optional[str] = None,
+    remove: bool = False,
+    clear_source_health: bool = False,
+) -> int:
+    """Patch/remove only the exact xAI pool generation being refreshed."""
+    credential_pool = auth_store.get("credential_pool")
+    entries = (
+        credential_pool.get("xai-oauth")
+        if isinstance(credential_pool, dict)
+        else None
+    )
+    if not isinstance(entries, list):
+        return 0
+
+    matched = 0
+    next_entries: List[Any] = []
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            next_entries.append(raw_entry)
+            continue
+        entry_id = str(raw_entry.get("id") or "").strip()
+        is_source = bool(source_pool_id) and entry_id == source_pool_id
+        is_device_alias = (
+            str(raw_entry.get("source") or "").strip() == "device_code"
+        )
+        pair_matches = (
+            oauth_token_pair_fingerprint(
+                raw_entry.get("access_token"),
+                raw_entry.get("refresh_token"),
+            )
+            == expected_token_pair_fingerprint
+        )
+        if pair_matches and (is_source or is_device_alias):
+            matched += 1
+            if remove:
+                continue
+            patched = dict(raw_entry)
+            patched["access_token"] = str(
+                (updated_tokens or {}).get("access_token") or ""
+            )
+            patched["refresh_token"] = str(
+                (updated_tokens or {}).get("refresh_token") or ""
+            )
+            if (updated_tokens or {}).get("token_type"):
+                patched["token_type"] = updated_tokens["token_type"]
+            if last_refresh:
+                patched["last_refresh"] = last_refresh
+            if clear_source_health:
+                for key in (
+                    "last_status",
+                    "last_status_at",
+                    "last_error_code",
+                    "last_error_reason",
+                    "last_error_message",
+                    "last_error_reset_at",
+                ):
+                    patched[key] = None
+            next_entries.append(patched)
+            continue
+        next_entries.append(raw_entry)
+
+    if matched:
+        credential_pool["xai-oauth"] = next_entries
+    return matched
 
 
 def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
@@ -4083,17 +7170,8 @@ def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     )
 
 
-def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
-    if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-    else:
-        auth_store = _load_auth_store()
-    state = _xai_oauth_state_from_store(auth_store)
-    if not _xai_oauth_state_has_usable_tokens(state):
-        global_state = _xai_oauth_state_from_store(_load_global_auth_store())
-        if _xai_oauth_state_has_usable_tokens(global_state):
-            state = global_state
+def _xai_oauth_data_from_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Validate one already-selected xAI state without changing its source."""
     if not state:
         raise AuthError(
             "No xAI OAuth credentials stored. Select xAI Grok OAuth (SuperGrok / Premium+) in `hermes model`.",
@@ -4126,11 +7204,317 @@ def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             relogin_required=True,
         )
     return {
-        "tokens": tokens,
+        "tokens": dict(tokens),
         "last_refresh": state.get("last_refresh"),
         "discovery": state.get("discovery") or {},
         "redirect_uri": state.get("redirect_uri"),
     }
+
+
+@dataclass(frozen=True)
+class _XaiOauthLocator:
+    auth_path: Path
+    kind: str
+    credential_id: Optional[str] = None
+
+
+def _xai_pool_state_by_id(
+    auth_store: Dict[str, Any],
+    credential_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return one exact xAI pool row as OAuth state."""
+    credential_pool = auth_store.get("credential_pool")
+    entries = (
+        credential_pool.get("xai-oauth")
+        if isinstance(credential_pool, dict)
+        else None
+    )
+    if not isinstance(entries, list):
+        return None
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("id") or "").strip() == credential_id
+    ]
+    if len(matches) != 1:
+        return None
+    entry = matches[0]
+    state: Dict[str, Any] = {
+        "tokens": {
+            "access_token": str(entry.get("access_token") or ""),
+            "refresh_token": str(entry.get("refresh_token") or ""),
+            "token_type": str(entry.get("token_type") or "Bearer"),
+        },
+        "last_refresh": entry.get("last_refresh"),
+        "auth_mode": entry.get("auth_mode") or "oauth_device_code",
+    }
+    discovery = entry.get("discovery")
+    if isinstance(discovery, dict):
+        state["discovery"] = dict(discovery)
+    elif entry.get("token_endpoint"):
+        state["discovery"] = {
+            "token_endpoint": str(entry.get("token_endpoint") or "")
+        }
+
+    providers = auth_store.get("providers")
+    provider_state = (
+        providers.get("xai-oauth")
+        if isinstance(providers, dict)
+        else None
+    )
+    if (
+        isinstance(provider_state, dict)
+        and provider_oauth_token_pair_fingerprint(
+            "xai-oauth", provider_state
+        )
+        == provider_oauth_token_pair_fingerprint("xai-oauth", state)
+    ):
+        for key in ("discovery", "redirect_uri", "auth_mode"):
+            if key in provider_state:
+                state[key] = provider_state[key]
+    return state
+
+
+def _discover_xai_oauth_locator(
+    credential_id: Optional[str] = None,
+    *,
+    source_auth_path: Optional[Path] = None,
+) -> _XaiOauthLocator:
+    """Discover the active profile/root source without taking two locks."""
+    if source_auth_path is not None:
+        candidates: List[tuple[Path, Dict[str, Any]]] = [
+            (source_auth_path, _load_auth_store(source_auth_path))
+        ]
+    else:
+        active_path = _auth_file_path()
+        candidates = [(active_path, _load_auth_store(active_path))]
+        global_path = _global_auth_file_path()
+        if global_path is not None:
+            candidates.append((global_path, _load_global_auth_store()))
+
+    for path, store in candidates:
+        if credential_id is not None:
+            state = _xai_pool_state_by_id(store, credential_id)
+            if _xai_oauth_state_has_usable_tokens(state):
+                return _XaiOauthLocator(path, "pool", credential_id)
+            continue
+        state, pool_id = _xai_oauth_state_with_pool_id(store)
+        if _xai_oauth_state_has_usable_tokens(state):
+            return _XaiOauthLocator(
+                path,
+                "pool" if pool_id else "singleton",
+                pool_id,
+            )
+
+    if source_auth_path is not None:
+        raise AuthStoreConflictError(
+            "xAI credential source changed; reload the credential pool"
+        )
+    raise AuthError(
+        "No xAI OAuth credentials stored. Select xAI Grok OAuth (SuperGrok / Premium+) in `hermes model`.",
+        provider="xai-oauth",
+        code="xai_auth_missing",
+        relogin_required=True,
+    )
+
+
+def _xai_state_for_locator(
+    auth_store: Dict[str, Any],
+    locator: _XaiOauthLocator,
+) -> Optional[Dict[str, Any]]:
+    if locator.kind == "pool" and locator.credential_id:
+        return _xai_pool_state_by_id(auth_store, locator.credential_id)
+    providers = auth_store.get("providers")
+    state = (
+        providers.get("xai-oauth")
+        if isinstance(providers, dict)
+        else None
+    )
+    return dict(state) if isinstance(state, dict) else None
+
+
+def refresh_xai_oauth_coordinated(
+    *,
+    expected_access_token: str,
+    expected_refresh_token: str,
+    credential_id: Optional[str] = None,
+    source_auth_path: Optional[Path] = None,
+    timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    """Refresh one xAI grant under its actual profile/root source lock."""
+    locator = _discover_xai_oauth_locator(
+        credential_id,
+        source_auth_path=source_auth_path,
+    )
+    expected_pair = oauth_token_pair_fingerprint(
+        expected_access_token,
+        expected_refresh_token,
+    )
+    lock_timeout = max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        (2.0 * float(timeout_seconds)) + XAI_REFRESH_LOCK_GRACE_SECONDS,
+    )
+    with _auth_store_lock(locator.auth_path, timeout_seconds=lock_timeout):
+        store = _load_auth_store(locator.auth_path, strict=True)
+        state = _xai_state_for_locator(store, locator)
+        data = _xai_oauth_data_from_state(state)
+        tokens = dict(data["tokens"])
+        current_pair = oauth_token_pair_fingerprint(
+            tokens.get("access_token"),
+            tokens.get("refresh_token"),
+        )
+        if current_pair != expected_pair:
+            return {
+                **data,
+                "adopted": True,
+                "auth_path": str(locator.auth_path),
+                "credential_id": locator.credential_id,
+            }
+
+        discovery = dict(data.get("discovery") or {})
+        token_endpoint = str(
+            discovery.get("token_endpoint", "") or ""
+        ).strip()
+        redirect_uri = str(data.get("redirect_uri", "") or "").strip()
+        try:
+            refreshed = refresh_xai_oauth_pure(
+                str(tokens.get("access_token") or ""),
+                str(tokens.get("refresh_token") or ""),
+                token_endpoint=token_endpoint,
+                timeout_seconds=timeout_seconds,
+            )
+        except AuthError as exc:
+            if _is_terminal_xai_oauth_refresh_error(exc):
+                matched = _patch_xai_oauth_pool_generation(
+                    store,
+                    expected_token_pair_fingerprint=expected_pair,
+                    source_pool_id=locator.credential_id,
+                    remove=True,
+                )
+                if locator.kind == "pool" and matched == 0:
+                    raise AuthStoreConflictError(
+                        "xAI pool source changed before quarantine"
+                    ) from exc
+                providers = store.get("providers")
+                provider_state = (
+                    providers.get("xai-oauth")
+                    if isinstance(providers, dict)
+                    else None
+                )
+                if (
+                    isinstance(provider_state, dict)
+                    and provider_oauth_token_pair_fingerprint(
+                        "xai-oauth", provider_state
+                    )
+                    == expected_pair
+                ):
+                    quarantined = dict(provider_state)
+                    quarantined_tokens = dict(
+                        quarantined.get("tokens") or {}
+                    )
+                    quarantined_tokens.pop("access_token", None)
+                    quarantined_tokens.pop("refresh_token", None)
+                    quarantined["tokens"] = quarantined_tokens
+                    quarantined["last_auth_error"] = {
+                        "provider": "xai-oauth",
+                        "code": exc.code or "xai_refresh_failed",
+                        "message": str(exc),
+                        "reason": "coordinated_refresh_failure",
+                        "relogin_required": True,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    _store_provider_state(
+                        store,
+                        "xai-oauth",
+                        quarantined,
+                        set_active=False,
+                    )
+                _save_auth_store(store, target_path=locator.auth_path)
+            raise
+
+        updated_tokens = dict(tokens)
+        updated_tokens["access_token"] = refreshed["access_token"]
+        updated_tokens["refresh_token"] = refreshed["refresh_token"]
+        for key in ("id_token", "expires_in", "token_type"):
+            value = refreshed.get(key)
+            if value not in (None, ""):
+                updated_tokens[key] = value
+        last_refresh = str(refreshed.get("last_refresh") or "")
+        matched = _patch_xai_oauth_pool_generation(
+            store,
+            expected_token_pair_fingerprint=expected_pair,
+            source_pool_id=locator.credential_id,
+            updated_tokens=updated_tokens,
+            last_refresh=last_refresh,
+            clear_source_health=True,
+        )
+        if locator.kind == "pool" and matched == 0:
+            raise AuthStoreConflictError(
+                "xAI pool source changed during refresh"
+            )
+
+        providers = store.get("providers")
+        provider_state = (
+            providers.get("xai-oauth")
+            if isinstance(providers, dict)
+            else None
+        )
+        if (
+            isinstance(provider_state, dict)
+            and provider_oauth_token_pair_fingerprint(
+                "xai-oauth", provider_state
+            )
+            == expected_pair
+        ):
+            updated_state = dict(provider_state)
+            updated_state["tokens"] = dict(updated_tokens)
+            updated_state["last_refresh"] = last_refresh
+            if token_endpoint:
+                updated_state["discovery"] = {
+                    "token_endpoint": token_endpoint
+                }
+            if redirect_uri:
+                updated_state["redirect_uri"] = redirect_uri
+            _store_provider_state(
+                store,
+                "xai-oauth",
+                updated_state,
+                set_active=False,
+            )
+        elif locator.kind == "singleton":
+            raise AuthStoreConflictError(
+                "xAI singleton changed during refresh"
+            )
+
+        _save_auth_store(store, target_path=locator.auth_path)
+        return {
+            "tokens": updated_tokens,
+            "last_refresh": last_refresh,
+            "discovery": {"token_endpoint": token_endpoint}
+            if token_endpoint
+            else {},
+            "redirect_uri": redirect_uri,
+            "auth_mode": (state or {}).get("auth_mode")
+            or "oauth_device_code",
+            "adopted": False,
+            "auth_path": str(locator.auth_path),
+            "credential_id": locator.credential_id,
+        }
+
+
+def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+    if _lock:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+    else:
+        auth_store = _load_auth_store()
+    state = _xai_oauth_state_from_store(auth_store)
+    if not _xai_oauth_state_has_usable_tokens(state):
+        global_state = _xai_oauth_state_from_store(_load_global_auth_store())
+        if _xai_oauth_state_has_usable_tokens(global_state):
+            state = global_state
+    return _xai_oauth_data_from_state(state)
 
 
 def _profile_has_own_xai_oauth_state(auth_store: Dict[str, Any]) -> bool:
@@ -4144,7 +7528,11 @@ def _profile_has_own_xai_oauth_state(auth_store: Dict[str, Any]) -> bool:
     return isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict)
 
 
-def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
+def _write_through_xai_oauth_to_global_root(
+    state: Dict[str, Any],
+    *,
+    expected_token_pair_fingerprint: str,
+) -> None:
     """Persist a rotated xAI OAuth ``state`` into the global-root auth.json.
 
     Best-effort write-through for the multi-profile rotation hazard (#43589):
@@ -4177,14 +7565,29 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
             except Exception:
                 return
     try:
-        if global_path.exists():
-            global_store = _load_auth_store(global_path)
-        else:
-            global_store = {}
-        if not isinstance(global_store, dict):
-            return
-        _store_provider_state(global_store, "xai-oauth", dict(state), set_active=False)
-        _save_auth_store(global_store, global_path)
+        def _patch(global_store: Dict[str, Any]) -> None:
+            providers = global_store.get("providers")
+            current_state = (
+                providers.get("xai-oauth")
+                if isinstance(providers, dict)
+                else None
+            )
+            if (
+                not isinstance(current_state, dict)
+                or provider_oauth_token_pair_fingerprint(
+                    "xai-oauth",
+                    current_state,
+                )
+                != expected_token_pair_fingerprint
+            ):
+                raise AuthStoreConflictError(
+                    "Provider state changed before global write-through"
+                )
+            _store_provider_state(
+                global_store, "xai-oauth", dict(state), set_active=False
+            )
+
+        mutate_auth_store(_patch, target_path=global_path)
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug("xAI OAuth: write-through to global root failed: %s", exc)
 
@@ -4196,17 +7599,17 @@ def _save_xai_oauth_tokens(
     redirect_uri: str = "",
     last_refresh: Optional[str] = None,
     auth_mode: str = "oauth_device_code",
+    expected_root_token_pair_fingerprint: Optional[str] = None,
 ) -> None:
+    del expected_root_token_pair_fingerprint
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
         auth_store = _load_auth_store()
-        # A profile that lacks its own xai-oauth block is reading the root
-        # grant through _load_provider_state's fallback. When such a profile
-        # refreshes the (rotating) grant, we must write the rotated chain back
-        # to root too, or root is left holding a revoked refresh token (#43589).
-        write_through_to_root = not _profile_has_own_xai_oauth_state(auth_store)
-        state = _load_provider_state(auth_store, "xai-oauth") or {}
+        # This helper is used by fresh device-code login flows. A named
+        # profile creates its own grant rather than overwriting the root
+        # fallback. Runtime refresh uses the exact-source coordinator.
+        state = _load_local_provider_state(auth_store, "xai-oauth") or {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -4216,8 +7619,6 @@ def _save_xai_oauth_tokens(
             state["redirect_uri"] = redirect_uri
         _save_provider_state(auth_store, "xai-oauth", state)
         _save_auth_store(auth_store)
-        if write_through_to_root:
-            _write_through_xai_oauth_to_global_root(state)
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -4516,59 +7917,19 @@ def refresh_xai_oauth_pure(
     return updated
 
 
-def _refresh_xai_oauth_tokens(
-    tokens: Dict[str, Any],
-    *,
-    token_endpoint: str,
-    redirect_uri: str = "",
-    timeout_seconds: float,
-) -> Dict[str, Any]:
-    # Re-persist whatever auth_mode is already stored (legacy pre-device-code
-    # logins may still carry ``oauth_pkce``): the refresh hot path must not
-    # relabel how the grant was originally obtained.
-    try:
-        state = _load_provider_state(_load_auth_store(), "xai-oauth") or {}
-        auth_mode = str(state.get("auth_mode") or "oauth_device_code")
-    except Exception:
-        auth_mode = "oauth_device_code"
-    refreshed = refresh_xai_oauth_pure(
-        str(tokens.get("access_token", "") or ""),
-        str(tokens.get("refresh_token", "") or ""),
-        token_endpoint=token_endpoint,
-        timeout_seconds=timeout_seconds,
-    )
-    updated_tokens = dict(tokens)
-    updated_tokens["access_token"] = refreshed["access_token"]
-    updated_tokens["refresh_token"] = refreshed["refresh_token"]
-    if refreshed.get("id_token"):
-        updated_tokens["id_token"] = refreshed["id_token"]
-    if refreshed.get("expires_in") is not None:
-        updated_tokens["expires_in"] = refreshed["expires_in"]
-    if refreshed.get("token_type"):
-        updated_tokens["token_type"] = refreshed["token_type"]
-    _save_xai_oauth_tokens(
-        updated_tokens,
-        discovery={"token_endpoint": token_endpoint},
-        redirect_uri=redirect_uri,
-        last_refresh=refreshed["last_refresh"],
-        auth_mode=auth_mode,
-    )
-    return updated_tokens
-
-
 def resolve_xai_oauth_runtime_credentials(
     *,
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
-    data = _read_xai_oauth_tokens()
+    # Atomic auth.json replacement makes this unlocked snapshot safe and lets
+    # concurrent callers capture the same pre-rotation generation before one
+    # of them acquires the source lock. The coordinator re-reads strictly.
+    data = _read_xai_oauth_tokens(_lock=False)
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
-    discovery = dict(data.get("discovery") or {})
-    token_endpoint = str(discovery.get("token_endpoint", "") or "").strip()
-    redirect_uri = str(data.get("redirect_uri", "") or "").strip()
 
     effective_skew = (
         int(refresh_skew_seconds)
@@ -4579,59 +7940,13 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_xai_oauth_tokens(_lock=False)
-            tokens = dict(data["tokens"])
-            access_token = str(tokens.get("access_token", "") or "").strip()
-            discovery = dict(data.get("discovery") or {})
-            token_endpoint = str(discovery.get("token_endpoint", "") or "").strip()
-            redirect_uri = str(data.get("redirect_uri", "") or "").strip()
-            effective_skew = (
-                int(refresh_skew_seconds)
-                if refresh_skew_seconds is not None
-                else _xai_proactive_refresh_skew_seconds(access_token)
-            )
-            should_refresh = bool(force_refresh)
-            if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
-            if should_refresh:
-                if not token_endpoint:
-                    token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]
-                try:
-                    tokens = _refresh_xai_oauth_tokens(
-                        tokens,
-                        token_endpoint=token_endpoint,
-                        redirect_uri=redirect_uri,
-                        timeout_seconds=refresh_timeout_seconds,
-                    )
-                    access_token = str(tokens.get("access_token", "") or "").strip()
-                except AuthError as exc:
-                    if _is_terminal_xai_oauth_refresh_error(exc):
-                        # Terminal failure (HTTP 400/401/403 — invalid_grant, token revoked).
-                        # Clear dead tokens from auth.json so subsequent sessions fail fast
-                        # without a network retry. Mirrors credential_pool.py quarantine.
-                        try:
-                            _q_store = _load_auth_store()
-                            _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
-                            _q_tokens = dict(_q_state.get("tokens") or {})
-                            _q_tokens.pop("access_token", None)
-                            _q_tokens.pop("refresh_token", None)
-                            _q_state["tokens"] = _q_tokens
-                            _q_state["last_auth_error"] = {
-                                "provider": "xai-oauth",
-                                "code": exc.code or "xai_refresh_failed",
-                                "message": str(exc),
-                                "reason": "runtime_refresh_failure",
-                                "relogin_required": True,
-                                "at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
-                            _save_auth_store(_q_store)
-                        except Exception as _save_exc:
-                            logger.debug(
-                                "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
-                            )
-                    raise
+        data = refresh_xai_oauth_coordinated(
+            expected_access_token=str(tokens.get("access_token") or ""),
+            expected_refresh_token=str(tokens.get("refresh_token") or ""),
+            timeout_seconds=refresh_timeout_seconds,
+        )
+        tokens = dict(data["tokens"])
+        access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = _xai_validate_inference_base_url(
         os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
@@ -5089,6 +8404,7 @@ def _quarantine_nous_oauth_state(
     error: AuthError,
     *,
     reason: str,
+    auth_path: Optional[Path] = None,
 ) -> None:
     """Keep routing metadata but remove dead OAuth material so it is not replayed."""
     # Forensic logging BEFORE we clear the token material. A NAS-hosted Fly agent
@@ -5113,10 +8429,10 @@ def _quarantine_nous_oauth_state(
 
     # On-disk integrity of the auth store at the moment of quarantine.
     try:
-        auth_path = _auth_file_path()
-        forensic["auth_json_path"] = str(auth_path)
+        forensic_path = auth_path or _auth_file_path()
+        forensic["auth_json_path"] = str(forensic_path)
         try:
-            st = os.stat(auth_path)
+            st = os.stat(forensic_path)
             forensic["auth_json_size"] = st.st_size
             forensic["auth_json_mtime"] = st.st_mtime
             forensic["auth_json_exists"] = True
@@ -5408,9 +8724,11 @@ def resolve_nous_access_token(
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state, state_source_path = _load_provider_state_with_source(auth_store, "nous")
+    with _locked_provider_auth_store("nous") as (
+        auth_store,
+        state,
+        state_source_path,
+    ):
 
         if not state:
             raise AuthError(
@@ -5488,6 +8806,7 @@ def resolve_nous_access_token(
                             state,
                             exc,
                             reason="managed_access_token_refresh_failure",
+                            auth_path=state_source_path,
                         )
                         _quarantine_nous_pool_entries(
                             auth_store,
@@ -5727,6 +9046,8 @@ def resolve_nous_runtime_credentials(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     force_refresh: bool = False,
+    sync_pool: bool = True,
+    source_auth_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Resolve Nous inference credentials for runtime use.
@@ -5739,9 +9060,14 @@ def resolve_nous_runtime_credentials(
     """
     sequence_id = uuid.uuid4().hex[:12]
 
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state, state_source_path = _load_provider_state_with_source(auth_store, "nous")
+    with _locked_provider_auth_store(
+        "nous",
+        source_auth_path=source_auth_path,
+    ) as (
+        auth_store,
+        state,
+        state_source_path,
+    ):
 
         if not state:
             raise AuthError("Hermes is not logged into Nous Portal.",
@@ -5899,6 +9225,7 @@ def resolve_nous_runtime_credentials(
                                     state,
                                     exc,
                                     reason="runtime_access_refresh_failure",
+                                    auth_path=state_source_path,
                                 )
                                 _quarantine_nous_pool_entries(
                                     auth_store,
@@ -5967,7 +9294,7 @@ def resolve_nous_runtime_credentials(
 
         _persist_state("resolve_nous_runtime_credentials_final")
 
-    if state_persisted:
+    if state_persisted and sync_pool:
         _sync_nous_pool_from_auth_store()
 
     api_key = state.get("agent_key")
@@ -7095,26 +10422,6 @@ def _login_openai_codex(
                 print("Existing Codex credentials are expired. Starting fresh login...")
         except AuthError:
             pass
-
-    # Check for existing Codex CLI tokens we can import
-    if not force_new_login:
-        cli_tokens = _import_codex_cli_tokens()
-        if cli_tokens:
-            print("Found existing Codex CLI credentials at ~/.codex/auth.json")
-            print("Hermes will create its own session to avoid conflicts with Codex CLI / VS Code.")
-            try:
-                do_import = input("Import these credentials? (a separate login is recommended) [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                do_import = "n"
-            if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
-                base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
-                config_path = _update_config_for_provider("openai-codex", base_url)
-                print()
-                print("Credentials imported. Note: if Codex CLI refreshes its token,")
-                print("Hermes will keep working independently with its own session.")
-                print(f"  Config updated: {config_path} (model.provider=openai-codex)")
-                return
 
     # Run a fresh device code flow — Hermes gets its own OAuth session
     print()

@@ -65,7 +65,7 @@ hermes profile install github.com/you/my-research-agent --alias
 
 不适合的场景：
 
-- **你只想在自己的机器上备份一个 profile。** 使用 [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export)——那正是这两个命令的用途。
+- **你需要包含 profile 根凭据和机器本地状态的完整本机备份。** 使用 [`hermes backup`](../reference/cli-commands.md#hermes-backup)。`profile export` / `import` 是可移植迁移，会刻意排除这些文件。
 - **你想随 agent 一起共享 API 密钥。** `auth.json` 和 `.env` 被刻意排除在分发之外。每个安装者使用自己的凭据。
 - **你想共享记忆 / 会话 / 对话历史。** 这些是用户数据，不是分发内容，永远不会被发送。
 
@@ -567,7 +567,7 @@ Profile 分发默认不带签名。你信任的是：
 
 - [Profiles：运行多个 Agent](./profiles.md) — 基础概念
 - [Profile 命令参考](../reference/profile-commands.md) — 每个标志、每个选项
-- [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export) — 本地备份 / 恢复（非分发）
+- [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export) — 可移植 profile 迁移，不是完整备份或分发
 - [在 Hermes 中使用 SOUL](../guides/use-soul-with-hermes.md) — 编写个性
 - [个性与 SOUL](./features/personality.md) — SOUL 在 agent 中的作用
 - [技能目录](../reference/skills-catalog.md) — 可打包的技能

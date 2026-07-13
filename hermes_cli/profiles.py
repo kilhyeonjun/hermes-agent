@@ -12,7 +12,7 @@ Usage::
 
     hermes profile create coder          # fresh profile + bundled skills
     hermes profile create coder --clone  # also copy config, .env, SOUL.md, skills
-    hermes profile create coder --clone-all  # full copy of source profile
+    hermes profile create coder --clone-all  # working-state copy; excludes auth/history
     coder chat                           # use via wrapper alias
     hermes -p coder chat                 # or via flag
     hermes profile use coder             # set as sticky default
@@ -20,6 +20,7 @@ Usage::
 """
 
 import json
+import errno
 import os
 import re
 import shlex
@@ -28,9 +29,11 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -125,6 +128,136 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "checkpoints",
 })
 
+# Canonical auth transaction artifacts are never byte-copied into another
+# profile. OAuth refresh tokens may be single-use, and copying auth.lock would
+# split the lock inode between writers. Static API keys in .env remain part of
+# the explicit --clone/--clone-all contract; portable export/import excludes
+# those separately below.
+_CLONE_ALL_AUTH_EXCLUDE_ROOT: frozenset[str] = frozenset({
+    "auth.json",
+    "auth.lock",
+    ".op.env",
+})
+
+_PORTABLE_PROFILE_CREDENTIAL_FILES: frozenset[str] = frozenset({
+    "auth.json",
+    "auth.lock",
+    ".env",
+    ".op.env",
+})
+
+# Machine-local roots that are never portable profile data. ``home`` is the
+# container tool HOME and may contain external CLI credentials; ``backups``
+# and snapshot/checkpoint trees may recursively contain older secret-bearing
+# state. Use the canonical ``hermes backup`` workflow for a full local backup.
+_PORTABLE_PROFILE_EXCLUDE_ROOT: frozenset[str] = frozenset({
+    "home",
+    "backups",
+    "state-snapshots",
+    "checkpoints",
+})
+
+_PROFILE_ENV_PLACEHOLDER = (
+    "# Per-profile secrets for this Hermes profile.\n"
+    "# Add API keys and tokens explicitly; root/shell credentials are not inherited.\n"
+    "# Behavioral settings belong in config.yaml, not here.\n"
+)
+
+_PROFILE_ARCHIVE_MAX_MEMBERS = 10_000
+_PROFILE_ARCHIVE_MAX_FILE_BYTES = 128 * 1024 * 1024
+_PROFILE_ARCHIVE_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+_PROFILE_ARCHIVE_MAX_DEPTH = 64
+_PROFILE_ARCHIVE_MAX_PATH_BYTES = 4096
+_PROFILE_ARCHIVE_MAX_METADATA_RECORD_BYTES = 1024 * 1024
+_PROFILE_ARCHIVE_MAX_METADATA_TOTAL_BYTES = 64 * 1024 * 1024
+_PROFILE_ARCHIVE_MAX_RAW_HEADERS = (_PROFILE_ARCHIVE_MAX_MEMBERS * 3) + 64
+_PROFILE_ARCHIVE_MAX_TRAILING_ZERO_BYTES = 1024 * 1024
+_PROFILE_ARCHIVE_MAX_DECOMPRESSED_BYTES = (
+    _PROFILE_ARCHIVE_MAX_TOTAL_BYTES
+    + _PROFILE_ARCHIVE_MAX_METADATA_TOTAL_BYTES
+    + (_PROFILE_ARCHIVE_MAX_RAW_HEADERS * 512)
+    + _PROFILE_ARCHIVE_MAX_TRAILING_ZERO_BYTES
+)
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+    | {f"com{index}" for index in ("¹", "²", "³")}
+    | {f"lpt{index}" for index in ("¹", "²", "³")}
+)
+_WINDOWS_RESERVED_NAME_CHARACTERS = frozenset('<>:"/\\|?*')
+
+
+def _is_native_windows() -> bool:
+    return os.name == "nt"
+
+
+def _is_windows_reparse_point(entry_stat: os.stat_result) -> bool:
+    if not _is_native_windows():
+        return False
+    attributes = int(getattr(entry_stat, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & reparse_flag)
+
+
+def _set_private_profile_file_mode(fd: int, path: Path, mode: int) -> None:
+    """Apply the strongest file-mode primitive available on this platform."""
+    if _is_native_windows():
+        # Python 3.11/3.12 has no fd-based chmod on Windows. Path chmod maps
+        # only the owner-write bit to the Windows read-only attribute; the
+        # containing user-profile ACL remains the access-control boundary.
+        windows_mode = stat.S_IREAD
+        if mode & stat.S_IWUSR:
+            windows_mode |= stat.S_IWRITE
+        path.chmod(windows_mode)
+        return
+    os.fchmod(fd, mode)
+
+
+def _sync_profile_directory(path: Path) -> None:
+    """Persist a directory entry on POSIX; validate it on native Windows."""
+    if _is_native_windows():
+        entry_stat = path.lstat()
+        if (
+            not stat.S_ISDIR(entry_stat.st_mode)
+            or stat.S_ISLNK(entry_stat.st_mode)
+            or _is_windows_reparse_point(entry_stat)
+        ):
+            raise OSError(errno.ELOOP, "profile directory is a reparse point")
+        # The Windows CRT cannot open a directory fd. File contents are still
+        # flushed before close, and archive publication uses write-through
+        # replacement where Windows exposes it.
+        return
+    directory_fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _create_private_profile_env(path: Path) -> None:
+    """Create a durable, independent 0600 profile-root environment file."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        _set_private_profile_file_mode(fd, path, 0o600)
+        payload = _PROFILE_ENV_PLACEHOLDER.encode("utf-8")
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        _sync_profile_directory(path.parent)
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
+
 # Marker file written by `hermes profile create --no-skills`.  When present in
 # a profile's root, callers of seed_profile_skills() (fresh-create, `hermes
 # update`'s all-profile sync, the web dashboard) skip bundled-skill seeding
@@ -145,16 +278,18 @@ def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
 def _clone_all_copytree_ignore(source_dir: Path):
     """Exclude infrastructure artifacts when cloning a profile via --clone-all.
 
-    Three categories:
+    Four categories:
       1. Root-level entries in ``_CLONE_ALL_HISTORY_EXCLUDE_ROOT`` — session
          history, backups, and snapshots that belong to the SOURCE profile
          and should never carry into a fresh clone.  Applies to any source.
-      2. Root-level entries in ``_CLONE_ALL_DEFAULT_EXCLUDE_ROOT`` — known
+      2. Root-level entries in ``_CLONE_ALL_AUTH_EXCLUDE_ROOT`` — canonical
+         auth state and its lock, which must never be byte-cloned.
+      3. Root-level entries in ``_CLONE_ALL_DEFAULT_EXCLUDE_ROOT`` — known
          Hermes infrastructure directories that only the default profile
          (``~/.hermes``) ever contains.  Gated on ``source_dir`` actually
          being the default profile so a named-profile source never has its
          own data silently dropped.
-      3. Universal exclusions at any depth — Python bytecode caches that
+      4. Universal exclusions at any depth — Python bytecode caches that
          are stale or regenerable (``__pycache__``, ``*.pyc``, ``*.pyo``)
          and runtime sockets / temp files (``*.sock``, ``*.tmp``).
 
@@ -184,6 +319,9 @@ def _clone_all_copytree_ignore(source_dir: Path):
                 # over-copy than silently drop user data.
                 at_root = False
             if at_root:
+                if entry.casefold() in _CLONE_ALL_AUTH_EXCLUDE_ROOT:
+                    ignored.append(entry)
+                    continue
                 # History artifacts: excluded for ANY source profile.
                 if entry in _CLONE_ALL_HISTORY_EXCLUDE_ROOT:
                     ignored.append(entry)
@@ -214,6 +352,7 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "gateway.pid", "gateway_state.json", "processes.json",
     "auth.json",            # API keys, OAuth tokens, credential pools
     ".env",                 # API keys (dotenv)
+    ".op.env",              # 1Password service-account bootstrap token
     "auth.lock", "active_profile", ".update_check",
     "errors.log",
     ".hermes_history",
@@ -231,14 +370,16 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
 # artifacts* at the root of HERMES_HOME; everything else is excluded.
 # Sensitive runtime infrastructure (``state.db``, ``logs/``, ``auth.*``,
 # other profiles) is intentionally *not* in this list so the export stays
-# a portable, credential-free snapshot of the user-facing surface
+# a portable snapshot with canonical profile-root credentials filtered
 # (#58394). Add new artifacts here when introduced in ``hermes_constants``.
 _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # Configuration / persona
     "config.yaml", "SOUL.md", "MEMORY.md", "USER.md", "todo.json",
     "system_prompt.md", "AGENTS.md", "CLAUDE.md", ".cursorrules",
+    "profile.yaml", "distribution.yaml", "mcp.json", "honcho.json",
+    NO_BUNDLED_SKILLS_MARKER,
     # User-facing skill, cron, and session artifacts
-    "skills", "cron", "scripts", "sessions",
+    "skills", "cron", "scripts", "sessions", "skins", "plans", "workspace",
     # Plugin / memory surfaces (per-profile overrides live here)
     "plugins", "memories", "knowledge", "preferences",
 })
@@ -372,12 +513,32 @@ def get_profile_dir(name: str) -> Path:
     return _get_profiles_root() / canon
 
 
+def _is_regular_profile_directory(path: Path) -> bool:
+    """Return whether *path* is an on-disk directory, never a symlink."""
+    try:
+        entry_stat = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(entry_stat.st_mode)
+        and not stat.S_ISLNK(entry_stat.st_mode)
+        and not _is_windows_reparse_point(entry_stat)
+    )
+
+
+def _require_regular_profile_directory(path: Path) -> None:
+    if not _is_regular_profile_directory(path):
+        raise ValueError(
+            f"Profile home must be a regular directory, not a link: {path}"
+        )
+
+
 def profile_exists(name: str) -> bool:
     """Check whether a profile directory exists."""
     canon = normalize_profile_name(name)
     if canon == "default":
         return True
-    return get_profile_dir(canon).is_dir()
+    return _is_regular_profile_directory(get_profile_dir(canon))
 
 
 # ---------------------------------------------------------------------------
@@ -909,12 +1070,12 @@ def list_profiles() -> List[ProfileInfo]:
         # wrapper dir each time — O(N*M), the dominant cost in this function).
         alias_map = build_alias_map()
         for entry in sorted(profiles_root.iterdir()):
-            if not entry.is_dir():
-                continue
             name = entry.name
             if name == "default":
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
+                continue
+            if not _is_regular_profile_directory(entry):
                 continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
@@ -968,20 +1129,22 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     """
     active = get_active_profile_name() or "default"
     if not multiplex:
-        return [(active, get_profile_dir(active))]
+        active_home = get_profile_dir(active)
+        if active != "default":
+            _require_regular_profile_directory(active_home)
+        return [(active, active_home)]
 
     serve: List[Tuple[str, Path]] = [("default", _get_default_hermes_home())]
 
     profiles_root = _get_profiles_root()
     if profiles_root.is_dir():
         for entry in sorted(profiles_root.iterdir()):
-            if not entry.is_dir():
-                continue
             name = entry.name
             if name == "default":
                 continue  # default is the built-in entry already added above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            _require_regular_profile_directory(entry)
             serve.append((name, entry))
 
     return serve
@@ -1006,7 +1169,8 @@ def create_profile(
         Source profile to clone from. If ``None`` and clone_config/clone_all
         is True, defaults to the currently active profile.
     clone_all:
-        If True, do a full copytree of the source (all state).
+        If True, copy working profile state except per-profile history and the
+        canonical auth.json/auth.lock transaction artifacts.
     clone_config:
         If True, copy config files (config.yaml, .env, SOUL.md), installed
         skills, and selected profile identity files from the source profile.
@@ -1051,13 +1215,24 @@ def create_profile(
             clone_from = normalize_profile_name(clone_from)
             validate_profile_name(clone_from)
             source_dir = get_profile_dir(clone_from)
-        if not source_dir.is_dir():
+        if not _is_regular_profile_directory(source_dir):
             raise FileNotFoundError(
                 f"Source profile '{clone_from or 'active'}' does not exist at {source_dir}"
             )
+        source_env = source_dir / ".env"
+        if os.path.lexists(source_env):
+            source_env_stat = source_env.lstat()
+            if (
+                not stat.S_ISREG(source_env_stat.st_mode)
+                or stat.S_ISLNK(source_env_stat.st_mode)
+            ):
+                raise ValueError(
+                    "Clone source .env must be a regular file, not a link"
+                )
 
     if clone_all and source_dir:
-        # Full copy of source profile (exclude sibling ~/.hermes/profiles/)
+        # Working copy of the source profile. Never duplicate sibling profiles,
+        # per-profile history, or canonical auth transaction artifacts.
         shutil.copytree(
             source_dir,
             profile_dir,
@@ -1067,6 +1242,16 @@ def create_profile(
         # Strip runtime files
         for stale in _CLONE_ALL_STRIP:
             (profile_dir / stale).unlink(missing_ok=True)
+        cloned_env = profile_dir / ".env"
+        if cloned_env.exists():
+            cloned_env_stat = cloned_env.lstat()
+            if (
+                not stat.S_ISREG(cloned_env_stat.st_mode)
+                or stat.S_ISLNK(cloned_env_stat.st_mode)
+                or getattr(cloned_env_stat, "st_nlink", 1) != 1
+            ):
+                raise ValueError("Cloned .env is not an independent regular file")
+            os.chmod(cloned_env, 0o600)
     else:
         # Bootstrap directory structure
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -1113,15 +1298,9 @@ def create_profile(
     # environment — users reasonably read that as "the new profile reads
     # the root .env". Skipped when --clone/--clone-all already copied one.
     env_path = profile_dir / ".env"
-    if not env_path.exists():
+    if not os.path.lexists(env_path):
         try:
-            env_path.write_text(
-                "# Per-profile secrets for this Hermes profile.\n"
-                "# API keys and tokens set here override the shell environment.\n"
-                "# Behavioral settings belong in config.yaml, not here.\n",
-                encoding="utf-8",
-            )
-            os.chmod(str(env_path), 0o600)
+            _create_private_profile_env(env_path)
         except OSError:
             pass  # best-effort — save_env_value creates the file on demand
 
@@ -1226,20 +1405,11 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
 
 
 def backfill_profile_envs(quiet: bool = False) -> List[str]:
-    """Give every named profile that predates per-profile ``.env`` files one.
+    """Create private placeholders for legacy profiles missing ``.env``.
 
-    Profiles created before the dashboard/CLI started seeding a ``.env``
-    (PR #44792) have none, so once the Channels/Keys endpoints became
-    profile-scoped those profiles stopped inheriting the root install's
-    credentials and showed everything as unconfigured. To avoid breaking
-    anyone on update, copy the DEFAULT install's ``.env`` into each named
-    profile that lacks one — that preserves the effective credentials those
-    profiles were already running with (they previously read the root
-    ``.env`` via the process environment). Users can then diverge per
-    profile from there.
-
-    Falls back to the placeholder header when the default install has no
-    ``.env`` itself. Never overwrites an existing profile ``.env``.
+    Root credentials are never copied into a named profile. Symlink profile
+    directories and any pre-existing non-regular ``.env`` entry are skipped
+    fail-closed.
 
     Returns the list of profile names that received a backfilled ``.env``.
     """
@@ -1248,27 +1418,37 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     if not profiles_root.is_dir():
         return backfilled
 
-    default_env = _get_default_hermes_home() / ".env"
-
     for entry in sorted(profiles_root.iterdir()):
-        if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
+        try:
+            entry_stat = entry.lstat()
+        except OSError:
+            continue
+        if (
+            not stat.S_ISDIR(entry_stat.st_mode)
+            or stat.S_ISLNK(entry_stat.st_mode)
+            or not _PROFILE_ID_RE.match(entry.name)
+        ):
             continue
         if entry.name == "default":
             continue
         env_path = entry / ".env"
-        if env_path.exists():
+        if os.path.lexists(env_path):
+            try:
+                env_stat = env_path.lstat()
+            except OSError:
+                continue
+            if (
+                not stat.S_ISREG(env_stat.st_mode)
+                or stat.S_ISLNK(env_stat.st_mode)
+                or getattr(env_stat, "st_nlink", 1) != 1
+            ):
+                if not quiet:
+                    print(
+                        f"⚠ Refusing unsafe .env entry for profile '{entry.name}'"
+                    )
             continue
         try:
-            if default_env.is_file():
-                shutil.copy2(default_env, env_path)
-            else:
-                env_path.write_text(
-                    "# Per-profile secrets for this Hermes profile.\n"
-                    "# API keys and tokens set here override the shell environment.\n"
-                    "# Behavioral settings belong in config.yaml, not here.\n",
-                    encoding="utf-8",
-                )
-            os.chmod(str(env_path), 0o600)
+            _create_private_profile_env(env_path)
             backfilled.append(entry.name)
         except OSError as e:
             if not quiet:
@@ -1480,6 +1660,8 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     profile_dir = get_profile_dir(canon)
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+    if profile_dir.is_symlink():
+        raise ValueError("Refusing to delete a symlinked profile directory")
 
     # Show what will be deleted
     model, provider = _read_config_model(profile_dir)
@@ -1544,12 +1726,38 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     # guard — resurrected the deleted tree.
     _stop_profile_backends(canon, profile_dir)
 
-    # 3. Remove wrapper script
+    # 3. Recover/quarantine any Codex WAL that targets this profile, then
+    # atomically retire the directory while the host mutation lock is held.
+    # The slower recursive deletion happens from the private tombstone path.
+    from hermes_cli.auth import _retire_codex_auth_store
+
+    retirement_root = profile_dir.parent.parent / ".profile-trash"
+    try:
+        retirement_root.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if retirement_root.is_symlink() or not retirement_root.is_dir():
+            raise ValueError("Profile retirement root is unsafe")
+        retirement_root.chmod(0o700)
+    except OSError as exc:
+        raise RuntimeError("Could not prepare private profile retirement root") from exc
+    retired_dir = retirement_root / (
+        f"{canon}.deleting-{uuid.uuid4().hex}"
+    )
+    with _retire_codex_auth_store(
+        profile_dir / "auth.json",
+        reason="profile_delete",
+    ):
+        if os.path.lexists(retired_dir):
+            raise FileExistsError(
+                f"Profile retirement path already exists: {retired_dir}"
+            )
+        profile_dir.rename(retired_dir)
+
+    # 4. Remove wrapper script after the profile is no longer addressable.
     if has_wrapper:
         if remove_wrapper_script(canon):
             print(f"✓ Removed {wrapper_path}")
 
-    # 4. Remove profile directory
+    # 5. Remove the retired profile tree.
     remove_error: Exception | None = None
     try:
         def _make_writable(func, path, exc):
@@ -1589,13 +1797,22 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             else:
                 raise
 
-        _rmtree_with_retry(profile_dir, _make_writable)
+        _rmtree_with_retry(retired_dir, _make_writable)
         print(f"✓ Removed {profile_dir}")
     except Exception as e:
         print(f"⚠ Could not remove {profile_dir}: {e}")
         remove_error = e
+        if os.path.lexists(retired_dir) and not os.path.lexists(profile_dir):
+            try:
+                with _retire_codex_auth_store(
+                    retired_dir / "auth.json",
+                    reason="profile_delete_rollback",
+                ):
+                    retired_dir.rename(profile_dir)
+            except Exception:
+                pass
 
-    # 5. Clear active_profile if it pointed to this profile
+    # 6. Clear active_profile if it pointed to this profile
     try:
         active = get_active_profile()
         if active == canon:
@@ -1877,24 +2094,423 @@ def _default_export_ignore(root_dir: Path):
     All other profile artifacts are copied through untouched.
     """
 
+    root_key = root_dir.absolute()
+    protected_inodes: set[tuple[int, int]] = set()
+    for credential_name in _PORTABLE_PROFILE_CREDENTIAL_FILES:
+        candidate = root_dir / credential_name
+        try:
+            candidate_stat = candidate.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(candidate_stat.st_mode) and not stat.S_ISLNK(
+            candidate_stat.st_mode
+        ):
+            protected_inodes.add((candidate_stat.st_dev, candidate_stat.st_ino))
+
     def _ignore(directory: str, contents: list) -> set:
         ignored: set = set()
+        directory_path = Path(directory)
         for entry in contents:
             # Universal exclusions (any depth)
             if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
                 ignored.add(entry)
-            # npm lockfiles can appear at root
-            elif entry in {"package.json", "package-lock.json"}:
-                ignored.add(entry)
+            else:
+                try:
+                    entry_stat = (directory_path / entry).lstat()
+                except OSError:
+                    ignored.add(entry)
+                    continue
+                if (
+                    stat.S_ISREG(entry_stat.st_mode)
+                    and (entry_stat.st_dev, entry_stat.st_ino)
+                    in protected_inodes
+                ):
+                    ignored.add(entry)
+                elif (
+                    stat.S_ISREG(entry_stat.st_mode)
+                    and getattr(entry_stat, "st_nlink", 1) > 1
+                ):
+                    raise ValueError(
+                        "Profile export cannot include hard-linked files"
+                    )
         # Root-level allow-list: drop everything that isn't a known
         # Hermes profile artifact.
-        if Path(directory) == root_dir:
+        if directory_path.absolute() == root_key:
             ignored.update(
                 entry for entry in contents if entry not in _DEFAULT_EXPORT_INCLUDE_ROOT
             )
         return ignored
 
     return _ignore
+
+
+def _named_export_ignore(root_dir: Path):
+    """Exclude machine-local roots, credentials, and hard-link aliases."""
+    root_key = root_dir.absolute()
+    protected_inodes: set[tuple[int, int]] = set()
+    for credential_name in _PORTABLE_PROFILE_CREDENTIAL_FILES:
+        candidate = root_dir / credential_name
+        try:
+            candidate_stat = candidate.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(candidate_stat.st_mode) and not stat.S_ISLNK(
+            candidate_stat.st_mode
+        ):
+            protected_inodes.add((candidate_stat.st_dev, candidate_stat.st_ino))
+
+    def _ignore(directory: str, contents: list) -> set[str]:
+        directory_path = Path(directory)
+        ignored: set[str] = set()
+        for entry in contents:
+            if entry == "__pycache__" or entry.endswith(
+                (".pyc", ".pyo", ".sock", ".tmp")
+            ):
+                ignored.add(entry)
+                continue
+            if (
+                directory_path.absolute() == root_key
+                and (
+                    entry.casefold() in _PORTABLE_PROFILE_CREDENTIAL_FILES
+                    or entry.casefold() in _PORTABLE_PROFILE_EXCLUDE_ROOT
+                )
+            ):
+                ignored.add(entry)
+                continue
+            try:
+                entry_stat = (directory_path / entry).lstat()
+            except OSError:
+                ignored.add(entry)
+                continue
+            if (
+                stat.S_ISREG(entry_stat.st_mode)
+                and (entry_stat.st_dev, entry_stat.st_ino)
+                in protected_inodes
+            ):
+                ignored.add(entry)
+            elif (
+                stat.S_ISREG(entry_stat.st_mode)
+                and getattr(entry_stat, "st_nlink", 1) > 1
+            ):
+                raise ValueError(
+                    "Profile export cannot include hard-linked files"
+                )
+        return ignored
+
+    return _ignore
+
+
+def _assert_portable_tree_has_no_symlinks(root_dir: Path) -> None:
+    """Reject archives that export can create but import cannot restore."""
+    for directory, dirnames, filenames in os.walk(
+        root_dir, topdown=True, followlinks=False
+    ):
+        directory_path = Path(directory)
+        for name in [*dirnames, *filenames]:
+            candidate = directory_path / name
+            try:
+                candidate_stat = candidate.lstat()
+            except OSError as exc:
+                raise ValueError(
+                    f"Profile export cannot inspect path: {candidate}"
+                ) from exc
+            if stat.S_ISLNK(candidate_stat.st_mode):
+                raise ValueError(
+                    "Profile export cannot include symlinks; replace the link "
+                    "with portable profile data or use `hermes backup`"
+                )
+
+
+def _portable_tree_signature(entry_stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(entry_stat.st_dev),
+        int(entry_stat.st_ino),
+        int(entry_stat.st_mode),
+        int(entry_stat.st_size),
+        int(getattr(entry_stat, "st_mtime_ns", 0)),
+        int(getattr(entry_stat, "st_ctime_ns", 0)),
+    )
+
+
+def _validated_portable_profile_tree_entries(
+    root_dir: Path,
+    archive_root: str,
+) -> List[tuple[Path, str, tuple[int, ...]]]:
+    """Return the exact bounded entry set that export is allowed to archive."""
+    entries: List[tuple[Path, str, tuple[int, ...]]] = []
+    total_bytes = 0
+
+    def _append(candidate: Path) -> None:
+        nonlocal total_bytes
+        try:
+            entry_stat = candidate.lstat()
+            relative = candidate.relative_to(root_dir)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"Profile export cannot inspect path: {candidate}"
+            ) from exc
+        member_name = (
+            archive_root
+            if relative == Path(".")
+            else f"{archive_root}/{relative.as_posix()}"
+        )
+        _normalize_profile_archive_parts(member_name)
+        if stat.S_ISLNK(entry_stat.st_mode):
+            raise ValueError(
+                "Profile export cannot include symlinks; use hermes backup"
+            )
+        if stat.S_ISREG(entry_stat.st_mode):
+            if getattr(entry_stat, "st_nlink", 1) != 1:
+                raise ValueError("Profile export cannot include hard-linked files")
+            if entry_stat.st_size > _PROFILE_ARCHIVE_MAX_FILE_BYTES:
+                raise ValueError("Profile archive member is too large")
+            total_bytes += int(entry_stat.st_size)
+            if total_bytes > _PROFILE_ARCHIVE_MAX_TOTAL_BYTES:
+                raise ValueError("Profile archive expands beyond the size limit")
+        elif not stat.S_ISDIR(entry_stat.st_mode):
+            raise ValueError(
+                f"Profile export cannot include special files: {candidate}"
+            )
+        entries.append(
+            (candidate, member_name, _portable_tree_signature(entry_stat))
+        )
+        if len(entries) > _PROFILE_ARCHIVE_MAX_MEMBERS:
+            raise ValueError("Profile archive contains too many members")
+
+    _append(root_dir)
+    for directory, dirnames, filenames in os.walk(
+        root_dir,
+        topdown=True,
+        followlinks=False,
+    ):
+        dirnames.sort()
+        filenames.sort()
+        directory_path = Path(directory)
+        for name in dirnames:
+            _append(directory_path / name)
+        for name in filenames:
+            _append(directory_path / name)
+    return entries
+
+
+def _add_validated_portable_profile_tree(
+    tf: Any,
+    entries: List[tuple[Path, str, tuple[int, ...]]],
+) -> None:
+    for source_path, member_name, expected_signature in entries:
+        try:
+            current_signature = _portable_tree_signature(source_path.lstat())
+        except OSError as exc:
+            raise ValueError(
+                f"Profile export source disappeared: {source_path}"
+            ) from exc
+        if current_signature != expected_signature:
+            raise ValueError("Profile export staging tree changed during archive")
+        tf.add(source_path, arcname=member_name, recursive=False)
+
+
+def _portable_profile_tree_digest(root_dir: Path, archive_root: str) -> str:
+    """Hash portable names, types, modes, and file bytes for snapshot parity."""
+    import hashlib
+
+    digest = hashlib.sha256()
+
+    def _frame(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    entries = _validated_portable_profile_tree_entries(root_dir, archive_root)
+    for source_path, member_name, expected_signature in entries:
+        entry_stat = source_path.lstat()
+        if _portable_tree_signature(entry_stat) != expected_signature:
+            raise ValueError("Profile export staging tree changed during digest")
+        _frame(member_name.encode("utf-8", errors="surrogateescape"))
+        _frame(
+            (
+                "dir" if stat.S_ISDIR(entry_stat.st_mode) else "file"
+            ).encode("ascii")
+        )
+        _frame(str(stat.S_IMODE(entry_stat.st_mode)).encode("ascii"))
+        _frame(str(entry_stat.st_size).encode("ascii"))
+        if not stat.S_ISREG(entry_stat.st_mode):
+            continue
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(source_path), flags)
+        try:
+            opened = os.fstat(fd)
+            if _portable_tree_signature(opened) != expected_signature:
+                raise ValueError(
+                    "Profile export staging file changed during digest"
+                )
+            while True:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+    return digest.hexdigest()
+
+
+def _stage_consistent_portable_profile_snapshot(
+    source_dir: Path,
+    staging_parent: Path,
+    *,
+    archive_root: str,
+    ignore_factory: Any,
+) -> Path:
+    """Require two independently copied portable snapshots to match."""
+    first = staging_parent / ".snapshot-a"
+    second = staging_parent / archive_root
+    digests: List[str] = []
+    for destination in (first, second):
+        shutil.copytree(
+            source_dir,
+            destination,
+            symlinks=True,
+            ignore=ignore_factory(source_dir),
+        )
+        _assert_portable_tree_has_no_symlinks(destination)
+        digests.append(
+            _portable_profile_tree_digest(destination, archive_root)
+        )
+    if digests[0] != digests[1]:
+        raise ValueError("Profile source changed during snapshot")
+    shutil.rmtree(first)
+    return second
+
+
+def _validate_profile_export_output(final_output: Path) -> None:
+    """Reject an unsafe destination before staging begins."""
+    if os.path.lexists(final_output):
+        output_stat = final_output.lstat()
+        if (
+            not stat.S_ISREG(output_stat.st_mode)
+            or stat.S_ISLNK(output_stat.st_mode)
+            or _is_windows_reparse_point(output_stat)
+            or getattr(output_stat, "st_nlink", 1) != 1
+        ):
+            raise ValueError(
+                "Profile export output must be a regular, single-link file"
+            )
+
+
+def _write_portable_profile_archive(
+    staged: Path,
+    *,
+    archive_root: str,
+    final_output: Path,
+) -> Path:
+    """Write through a private same-directory file and atomically replace."""
+    import tarfile
+
+    parent = final_output.parent or Path(".")
+    temp_name = f".{final_output.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    archive_entries = _validated_portable_profile_tree_entries(
+        staged,
+        archive_root,
+    )
+    if _is_native_windows():
+        try:
+            parent_stat = parent.lstat()
+        except OSError as exc:
+            raise ValueError(
+                "Profile export output parent must be a real directory"
+            ) from exc
+        if (
+            parent.is_symlink()
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or _is_windows_reparse_point(parent_stat)
+        ):
+            raise ValueError(
+                "Profile export output parent must be a real directory"
+            )
+        temp_path = parent / temp_name
+        temp_fd = -1
+        try:
+            temp_fd = os.open(
+                str(temp_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(temp_fd, "wb") as handle:
+                temp_fd = -1
+                with tarfile.open(fileobj=handle, mode="w:gz") as tf:
+                    _add_validated_portable_profile_tree(tf, archive_entries)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, final_output)
+            result_stat = final_output.lstat()
+            if (
+                final_output.is_symlink()
+                or not stat.S_ISREG(result_stat.st_mode)
+                or getattr(result_stat, "st_nlink", 1) != 1
+            ):
+                raise OSError("Profile export archive safety check failed")
+            return final_output
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    parent_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        parent_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        parent_flags |= os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(str(parent), parent_flags)
+    except OSError as exc:
+        raise ValueError(
+            "Profile export output parent must be a real directory"
+        ) from exc
+
+    temp_fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+        with os.fdopen(temp_fd, "wb") as handle:
+            temp_fd = -1
+            os.fchmod(handle.fileno(), 0o600)
+            with tarfile.open(fileobj=handle, mode="w:gz") as tf:
+                _add_validated_portable_profile_tree(tf, archive_entries)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temp_name,
+            final_output.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        result_stat = os.stat(
+            final_output.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(result_stat.st_mode)
+            or result_stat.st_nlink != 1
+            or stat.S_IMODE(result_stat.st_mode) != 0o600
+        ):
+            raise OSError("Profile export archive durability check failed")
+        return final_output
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
 
 
 def export_profile(name: str, output_path: str) -> Path:
@@ -1907,40 +2523,64 @@ def export_profile(name: str, output_path: str) -> Path:
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
     profile_dir = get_profile_dir(canon)
-    if not profile_dir.is_dir():
+    if not _is_regular_profile_directory(profile_dir):
         raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+    source_stat = profile_dir.lstat()
 
     output = Path(output_path)
     # shutil.make_archive wants the base name without extension
     base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
+    final_output = Path(base + ".tar.gz")
+    _validate_profile_export_output(final_output)
 
     if canon == "default":
         # The default profile IS ~/.hermes itself — its parent is ~/ and its
         # directory name is ".hermes", not "default".  We stage a clean copy
         # under a temp dir so the archive contains ``default/...``.
         with tempfile.TemporaryDirectory() as tmpdir:
-            staged = Path(tmpdir) / "default"
-            shutil.copytree(
+            staged = _stage_consistent_portable_profile_snapshot(
                 profile_dir,
-                staged,
-                symlinks=True,
-                ignore=_default_export_ignore(profile_dir),
+                Path(tmpdir),
+                archive_root="default",
+                ignore_factory=_default_export_ignore,
             )
-            result = shutil.make_archive(base, "gztar", tmpdir, "default")
-            return Path(result)
+            final_source_stat = profile_dir.lstat()
+            if (
+                source_stat.st_dev,
+                source_stat.st_ino,
+            ) != (
+                final_source_stat.st_dev,
+                final_source_stat.st_ino,
+            ):
+                raise ValueError("Profile changed identity during export")
+            return _write_portable_profile_archive(
+                staged,
+                archive_root="default",
+                final_output=final_output,
+            )
 
     # Named profiles — stage a filtered copy to exclude credentials
     with tempfile.TemporaryDirectory() as tmpdir:
-        staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
-        shutil.copytree(
+        staged = _stage_consistent_portable_profile_snapshot(
             profile_dir,
-            staged,
-            symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            Path(tmpdir),
+            archive_root=canon,
+            ignore_factory=_named_export_ignore,
         )
-        result = shutil.make_archive(base, "gztar", tmpdir, canon)
-        return Path(result)
+        final_source_stat = profile_dir.lstat()
+        if (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        ) != (
+            final_source_stat.st_dev,
+            final_source_stat.st_ino,
+        ):
+            raise ValueError("Profile changed identity during export")
+        return _write_portable_profile_archive(
+            staged,
+            archive_root=canon,
+            final_output=final_output,
+        )
 
 
 def _normalize_profile_archive_parts(member_name: str) -> List[str]:
@@ -1958,129 +2598,491 @@ def _normalize_profile_archive_parts(member_name: str) -> List[str]:
         raise ValueError(f"Unsafe archive member path: {member_name}")
 
     parts = [part for part in posix_path.parts if part not in {"", "."}]
-    if not parts or any(part == ".." for part in parts):
+    if (
+        not parts
+        or any(part == ".." for part in parts)
+        or len(parts) > _PROFILE_ARCHIVE_MAX_DEPTH
+        or len(normalized_name.encode("utf-8")) > _PROFILE_ARCHIVE_MAX_PATH_BYTES
+    ):
         raise ValueError(f"Unsafe archive member path: {member_name}")
+    for part in parts:
+        stem = part.split(".", 1)[0].casefold()
+        if (
+            part.endswith((" ", "."))
+            or any(char in _WINDOWS_RESERVED_NAME_CHARACTERS for char in part)
+            or any(ord(char) < 32 for char in part)
+            or stem in _WINDOWS_RESERVED_COMPONENTS
+        ):
+            raise ValueError(f"Unsafe archive member path: {member_name}")
     return parts
 
 
-def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
-    """Extract a profile archive without allowing path escapes or links."""
+def _preflight_profile_archive_gzip(source: Any) -> None:
+    """Bound gzip-expanded TAR metadata before tarfile interprets it."""
+    import gzip
     import tarfile
 
-    with tarfile.open(archive, "r:gz") as tf:
-        for member in tf.getmembers():
-            parts = _normalize_profile_archive_parts(member.name)
+    source.seek(0)
+    metadata_types = {
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+    }
+    header_count = 0
+    metadata_total = 0
+    file_total = 0
+    decompressed_total = 0
+    zero_blocks = 0
+    reached_end = False
+
+    try:
+        with gzip.GzipFile(fileobj=source, mode="rb") as expanded:
+            while True:
+                block = expanded.read(tarfile.BLOCKSIZE)
+                if not block:
+                    break
+                if len(block) != tarfile.BLOCKSIZE:
+                    raise ValueError("Profile archive has a truncated TAR header")
+                decompressed_total += len(block)
+                if decompressed_total > _PROFILE_ARCHIVE_MAX_DECOMPRESSED_BYTES:
+                    raise ValueError("Profile archive expands beyond the raw size limit")
+                if block == (b"\0" * tarfile.BLOCKSIZE):
+                    zero_blocks += 1
+                    if zero_blocks < 2:
+                        continue
+                    trailing_total = 0
+                    while True:
+                        trailing = expanded.read(64 * 1024)
+                        if not trailing:
+                            break
+                        trailing_total += len(trailing)
+                        if (
+                            trailing_total
+                            > _PROFILE_ARCHIVE_MAX_TRAILING_ZERO_BYTES
+                        ):
+                            raise ValueError(
+                                "Profile archive has excessive trailing padding"
+                            )
+                        if trailing.strip(b"\0"):
+                            raise ValueError(
+                                "Profile archive contains data after its end marker"
+                            )
+                    reached_end = True
+                    break
+                if zero_blocks:
+                    raise ValueError(
+                        "Profile archive has a malformed TAR end marker"
+                    )
+
+                header_count += 1
+                if header_count > _PROFILE_ARCHIVE_MAX_RAW_HEADERS:
+                    raise ValueError("Profile archive contains too many raw headers")
+                try:
+                    header = tarfile.TarInfo.frombuf(
+                        block,
+                        encoding="utf-8",
+                        errors="surrogateescape",
+                    )
+                except tarfile.HeaderError as exc:
+                    raise ValueError("Profile archive has an invalid TAR header") from exc
+                size = int(header.size)
+                if size < 0:
+                    raise ValueError("Profile archive has a negative member size")
+                padded_size = (
+                    (size + tarfile.BLOCKSIZE - 1)
+                    // tarfile.BLOCKSIZE
+                    * tarfile.BLOCKSIZE
+                )
+                decompressed_total += padded_size
+                if decompressed_total > _PROFILE_ARCHIVE_MAX_DECOMPRESSED_BYTES:
+                    raise ValueError("Profile archive expands beyond the raw size limit")
+
+                if header.type in metadata_types:
+                    if size > _PROFILE_ARCHIVE_MAX_METADATA_RECORD_BYTES:
+                        raise ValueError(
+                            "Profile archive metadata record is too large"
+                        )
+                    metadata_total += size
+                    if metadata_total > _PROFILE_ARCHIVE_MAX_METADATA_TOTAL_BYTES:
+                        raise ValueError(
+                            "Profile archive metadata exceeds the size limit"
+                        )
+                elif header.isfile():
+                    if size > _PROFILE_ARCHIVE_MAX_FILE_BYTES:
+                        raise ValueError("Profile archive member is too large")
+                    file_total += size
+                    if file_total > _PROFILE_ARCHIVE_MAX_TOTAL_BYTES:
+                        raise ValueError(
+                            "Profile archive expands beyond the size limit"
+                        )
+
+                remaining = padded_size
+                while remaining:
+                    chunk = expanded.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError(
+                            "Profile archive has truncated member data"
+                        )
+                    remaining -= len(chunk)
+    except (gzip.BadGzipFile, EOFError, OSError) as exc:
+        raise ValueError("Profile archive gzip stream is invalid") from exc
+    finally:
+        source.seek(0)
+
+    if not reached_end:
+        raise ValueError("Profile archive is missing its TAR end marker")
+
+
+@contextmanager
+def _open_profile_archive_tar(archive: Path) -> Iterator[Any]:
+    """Open one regular, single-link archive inode without following links."""
+    import tarfile
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(archive), flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(
+            "Profile archive must be a regular, single-link file"
+        ) from exc
+    try:
+        archive_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(archive_stat.st_mode)
+            or archive_stat.st_nlink != 1
+            or archive_stat.st_size > _PROFILE_ARCHIVE_MAX_DECOMPRESSED_BYTES
+        ):
+            raise ValueError(
+                "Profile archive must be a regular, single-link file"
+            )
+        with os.fdopen(fd, "rb") as source:
+            fd = -1
+            _preflight_profile_archive_gzip(source)
+            with tarfile.open(fileobj=source, mode="r:gz") as tf:
+                yield tf
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _validated_profile_archive_members(
+    tf: Any,
+) -> tuple[List[tuple[Any, List[str], str]], str]:
+    """Stream and bound every header before any archive byte is extracted."""
+    normalized: List[tuple[Any, List[str], str]] = []
+    seen: set[str] = set()
+    file_keys: set[str] = set()
+    directory_keys: set[str] = set()
+    top_dirs: set[str] = set()
+    top_level_files: set[str] = set()
+    total_bytes = 0
+    for member_count, member in enumerate(tf, start=1):
+        if member_count > _PROFILE_ARCHIVE_MAX_MEMBERS:
+            raise ValueError("Profile archive contains too many members")
+        parts = _normalize_profile_archive_parts(member.name)
+        if len(parts) >= 2:
+            root_entry = parts[1].casefold()
+            if root_entry in _PORTABLE_PROFILE_CREDENTIAL_FILES:
+                raise ValueError(
+                    "Profile archive contains a credential-bearing root file; "
+                    "authenticate the imported profile through `hermes auth add` instead."
+                )
+            if root_entry in _PORTABLE_PROFILE_EXCLUDE_ROOT:
+                raise ValueError(
+                    "Profile archive contains a machine-local root"
+                )
+            top_dirs.add(parts[0])
+        elif member.isdir():
+            top_dirs.add(parts[0])
+        else:
+            top_level_files.add(parts[0])
+        if not member.isdir() and not member.isfile():
+            raise ValueError(f"Unsupported archive member type: {member.name}")
+        if member.isdir() and int(member.size or 0) != 0:
+            raise ValueError("Profile archive directory has a non-zero size")
+        if member.isfile():
+            if member.size < 0 or member.size > _PROFILE_ARCHIVE_MAX_FILE_BYTES:
+                raise ValueError("Profile archive member is too large")
+            total_bytes += int(member.size)
+            if total_bytes > _PROFILE_ARCHIVE_MAX_TOTAL_BYTES:
+                raise ValueError("Profile archive expands beyond the size limit")
+        key = "/".join(parts).casefold()
+        if key in seen:
+            raise ValueError("Profile archive contains duplicate paths")
+        seen.add(key)
+        if member.isdir():
+            directory_keys.add(key)
+        else:
+            file_keys.add(key)
+        normalized.append((member, parts, key))
+
+    for key in seen:
+        components = key.split("/")
+        for index in range(1, len(components)):
+            if "/".join(components[:index]) in file_keys:
+                raise ValueError(
+                    "Profile archive contains a file/directory collision"
+                )
+    if file_keys & directory_keys:
+        raise ValueError("Profile archive contains a file/directory collision")
+    if top_level_files or len(top_dirs) != 1:
+        raise ValueError(
+            "Profile archive must contain exactly one top-level directory."
+        )
+    return normalized, next(iter(top_dirs))
+
+
+def _safe_extract_profile_archive(
+    archive: Path,
+    destination: Path,
+) -> str:
+    """Validate, extract, and return one archive root without path escapes."""
+    with _open_profile_archive_tar(archive) as tf:
+        normalized, archive_root = _validated_profile_archive_members(tf)
+        for member, parts, _key in normalized:
             target = destination.joinpath(*parts)
 
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
+                target.chmod((member.mode & 0o700) or 0o700)
                 continue
-
-            if not member.isfile():
-                raise ValueError(
-                    f"Unsupported archive member type: {member.name}"
-                )
 
             target.parent.mkdir(parents=True, exist_ok=True)
             extracted = tf.extractfile(member)
             if extracted is None:
                 raise ValueError(f"Cannot read archive member: {member.name}")
 
-            with extracted, open(target, "wb") as dst:
-                shutil.copyfileobj(extracted, dst)
-
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(target), flags, 0o600)
             try:
-                os.chmod(target, member.mode & 0o777)
-            except OSError:
-                pass
+                with extracted, os.fdopen(fd, "wb") as dst:
+                    fd = -1
+                    shutil.copyfileobj(extracted, dst)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                    _set_private_profile_file_mode(
+                        dst.fileno(),
+                        target,
+                        (member.mode & 0o700) or 0o600,
+                    )
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+    return archive_root
 
 
 def _inspect_profile_archive_roots(archive: Path) -> set[str]:
-    """Return the archive's top-level directory names.
+    """Compatibility inspector using the same bounded streaming validator."""
+    with _open_profile_archive_tar(archive) as tf:
+        _members, archive_root = _validated_profile_archive_members(tf)
+    return {archive_root}
 
-    Profile imports expect exactly one root directory. Inspecting the archive
-    before extraction lets us stage the import safely instead of mutating a
-    live profile tree first and reconciling names later.
-    """
-    import tarfile
 
-    with tarfile.open(archive, "r:gz") as tf:
-        top_dirs = {
-            parts[0]
-            for member in tf.getmembers()
-            for parts in [_normalize_profile_archive_parts(member.name)]
-            if len(parts) > 1 or member.isdir()
-        }
-        if not top_dirs:
-            top_dirs = {
-                _normalize_profile_archive_parts(member.name)[0]
-                for member in tf.getmembers()
-                if member.isdir()
-            }
-    return top_dirs
+def _open_private_profiles_root(profiles_root: Path) -> Optional[int]:
+    """Create/open the profiles root as one private, non-symlink directory."""
+    profiles_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    root_stat = profiles_root.lstat()
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or stat.S_ISLNK(root_stat.st_mode)
+        or _is_windows_reparse_point(root_stat)
+    ):
+        raise ValueError("Hermes profiles root must be a real directory")
+    profiles_root.chmod(0o700)
+    if _is_native_windows():
+        if profiles_root.is_symlink():
+            raise ValueError("Hermes profiles root must be a real directory")
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        root_fd = os.open(str(profiles_root), flags)
+    except OSError as exc:
+        raise ValueError("Hermes profiles root cannot be opened safely") from exc
+    opened = os.fstat(root_fd)
+    if (opened.st_dev, opened.st_ino) != (root_stat.st_dev, root_stat.st_ino):
+        os.close(root_fd)
+        raise ValueError("Hermes profiles root changed during open")
+    return root_fd
+
+
+def _assert_profiles_root_matches_fd(
+    profiles_root: Path,
+    root_fd: Optional[int],
+) -> None:
+    current = profiles_root.lstat()
+    if root_fd is None:
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or _is_windows_reparse_point(current)
+        ):
+            raise ValueError("Hermes profiles root changed during import")
+        return
+    opened = os.fstat(root_fd)
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or _is_windows_reparse_point(current)
+        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise ValueError("Hermes profiles root changed during import")
+
+
+def _rename_profile_noreplace(
+    *,
+    profiles_root: Path,
+    root_fd: Optional[int],
+    source_relative: str,
+    destination_name: str,
+) -> None:
+    """Atomically move a staged directory without replacing any destination."""
+    source_parts = PurePosixPath(source_relative.replace(os.sep, "/")).parts
+    if (
+        not source_parts
+        or any(part in {"", ".", ".."} for part in source_parts)
+        or "/" in destination_name
+        or destination_name in {"", ".", ".."}
+    ):
+        raise ValueError("Unsafe staged profile rename")
+
+    if _is_native_windows():
+        os.rename(
+            profiles_root / source_relative,
+            profiles_root / destination_name,
+        )
+        return
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_relative)
+    destination_bytes = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        rename_fn = getattr(libc, "renameatx_np", None)
+        flags = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        rename_fn = getattr(libc, "renameat2", None)
+        flags = 0x00000001  # RENAME_NOREPLACE
+    else:
+        rename_fn = None
+        flags = 0
+    if rename_fn is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "Atomic no-replace profile import is unsupported",
+        )
+    rename_fn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_fn.restype = ctypes.c_int
+    if rename_fn(
+        root_fd,
+        source_bytes,
+        root_fd,
+        destination_bytes,
+        flags,
+    ) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "Profile destination already exists",
+            str(profiles_root / destination_name),
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        str(profiles_root / destination_name),
+    )
 
 
 def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     """Import a profile from a tar.gz archive.
 
     If *name* is not given, infers it from the archive's top-level directory.
-    Returns the imported profile directory.
+    Credential-bearing root files are rejected; authenticate the imported
+    profile explicitly after import. Returns the imported profile directory.
     """
     import tempfile
 
     archive = Path(archive_path)
-    if not archive.exists():
+    if not os.path.lexists(archive):
         raise FileNotFoundError(f"Archive not found: {archive}")
 
-    top_dirs = _inspect_profile_archive_roots(archive)
-    archive_root = top_dirs.pop() if len(top_dirs) == 1 else None
-    inferred_name = name or archive_root
-    if not inferred_name:
-        raise ValueError(
-            "Cannot determine profile name from archive. "
-            "Specify it explicitly: hermes profile import <archive> --name <name>"
-        )
-    if archive_root is None:
-        raise ValueError(
-            "Profile archive must contain exactly one top-level directory."
-        )
-
-    # Archives exported from the default profile have "default/" as top-level
-    # dir.  Importing as "default" would target ~/.hermes itself — disallow
-    # that and guide the user toward a named profile.
-    canon = normalize_profile_name(inferred_name)
-    validate_profile_name(canon)
-    if canon == "default":
-        raise ValueError(
-            "Cannot import as 'default' — that is the built-in root profile (~/.hermes). "
-            "Specify a different name: hermes profile import <archive> --name <name>"
-        )
-
-    profile_dir = get_profile_dir(canon)
-    if profile_dir.exists():
-        raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
-
     profiles_root = _get_profiles_root()
-    profiles_root.mkdir(parents=True, exist_ok=True)
+    root_fd = _open_private_profiles_root(profiles_root)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".hermes_profile_import_",
+            dir=profiles_root,
+        ) as tmpdir:
+            _assert_profiles_root_matches_fd(profiles_root, root_fd)
+            staging_root = Path(tmpdir)
+            archive_root = _safe_extract_profile_archive(archive, staging_root)
+            inferred_name = name or archive_root
+            if not inferred_name:
+                raise ValueError(
+                    "Cannot determine profile name from archive. "
+                    "Specify it explicitly: hermes profile import <archive> --name <name>"
+                )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
-        staging_root = Path(tmpdir)
-        _safe_extract_profile_archive(archive, staging_root)
+            canon = normalize_profile_name(inferred_name)
+            validate_profile_name(canon)
+            if canon == "default":
+                raise ValueError(
+                    "Cannot import as 'default' — that is the built-in root profile (~/.hermes). "
+                    "Specify a different name: hermes profile import <archive> --name <name>"
+                )
 
-        extracted = staging_root / archive_root
-        if not extracted.is_dir():
-            raise ValueError(
-                f"Profile archive root is missing or invalid: {archive_root}"
+            profile_dir = get_profile_dir(canon)
+            if profile_dir.parent.absolute() != profiles_root.absolute():
+                raise ValueError("Imported profile target escaped the profiles root")
+            if profile_dir.exists():
+                raise FileExistsError(
+                    f"Profile '{canon}' already exists at {profile_dir}"
+                )
+
+            extracted = staging_root / archive_root
+            if not extracted.is_dir() or extracted.is_symlink():
+                raise ValueError(
+                    f"Profile archive root is missing or invalid: {archive_root}"
+                )
+            _create_private_profile_env(extracted / ".env")
+
+            if os.path.lexists(profile_dir):
+                raise FileExistsError(
+                    f"Profile '{canon}' appeared during import at {profile_dir}"
+                )
+            _assert_profiles_root_matches_fd(profiles_root, root_fd)
+            source_relative = str(extracted.relative_to(profiles_root))
+            _rename_profile_noreplace(
+                profiles_root=profiles_root,
+                root_fd=root_fd,
+                source_relative=source_relative,
+                destination_name=canon,
             )
-
-        final_source = extracted
-        if archive_root != canon:
-            final_source = staging_root / canon
-            extracted.rename(final_source)
-
-        shutil.move(str(final_source), str(profile_dir))
-
-    return profile_dir
+            if root_fd is not None:
+                os.fsync(root_fd)
+        return profile_dir
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -2165,7 +3167,7 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     old_dir = get_profile_dir(old_canon)
     new_dir = get_profile_dir(new_canon)
 
-    if not old_dir.is_dir():
+    if not _is_regular_profile_directory(old_dir):
         raise FileNotFoundError(f"Profile '{old_canon}' does not exist.")
     if new_dir.exists():
         raise FileExistsError(f"Profile '{new_canon}' already exists.")
@@ -2175,8 +3177,15 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         _cleanup_gateway_service(old_canon, old_dir)
         _stop_gateway_process(old_dir)
 
-    # 2. Rename directory
-    old_dir.rename(new_dir)
+    # 2. Recover/quarantine Codex WALs and quiesce the profile's grants while
+    # its authenticated absolute auth-store path moves to the new directory.
+    from hermes_cli.auth import _retire_codex_auth_store
+
+    with _retire_codex_auth_store(
+        old_dir / "auth.json",
+        reason="profile_rename",
+    ):
+        old_dir.rename(new_dir)
     print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
 
     # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
@@ -2216,10 +3225,13 @@ def resolve_profile_env(profile_name: str) -> str:
     validate_profile_name(canon)
     profile_dir = get_profile_dir(canon)
 
-    if canon != "default" and not profile_dir.is_dir():
-        raise FileNotFoundError(
-            f"Profile '{canon}' does not exist. "
-            f"Create it with: hermes profile create {canon}"
-        )
+    if canon != "default":
+        if os.path.lexists(profile_dir):
+            _require_regular_profile_directory(profile_dir)
+        else:
+            raise FileNotFoundError(
+                f"Profile '{canon}' does not exist. "
+                f"Create it with: hermes profile create {canon}"
+            )
 
     return str(profile_dir)

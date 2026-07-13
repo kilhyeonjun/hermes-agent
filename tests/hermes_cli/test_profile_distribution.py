@@ -460,6 +460,7 @@ class TestSecurity:
     def test_user_owned_exclude_covers_credentials(self):
         assert "auth.json" in USER_OWNED_EXCLUDE
         assert ".env" in USER_OWNED_EXCLUDE
+        assert ".op.env" in USER_OWNED_EXCLUDE
         assert "memories" in USER_OWNED_EXCLUDE
         assert "sessions" in USER_OWNED_EXCLUDE
         assert "local" in USER_OWNED_EXCLUDE
@@ -471,6 +472,7 @@ class TestSecurity:
         # Author leaks credentials into the staging tree (shouldn't happen, but...)
         (staged / "auth.json").write_text('{"leaked": true}')
         (staged / ".env").write_text("LEAKED=1")
+        (staged / ".op.env").write_text("OP_SERVICE_ACCOUNT_TOKEN=LEAKED")
 
         plan = install_distribution(str(staged), name="clean")
         assert not (plan.target_dir / "auth.json").exists(), "auth.json leaked"
@@ -478,6 +480,7 @@ class TestSecurity:
         # about is that the leaked content didn't land in the target.
         if (plan.target_dir / ".env").exists():
             assert "LEAKED" not in (plan.target_dir / ".env").read_text()
+        assert not (plan.target_dir / ".op.env").exists(), ".op.env leaked"
 
     def test_install_rejects_symlinked_distribution_files(self, profile_env, tmp_path):
         """Distribution install must not follow symlinks to local files."""

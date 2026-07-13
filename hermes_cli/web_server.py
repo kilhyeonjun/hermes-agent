@@ -84,6 +84,7 @@ from gateway.status import (
     parse_active_agents,
     read_runtime_status,
 )
+from agent.file_safety import get_read_block_error, is_write_denied
 from utils import env_var_enabled
 
 try:
@@ -1324,7 +1325,7 @@ def _is_sensitive_filename(name: str) -> bool:
 
 
 def _is_sensitive_path(path: Path) -> bool:
-    """Return True for any path the managed-files API must never expose.
+    """Return True for any path the managed-files API must never expose or mutate.
 
     Combines the basename denylist (:func:`_is_sensitive_filename`) with a
     credential-directory-tree check: a path is sensitive if its own basename
@@ -1335,10 +1336,9 @@ def _is_sensitive_path(path: Path) -> bool:
     the canonical guards cover as directory trees but a basename-only check
     would miss.
 
-    Read-side only: this guards list/read/download (the #57505 exfil surface).
-    The write endpoints (upload/mkdir/delete) are a separate threat class
-    handled by the write-path checks; extending this guard to them is out of
-    scope for this fix.
+    The same predicate is intentionally used for list/read/download and every
+    generic mutation endpoint. Credential stores must be changed only through
+    their dedicated transactional APIs.
     """
     if _is_sensitive_filename(path.name):
         return True
@@ -1872,6 +1872,8 @@ async def download_managed_file(request: Request, path: str):
 @app.post("/api/files/upload")
 async def upload_managed_file(payload: ManagedFileUpload, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Sensitive files cannot be modified")
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
     if target.exists() and not payload.overwrite:
@@ -1912,6 +1914,8 @@ async def upload_managed_file_stream(
     overwrite: bool = Form(True),
 ):
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Sensitive files cannot be modified")
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
     if target.exists() and not overwrite:
@@ -1971,6 +1975,8 @@ async def upload_managed_file_stream(
 @app.post("/api/files/mkdir")
 async def create_managed_directory(payload: ManagedDirectoryCreate, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Sensitive paths cannot be created")
     if target.exists() and not target.is_dir():
         raise HTTPException(status_code=409, detail="A file already exists at that path")
 
@@ -1992,6 +1998,8 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 @app.delete("/api/files")
 async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request)
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Sensitive paths cannot be deleted")
     if policy.locked_root is not None and target == policy.locked_root:
         raise HTTPException(status_code=400, detail="Cannot delete the managed files root")
     if target.parent == target:
@@ -2017,11 +2025,15 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
 @app.get("/api/fs/list")
 async def fs_list(path: str):
     target = _fs_path(path)
+    if get_read_block_error(str(target)):
+        raise HTTPException(status_code=403, detail="Access to sensitive paths is not allowed")
     try:
         entries = []
         with os.scandir(target) as scan:
             for entry in scan:
                 if entry.name in _FS_READDIR_HIDDEN:
+                    continue
+                if get_read_block_error(str(target / entry.name)):
                     continue
                 entries.append({
                     "name": entry.name,
@@ -2042,7 +2054,10 @@ async def fs_list(path: str):
 
 @app.get("/api/fs/read-text")
 async def fs_read_text(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+    requested = _fs_path(path)
+    if get_read_block_error(str(requested)):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    target, st = _fs_regular_file(requested)
     if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     bytes_to_read = min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES)
@@ -2082,6 +2097,8 @@ async def fs_write_text(payload: FsWriteText):
     so both transports behave identically.
     """
     target = _fs_path(payload.path)
+    if is_write_denied(str(target)):
+        raise HTTPException(status_code=403, detail="Sensitive files cannot be modified")
     text = payload.content or ""
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
@@ -2118,7 +2135,10 @@ async def fs_write_text(payload: FsWriteText):
 
 @app.get("/api/fs/read-data-url")
 async def fs_read_data_url(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+    requested = _fs_path(path)
+    if get_read_block_error(str(requested)):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    target, st = _fs_regular_file(requested)
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     try:
@@ -11452,21 +11472,39 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
     return {"ok": True, "provider": provider, "count": len(pool.entries())}
 
 
-@app.delete("/api/credentials/pool/{provider}/{index}")
-async def remove_credential_pool_entry(provider: str, index: int):
-    """Remove a pool entry.  ``index`` is 1-based (matches the list response)."""
-    from agent.credential_pool import load_pool
+@app.delete("/api/credentials/pool/{provider}/entries/{credential_id:path}")
+async def remove_credential_pool_entry(provider: str, credential_id: str):
+    """Remove exactly one stable credential ID through the canonical service."""
+    from agent.credential_sources import (
+        CredentialRemovalNotFoundError,
+        remove_credential_target,
+    )
+    from hermes_cli.auth import AuthStoreConflictError
 
     provider = (provider or "").strip().lower()
+    credential_id = (credential_id or "").strip()
+    if not provider or not credential_id:
+        raise HTTPException(
+            status_code=400,
+            detail="provider and credential_id are required",
+        )
     try:
-        pool = load_pool(provider)
-        removed = pool.remove_index(index)
+        outcome = remove_credential_target(provider, credential_id)
+    except CredentialRemovalNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AuthStoreConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         _log.exception("DELETE /api/credentials/pool failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if removed is None:
-        raise HTTPException(status_code=404, detail="No pool entry at that index")
-    return {"ok": True, "provider": provider, "count": len(pool.entries())}
+    return {
+        "ok": True,
+        "provider": provider,
+        "credential_id": credential_id,
+        "count": outcome.remaining_count,
+        "cleaned": outcome.result.cleaned,
+        "hints": outcome.result.hints,
+    }
 
 
 # ---------------------------------------------------------------------------

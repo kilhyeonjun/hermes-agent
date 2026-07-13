@@ -66,6 +66,7 @@ _EXCLUDED_DIRS = {
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".profile-trash",  # failed/partial profile deletions; machine-local
 }
 
 # File-name suffixes to skip
@@ -86,6 +87,9 @@ _EXCLUDED_SUFFIXES = (
 _EXCLUDED_NAMES = {
     "gateway.pid",
     "cron.pid",
+    # Lock inodes are host-local synchronization primitives. Restoring one
+    # can split concurrent writers across the old and replacement inode.
+    "auth.lock",
 }
 
 # File names that ``hermes import`` must never overwrite, matched by basename so
@@ -119,10 +123,23 @@ _IMPORT_SKIP_NAMES = {
     "cron.pid",
     "gateway.lock",
     "processes.json",
+    "auth.lock",
 }
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
-_SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
+_SECRET_FILE_NAMES = {".env", ".op.env", "auth.json", "state.db"}
+
+
+def _is_codex_refresh_runtime_path(rel_path: Path) -> bool:
+    """Return True for host-local Codex refresh lock/key/WAL subtrees."""
+    parts = tuple(part.casefold() for part in rel_path.parts)
+    if len(parts) >= 2 and parts[:2] == ("state", "codex-refresh"):
+        return True
+    return bool(
+        len(parts) >= 4
+        and parts[0] == "profiles"
+        and parts[2:4] == ("state", "codex-refresh")
+    )
 
 # Reserved archive subtree for provider state that lives OUTSIDE HERMES_HOME
 # (e.g. ~/.honcho, ~/.hindsight). The active memory provider declares these via
@@ -210,6 +227,8 @@ def _iter_external_files(base: Path) -> List[Path]:
 
 def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
+    if _is_codex_refresh_runtime_path(rel_path):
+        return True
     parts = rel_path.parts
 
     for part in parts:
@@ -331,7 +350,11 @@ def run_backup(args) -> None:
         orig_dirnames = dirnames[:]
         dirnames[:] = [
             d for d in dirnames
-            if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
+            if (
+                d not in _EXCLUDED_DIRS
+                or (d == "hermes-agent" and not is_root)
+            )
+            and not _is_codex_refresh_runtime_path(rel_dir / d)
         ]
         for removed in set(orig_dirnames) - set(dirnames):
             skipped_dirs.add(str(rel_dir / removed))
@@ -630,6 +653,9 @@ def run_import(args) -> None:
             if Path(rel).name in _IMPORT_SKIP_NAMES:
                 skipped_runtime.append(rel)
                 continue
+            if _is_codex_refresh_runtime_path(Path(rel)):
+                skipped_runtime.append(rel)
+                continue
 
             target = hermes_root / rel
 
@@ -638,6 +664,23 @@ def run_import(args) -> None:
                 target.resolve().relative_to(hermes_root.resolve())
             except ValueError:
                 errors.append(f"  {rel}: path traversal blocked")
+                continue
+
+            if target.name == "auth.json":
+                try:
+                    from hermes_cli.auth import replace_auth_store_from_snapshot
+
+                    replace_auth_store_from_snapshot(
+                        zf.read(member),
+                        target_path=target,
+                        actor="hermes_cli.backup.run_import",
+                        reason="explicit full backup import",
+                    )
+                    restored += 1
+                except Exception as exc:
+                    errors.append(f"  {rel}: auth restore refused: {exc}")
+                if restored % 500 == 0:
+                    print(f"  {restored}/{file_count} files ...")
                 continue
 
             try:
@@ -917,10 +960,15 @@ def list_quick_snapshots(
 def restore_quick_snapshot(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
+    *,
+    restore_credentials: bool = False,
 ) -> bool:
     """Restore state from a quick snapshot.
 
-    Overwrites current state files with the snapshot's copies.
+    Overwrites current state files with the snapshot's copies. Credential
+    state is skipped by default because OAuth refresh generations in an old
+    snapshot may already be consumed. Callers must opt in explicitly, in
+    which case the canonical auth transaction validates and replaces it.
     Returns True if at least one file was restored.
     """
     home = hermes_home or get_hermes_home()
@@ -969,6 +1017,27 @@ def restore_quick_snapshot(
             continue
 
         if not src.exists():
+            continue
+
+        if _is_codex_refresh_runtime_path(Path(rel)):
+            continue
+        if Path(rel).name == "auth.lock":
+            continue
+        if Path(rel).name == "auth.json":
+            if not restore_credentials:
+                continue
+            try:
+                from hermes_cli.auth import replace_auth_store_from_snapshot
+
+                replace_auth_store_from_snapshot(
+                    src.read_bytes(),
+                    target_path=dst,
+                    actor="hermes_cli.backup.restore_quick_snapshot",
+                    reason="explicit quick snapshot credential restore",
+                )
+                restored += 1
+            except Exception as exc:
+                logger.error("Failed to restore %s: %s", rel, exc)
             continue
 
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1156,8 +1225,17 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     try:
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
+            try:
+                rel_dir = dp.relative_to(hermes_root)
+            except ValueError:
+                continue
             # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in _EXCLUDED_DIRS
+                and not _is_codex_refresh_runtime_path(rel_dir / d)
+            ]
 
             for fname in filenames:
                 fpath = dp / fname

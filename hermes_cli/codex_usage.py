@@ -203,15 +203,22 @@ def load_route_policy() -> Dict[str, Any]:
     }
 
 
-def collect() -> Dict[str, Any]:
+def collect(*, mutate: bool = True) -> Dict[str, Any]:
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openai-codex")
+    pool = (
+        load_pool("openai-codex")
+        if mutate
+        else load_pool("openai-codex", read_only=True)
+    )
     # First let Hermes clear expired cooldowns / refresh available tokens, then
     # inspect the full pool. Quota reporting must include exhausted credentials
     # too; otherwise a 7d-reset-aware recommendation cannot see the account that
     # is about to recover next.
-    available_entries = pool._available_entries(clear_expired=True, refresh=True)  # intentional internal API
+    available_entries = pool._available_entries(
+        clear_expired=mutate,
+        refresh=mutate,
+    )  # intentional internal API
     routable_entries = pool._routable_entries(available_entries)  # intentional internal API
     entries = pool.entries()
     strategy = str(getattr(pool, "_strategy", "fill_first"))

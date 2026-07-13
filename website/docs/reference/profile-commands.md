@@ -80,8 +80,8 @@ Creates a new profile.
 | Argument / Option | Description |
 |-------------------|-------------|
 | `<name>` | Name for the new profile. Must be a valid directory name (alphanumeric, hyphens, underscores). |
-| `--clone` | Copy `config.yaml`, `.env`, `SOUL.md`, and skills from the current profile. |
-| `--clone-all` | Copy everything (config, memories, skills, cron, plugins) from the current profile. Excludes per-profile history: sessions, `state.db`, backups, state-snapshots, checkpoints. |
+| `--clone` | Copy `config.yaml`, `.env`, `SOUL.md`, skills, and curated `memories/MEMORY.md` and `memories/USER.md` from the current profile. Sessions and runtime state start fresh. |
+| `--clone-all` | Copy working state (config, `.env` secrets, memories, skills, cron, plugins) from the current profile. Excludes canonical `auth.json`/`auth.lock`, root `.op.env`, and per-profile history: sessions, `state.db`, backups, state-snapshots, checkpoints. Review copied static keys and re-authenticate OAuth providers in the clone. |
 | `--clone-from <profile>` | Clone config/skills/SOUL from a specific profile instead of the current one. Implies `--clone` unless paired with `--clone-all`. |
 | `--no-alias` | Skip wrapper script creation. |
 | `--description "<text>"` | One- or two-sentence description of what this profile is good at. Used by the kanban orchestrator to route tasks based on role instead of profile name alone. Skip and add later via `hermes profile describe`. Persisted in `<profile_dir>/profile.yaml`. |
@@ -98,13 +98,13 @@ hermes profile create mybot
 # Clone config only from current profile
 hermes profile create work --clone
 
-# Clone everything from current profile
+# Clone working state from current profile (auth/history excluded)
 hermes profile create backup --clone-all
 
 # Clone config from a specific profile
 hermes profile create work2 --clone-from work
 
-# Clone everything from a specific profile
+# Clone working state from a specific profile (auth/history excluded)
 hermes profile create work2-backup --clone-from work --clone-all
 ```
 
@@ -250,6 +250,14 @@ hermes profile export <name> [options]
 
 Exports a profile as a compressed tar.gz archive.
 
+The archive excludes the profile-root credential files `auth.json`, `auth.lock`,
+`.env`, and `.op.env` (including hard-link aliases), plus machine-local `home/`,
+`backups/`, `state-snapshots/`, and `checkpoints/`. Export rejects symlinks.
+Nested project files are preserved even when they have credential-like names,
+so this is not a general-purpose secret scrubber. Inspect an archive before
+sharing it outside its trust boundary; use `hermes backup` for a complete,
+trusted local backup.
+
 | Argument / Option | Description |
 |-------------------|-------------|
 | `<name>` | Profile to export. |
@@ -271,6 +279,12 @@ hermes profile import <archive> [options]
 ```
 
 Imports a profile from a tar.gz archive.
+
+Import rejects profile-root `auth.json`, `auth.lock`, `.env`, and `.op.env`, as
+well as every symlink entry, then creates a blank private root `.env` (`0600`)
+for the new profile. Nested project files are preserved. Named profiles do not
+inherit credential variables from the launching shell or a repository `.env`;
+configure credentials explicitly in the new profile.
 
 | Argument / Option | Description |
 |-------------------|-------------|
@@ -297,16 +311,17 @@ as a **git repository**. A recipient installs the distribution with a single
 command and can update it in place later without touching their local
 memories, sessions, or credentials.
 
-`auth.json` and `.env` are never part of a distribution — they stay on the
-installing user's machine.
+`auth.json`, `.env`, and `.op.env` are never part of a distribution — they stay
+on the installing user's machine.
 
 The recipient's user data (memories, sessions, auth, their own edits to
 `.env`) is always preserved across the initial install and subsequent
 updates.
 
 :::info
-`hermes profile export` / `import` are still the right commands for
-**local backup and restore** of a profile on your own machine. Distribution
+`hermes profile export` / `import` are still the right commands for a
+**portable profile transfer** with the documented root-credential and
+machine-local exclusions. Distribution
 (`install` / `update` / `info`) is a separate concept: ship a profile via
 git so someone else can install it.
 :::

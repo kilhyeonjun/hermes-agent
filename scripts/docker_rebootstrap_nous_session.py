@@ -25,8 +25,9 @@ case is a no-op, so we never clobber a healthy or merely-rotating session.
 
 Design constraints
 ------------------
-- Pure stdlib, no hermes_cli imports: runs early in the boot hook, before the
-  app venv/modules are guaranteed importable, as its own subprocess.
+- Lazy canonical protocol import: if ``hermes_cli.auth`` is not importable at
+  this early boot stage, fail closed with a no-op. Never fall back to a raw
+  whole-file replace that could race a live gateway writer.
 - Surgical: replaces ONLY ``providers.nous`` in the existing auth.json, leaving
   every other provider, the version, and any other top-level state untouched.
 - Fail-safe: any parse/IO error leaves auth.json exactly as-is and exits 0 (a
@@ -37,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Optional
 
 # Env var the orchestrator sets to the re-seed payload. Deliberately DISTINCT
@@ -44,6 +46,7 @@ from typing import Any, Optional
 # paths can never be confused: BOOTSTRAP seeds a fresh volume; REBOOTSTRAP
 # overwrites a terminally-dead Nous entry on an existing volume.
 REBOOTSTRAP_ENV = "HERMES_AUTH_JSON_REBOOTSTRAP"
+BOOTSTRAP_ENV = "HERMES_AUTH_JSON_BOOTSTRAP"
 
 
 def _nous_entry_is_terminal(nous_state: Any) -> bool:
@@ -84,7 +87,82 @@ def _extract_nous_from_seed(seed_raw: str) -> Optional[dict]:
     nous = providers.get("nous")
     if not isinstance(nous, dict) or not nous:
         return None
+    access = nous.get("access_token")
+    refresh = nous.get("refresh_token")
+    marker = nous.get("last_auth_error")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    if isinstance(marker, dict) and marker.get("relogin_required") is True:
+        return None
     return nous
+
+
+def _load_auth_protocol():
+    """Load the minimal canonical reseed protocol, or fail closed."""
+    try:
+        from hermes_cli import auth as auth_mod
+    except Exception:
+        return None
+    required = (
+        "_auth_store_lock",
+        "_load_auth_store",
+        "_save_auth_store",
+        "AuthStoreCorruptError",
+    )
+    if any(not hasattr(auth_mod, name) for name in required):
+        return None
+    return auth_mod
+
+
+def _load_bootstrap_auth_protocol():
+    """Load the create-only snapshot protocol, or return None."""
+    auth_mod = _load_auth_protocol()
+    if auth_mod is None:
+        return None
+    required = (
+        "AuthStoreConflictError",
+        "replace_auth_store_from_snapshot",
+    )
+    if any(not hasattr(auth_mod, name) for name in required):
+        return None
+    return auth_mod
+
+
+def bootstrap_if_absent(auth_path: str, seed_raw: str) -> str:
+    """Create a first-boot auth store through the canonical transaction.
+
+    Returns ``bootstrapped``, ``already_exists``, ``no_seed``, ``bad_seed``,
+    ``unsafe_path``, ``protocol_unavailable``, or ``protocol_error``.
+    """
+    if not seed_raw:
+        return "no_seed"
+    path = Path(auth_path)
+    if path.is_symlink():
+        return "unsafe_path"
+    if path.exists():
+        return "already_exists"
+
+    auth_mod = _load_bootstrap_auth_protocol()
+    if auth_mod is None:
+        return "protocol_unavailable"
+    try:
+        auth_mod.replace_auth_store_from_snapshot(
+            seed_raw,
+            target_path=path,
+            actor="docker_bootstrap",
+            reason="first boot auth bootstrap",
+            require_absent=True,
+            supersede_ambiguous=False,
+        )
+    except auth_mod.AuthStoreConflictError:
+        return "already_exists"
+    except auth_mod.AuthStoreCorruptError:
+        return "bad_seed"
+    except Exception:
+        return "protocol_error"
+    return "bootstrapped"
 
 
 def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
@@ -95,6 +173,8 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
       - "no_auth_file"     — auth.json absent (blank volume → let the normal
                              HERMES_AUTH_JSON_BOOTSTRAP path handle it)
       - "auth_unreadable"  — auth.json present but unparseable (leave as-is)
+      - "protocol_unavailable" — canonical writer cannot be imported; no-op
+      - "protocol_error"   — canonical locked mutation failed; no-op
       - "not_terminal"     — on-disk nous entry is healthy/absent → no-op
       - "reseeded"         — nous entry was terminal; replaced from seed
     """
@@ -109,61 +189,71 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
         # Blank volume — this is the normal first-boot case, not a re-seed.
         return "no_auth_file"
 
+    auth_mod = _load_auth_protocol()
+    if auth_mod is None:
+        return "protocol_unavailable"
+
+    path = Path(auth_path)
     try:
-        with open(auth_path, "r", encoding="utf-8") as fh:
-            store = json.load(fh)
-    except (OSError, ValueError):
-        # Corrupt/unreadable auth.json: do NOT overwrite blindly. A separate
-        # concern; leave it for the operator / other recovery paths.
+        with auth_mod._auth_store_lock(path):
+            store = auth_mod._load_auth_store(path, strict=True)
+
+            providers = store.get("providers")
+            if not isinstance(providers, dict):
+                providers = {}
+                store["providers"] = providers
+
+            if not _nous_entry_is_terminal(providers.get("nous")):
+                # Healthy, rotating, or absent nous entry — the load-bearing
+                # guard is checked again only after acquiring the shared lock.
+                return "not_terminal"
+
+            # Surgical replacement under the canonical lock/CAS protocol.
+            providers["nous"] = dict(seed_nous)
+            auth_mod._save_auth_store(store, target_path=path)
+    except auth_mod.AuthStoreCorruptError:
         return "auth_unreadable"
-
-    if not isinstance(store, dict):
-        return "auth_unreadable"
-
-    providers = store.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        store["providers"] = providers
-
-    if not _nous_entry_is_terminal(providers.get("nous")):
-        # Healthy, rotating, or absent nous entry — the load-bearing guard.
-        # Never clobber a good session; this is what makes the re-seed safe to
-        # push on every restart.
-        return "not_terminal"
-
-    # Surgical replacement: swap ONLY providers.nous, preserve everything else.
-    providers["nous"] = seed_nous
-
-    tmp_path = f"{auth_path}.rebootstrap.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(store, fh)
-    os.replace(tmp_path, auth_path)
-    try:
-        os.chmod(auth_path, 0o600)
-    except OSError:
-        pass
+    except Exception:
+        return "protocol_error"
     return "reseeded"
 
 
 def main() -> int:
-    auth_path = sys.argv[1] if len(sys.argv) > 1 else ""
+    bootstrap_mode = len(sys.argv) > 1 and sys.argv[1] == "--bootstrap"
+    path_index = 2 if bootstrap_mode else 1
+    auth_path = sys.argv[path_index] if len(sys.argv) > path_index else ""
     if not auth_path:
         home = os.environ.get("HERMES_HOME", "")
         auth_path = os.path.join(home, "auth.json") if home else "auth.json"
-    seed_raw = os.environ.get(REBOOTSTRAP_ENV, "")
+    seed_raw = os.environ.get(
+        BOOTSTRAP_ENV if bootstrap_mode else REBOOTSTRAP_ENV,
+        "",
+    )
 
     try:
-        result = reseed_if_terminal(auth_path, seed_raw)
+        result = (
+            bootstrap_if_absent(auth_path, seed_raw)
+            if bootstrap_mode
+            else reseed_if_terminal(auth_path, seed_raw)
+        )
     except Exception as exc:  # never let a re-seed error fail the boot
         print(f"[rebootstrap] error (ignored): {exc!r}", file=sys.stderr)
         return 0
 
-    if result == "reseeded":
+    if result == "bootstrapped":
+        print(f"[rebootstrap] created auth.json from {BOOTSTRAP_ENV}")
+    elif result == "reseeded":
         print("[rebootstrap] Nous bootstrap session was terminal; re-seeded auth.json from "
               f"{REBOOTSTRAP_ENV}")
     else:
         # Quiet by default for the common no-op cases; still emit a breadcrumb.
         print(f"[rebootstrap] no-op ({result})")
+    if bootstrap_mode and result not in {"bootstrapped", "already_exists", "no_seed"}:
+        print(
+            f"[rebootstrap] first-bootstrap failed closed ({result})",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

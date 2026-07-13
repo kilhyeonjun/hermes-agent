@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import subprocess
 import sys
 import types
@@ -165,9 +166,32 @@ def test_auto_sync_splits_default_personal_from_global_clients(monkeypatch, tmp_
 
     monkeypatch.setattr(codex_route.subprocess, "run", fake_run)
 
-    assert codex_route.sync_all_profiles() == []
+    payloads = {
+        str(home.resolve(strict=False)): json.dumps(
+            {
+                "version": codex_route.INTERNAL_PAYLOAD_VERSION,
+                "payload": {
+                    "accounts": [],
+                    "routing": {},
+                    "recommendation": {"label": "personal"},
+                },
+            }
+        )
+        for _name, home in homes
+    }
+    assert codex_route.sync_all_profiles(payloads, homes=homes) == []
     assert len(calls) == 3
-    commands = sorted((tuple(argv[3:]), kwargs["env"]["HERMES_HOME"]) for argv, kwargs in calls)
+    commands = sorted(
+        (
+            tuple(
+                arg
+                for arg in argv[3:]
+                if arg != "--internal-payload-stdin"
+            ),
+            kwargs["env"]["HERMES_HOME"],
+        )
+        for argv, kwargs in calls
+    )
     assert commands == sorted(
         [
             (("--profile-account", "personal", "--skip-cliproxy"), str(homes[0][1])),
@@ -180,6 +204,17 @@ def test_auto_sync_splits_default_personal_from_global_clients(monkeypatch, tmp_
         assert kwargs["shell"] is False
         assert kwargs["timeout"] == codex_route.PROFILE_SYNC_TIMEOUT
         assert kwargs["env"]["HERMES_CODEX_ROUTE_LOCK_HELD"] == "1"
+        expected_payload = payloads[
+            str(Path(kwargs["env"]["HERMES_HOME"]).resolve(strict=False))
+        ]
+        assert kwargs["input"] == expected_payload
+
+    default_inputs = [
+        kwargs["input"]
+        for _argv, kwargs in calls
+        if kwargs["env"]["HERMES_HOME"] == str(homes[0][1])
+    ]
+    assert default_inputs == [payloads[str(homes[0][1].resolve())]] * 2
 
 
 def test_fixed_sync_keeps_default_and_global_clients_in_one_transaction(
@@ -202,8 +237,31 @@ def test_fixed_sync_keeps_default_and_global_clients_in_one_transaction(
 
     monkeypatch.setattr(codex_route.subprocess, "run", fake_run)
 
-    assert codex_route.sync_all_profiles() == []
-    commands = sorted((tuple(argv[3:]), kwargs["env"]["HERMES_HOME"]) for argv, kwargs in calls)
+    payloads = {
+        str(home.resolve(strict=False)): json.dumps(
+            {
+                "version": codex_route.INTERNAL_PAYLOAD_VERSION,
+                "payload": {
+                    "accounts": [],
+                    "routing": {},
+                    "recommendation": {"label": "company"},
+                },
+            }
+        )
+        for _name, home in homes
+    }
+    assert codex_route.sync_all_profiles(payloads, homes=homes) == []
+    commands = sorted(
+        (
+            tuple(
+                arg
+                for arg in argv[3:]
+                if arg != "--internal-payload-stdin"
+            ),
+            kwargs["env"]["HERMES_HOME"],
+        )
+        for argv, kwargs in calls
+    )
     assert commands == sorted(
         [
             ((), str(homes[0][1])),
@@ -226,7 +284,9 @@ def test_profile_sync_failure_redacts_child_output(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(codex_route.subprocess, "run", lambda *_args, **_kwargs: result)
 
-    detail = codex_route._sync_profile("gameduo", tmp_path / "gameduo")
+    detail = codex_route._sync_profile(
+        "gameduo", tmp_path / "gameduo", '{"accounts":[]}'
+    )
 
     assert detail is not None
     assert secret not in detail
@@ -246,7 +306,9 @@ def test_profile_sync_launch_error_is_force_redacted(monkeypatch, tmp_path):
     monkeypatch.setattr(codex_route.subprocess, "run", fail_run)
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
 
-    detail = codex_route._sync_profile("gameduo", tmp_path / "gameduo")
+    detail = codex_route._sync_profile(
+        "gameduo", tmp_path / "gameduo", '{"accounts":[]}'
+    )
 
     assert secret not in detail
     assert detail.startswith("gameduo: sync launch failed: ")
@@ -271,11 +333,20 @@ def test_partial_profile_failure_restores_policy_and_attempts_full_rollback(monk
     rounds = iter([["gameduo: sync failed"], ["penguincouple: rollback failed"]])
     calls = []
 
-    def fake_sync():
+    def fake_sync(_payloads, *, homes):
+        assert homes
         calls.append(policy.read_text(encoding="utf-8"))
         return next(rounds)
 
     monkeypatch.setattr(codex_route, "sync_all_profiles", fake_sync)
+    monkeypatch.setattr(
+        codex_route,
+        "collect_profile_payloads",
+        lambda homes: (
+            {str(home.resolve(strict=False)): '{"version":1,"payload":{"accounts":[],"routing":{},"recommendation":{}}}' for _name, home in homes},
+            [],
+        ),
+    )
 
     result = codex_route.main(["company"])
 
@@ -309,7 +380,8 @@ def test_unexpected_sync_exception_still_restores_and_runs_rollback(
     monkeypatch.setattr(codex_route, "POLICY_PATH", policy)
     calls = 0
 
-    def fake_sync():
+    def fake_sync(_payloads, *, homes):
+        assert homes
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -317,6 +389,14 @@ def test_unexpected_sync_exception_still_restores_and_runs_rollback(
         return []
 
     monkeypatch.setattr(codex_route, "sync_all_profiles", fake_sync)
+    monkeypatch.setattr(
+        codex_route,
+        "collect_profile_payloads",
+        lambda homes: (
+            {str(home.resolve(strict=False)): '{"version":1,"payload":{"accounts":[],"routing":{},"recommendation":{}}}' for _name, home in homes},
+            [],
+        ),
+    )
 
     assert codex_route.main(["company"]) == 1
     assert calls == 2
@@ -324,6 +404,120 @@ def test_unexpected_sync_exception_still_restores_and_runs_rollback(
     output = capsys.readouterr().out
     assert "profile sync raised RuntimeError" in output
     assert "rollback 완료" in output
+
+
+def test_apply_mode_collects_once_per_unique_home_before_route_lock(
+    monkeypatch, tmp_path
+):
+    from contextlib import contextmanager
+    from hermes_cli import codex_route
+
+    default = tmp_path / "default"
+    named = tmp_path / "named"
+    homes = [("default", default), ("named", named)]
+    events: list[str] = []
+    payloads = {
+        str(default.resolve(strict=False)): '{"version":1,"payload":{"accounts":[],"routing":{},"recommendation":{}}}',
+        str(named.resolve(strict=False)): '{"version":1,"payload":{"accounts":[],"routing":{},"recommendation":{}}}',
+    }
+
+    monkeypatch.setattr(codex_route, "profile_homes", lambda: homes)
+
+    def fake_collect(received_homes):
+        assert received_homes == homes
+        events.append("collect")
+        return payloads, []
+
+    @contextmanager
+    def fake_lock(*, path, timeout):
+        events.append("lock")
+        yield
+        events.append("unlock")
+
+    def fake_apply(mode, *, homes, payloads):
+        assert mode == "auto"
+        assert homes == [("default", default), ("named", named)]
+        assert payloads == payloads_expected
+        events.append("apply")
+        return "ok"
+
+    payloads_expected = payloads
+    monkeypatch.setattr(codex_route, "collect_profile_payloads", fake_collect)
+    monkeypatch.setattr(codex_route, "route_lock", fake_lock)
+    monkeypatch.setattr(codex_route, "_apply_mode_locked", fake_apply)
+
+    assert codex_route.apply_mode("auto") == "ok"
+    assert events == ["collect", "lock", "apply", "unlock"]
+
+
+def test_apply_mode_rejects_payloads_aged_during_parallel_collection(
+    monkeypatch, tmp_path
+):
+    from contextlib import contextmanager
+    from hermes_cli import codex_route
+
+    default = tmp_path / "default"
+    named = tmp_path / "named"
+    homes = [("default", default), ("named", named)]
+    now = {"value": 0.0}
+    collections = {"count": 0}
+    payloads = {
+        str(default.resolve(strict=False)): '{"version":1,"payload":{"accounts":[],"routing":{},"recommendation":{}}}',
+        str(named.resolve(strict=False)): '{"version":1,"payload":{"accounts":[],"routing":{},"recommendation":{}}}',
+    }
+
+    monkeypatch.setattr(codex_route, "profile_homes", lambda: homes)
+    monkeypatch.setattr(codex_route.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(codex_route, "COLLECTED_PAYLOAD_MAX_AGE_SECONDS", 15.0)
+
+    def fake_collect(received_homes):
+        assert received_homes == homes
+        collections["count"] += 1
+        now["value"] += 16.0
+        return payloads, []
+
+    @contextmanager
+    def fake_lock(*, path, timeout):
+        yield
+
+    monkeypatch.setattr(codex_route, "collect_profile_payloads", fake_collect)
+    monkeypatch.setattr(codex_route, "route_lock", fake_lock)
+    monkeypatch.setattr(
+        codex_route,
+        "_apply_mode_locked",
+        lambda *_args, **_kwargs: pytest.fail("stale payloads must not be applied"),
+    )
+
+    with pytest.raises(codex_route.RouteApplyError, match="payload changed"):
+        codex_route.apply_mode("auto")
+
+    assert collections["count"] == 2
+
+
+def test_collection_failure_never_acquires_route_lock_or_writes_policy(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import codex_route
+
+    policy = tmp_path / "codex_route_policy.json"
+    original = b'{"mode":"auto"}\n'
+    policy.write_bytes(original)
+    monkeypatch.setattr(codex_route, "POLICY_PATH", policy)
+    monkeypatch.setattr(
+        codex_route,
+        "collect_profile_payloads",
+        lambda _homes: ({}, ["default: payload collection failed"]),
+    )
+    monkeypatch.setattr(
+        codex_route,
+        "route_lock",
+        lambda **_kwargs: pytest.fail("collection failure must precede lock"),
+    )
+
+    with pytest.raises(codex_route.RouteApplyError, match="collection failed"):
+        codex_route.apply_mode("auto")
+
+    assert policy.read_bytes() == original
 
 
 def test_top_level_codex_route_dispatches_mode_to_handler(monkeypatch):

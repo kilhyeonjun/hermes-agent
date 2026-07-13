@@ -206,6 +206,10 @@ class CLICommandsMixin:
                 pass
             if restore_quick_snapshot(snap_id):
                 print(f"  Restored state from: {snap_id}")
+                print(
+                    "  Credentials were left unchanged "
+                    "(auth.json is not restored by /snapshot)."
+                )
                 print("  Restart recommended for state.db changes to take effect.")
             else:
                 print(f"  Snapshot not found: {snap_id}")

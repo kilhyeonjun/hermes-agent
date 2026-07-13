@@ -7,8 +7,9 @@ credentials untouched.
 
 Where this fits relative to the existing pieces:
 
-* ``hermes profile export/import`` — local backup / restore for a profile
-  on your own machine. NOT a distribution format. Stays as-is.
+* ``hermes profile export/import`` — portable profile transfer with documented
+  root-credential and machine-local exclusions. NOT a complete backup or a
+  distribution format; use ``hermes backup`` for trusted local recovery.
 * ``hermes skills install <url>`` — the URL install pattern we're mirroring,
   but at the profile granularity.
 
@@ -54,7 +55,7 @@ Update semantics:
   distribution.yaml) are replaced from the new source.
 * ``config.yaml`` is distribution-owned but preserved on update unless
   ``--force-config`` is passed (user overrides typically live here).
-* User-owned paths (memories/, sessions/, state.db, auth.json, .env,
+* User-owned paths (memories/, sessions/, state.db, auth.json, .env, .op.env,
   logs/, workspace/, home/, plans/, *_cache/, and anything under
   ``local/``) are never touched.
 """
@@ -99,7 +100,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
 # convention for user customizations.
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets
-    "auth.json", ".env",
+    "auth.json", ".env", ".op.env",
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",
     "hermes_state.db", "response_store.db",

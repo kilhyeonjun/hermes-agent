@@ -381,6 +381,44 @@ def test_shell_runner_does_not_depend_on_optional_host_live_guard() -> None:
     assert '"$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py"' in script
 
 
+def test_shell_runner_supports_native_windows_virtualenv_layout(tmp_path: Path) -> None:
+    """The canonical wrapper selects ``Scripts/python.exe`` when ``bin`` is absent."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is unavailable")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    fake_repo = tmp_path / "repo"
+    scripts_dir = fake_repo / "scripts"
+    windows_venv = fake_repo / ".venv" / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    windows_venv.mkdir(parents=True)
+    shutil.copy2(repo_root / "scripts" / "run_tests.sh", scripts_dir)
+    (scripts_dir / "run_tests_parallel.py").write_text("# probe\n", encoding="utf-8")
+    fake_python = windows_venv / "python.exe"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/invocation.txt\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    proc = subprocess.run(
+        [bash, str(scripts_dir / "run_tests.sh"), "tests/example.py", "-q"],
+        cwd=fake_repo,
+        env={**os.environ, "HOME": str(tmp_path / "home")},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    invocation = (windows_venv / "invocation.txt").read_text(encoding="utf-8")
+    assert str(scripts_dir / "run_tests_parallel.py") in invocation
+    assert "tests/example.py" in invocation
+
+
 def test_runner_fails_if_caller_live_state_changes(tmp_path: Path) -> None:
     """A direct-path escape is detected even when it bypasses guarded APIs."""
     repo_root = Path(__file__).resolve().parent.parent

@@ -626,7 +626,7 @@ Profiles 是构建在 `HERMES_HOME` 之上的托管层。您*可以*在每次命
 
 ### Profiles 共享记忆或会话吗？
 
-不共享。每个 profile 都有自己独立的记忆存储、会话数据库和技能目录，完全隔离。如果您想用现有的记忆和会话创建新 profile，请使用 `hermes profile create newname --clone-all` 从当前 profile 复制所有内容，或添加 `--clone-from <profile>` 从指定源 profile 复制。
+不共享。每个 profile 都有独立的记忆存储、会话数据库、技能目录、环境文件和规范认证存储。若要沿用现有工作配置和记忆，可使用 `hermes profile create newname --clone-all`，并可添加 `--clone-from <profile>`。Clone-all 会复制源 profile 的 `.env` 静态凭据，但主动排除 sessions、历史数据库、`auth.json`、`auth.lock` 和根 `.op.env`；请检查复制的静态 key，并在新 profile 中重新认证 OAuth provider，不要共享 refresh token。
 
 ### 运行 `hermes update` 时会发生什么？
 
@@ -768,7 +768,7 @@ skills:
    hermes import ~/hermes-backup-<timestamp>.zip
    ```
 
-4. 在新机器上运行 `hermes setup` 以验证 API key 和提供商配置是否正常工作。
+4. 在新机器上运行 `hermes setup` 以验证 API key 和提供商配置是否正常工作。Codex OAuth generation 不会迁移到新主机，因此请在新机器上重新认证 Codex。
 
 ### 将单个 profile 迁移到另一台机器
 
@@ -776,13 +776,13 @@ skills:
 
 ```bash
 # 在源机器上
-hermes profile export work ./work-backup.tar.gz
+hermes profile export work -o ./work-backup.tar.gz
 
 # 将文件复制到目标机器，然后：
-hermes profile import ./work-backup.tar.gz work
+hermes profile import ./work-backup.tar.gz --name work
 ```
 
-导入的 profile 将包含导出时的所有配置、记忆、会话和技能。如果新机器的设置不同，您可能需要更新路径或重新向提供商进行身份验证。
+导入的 profile 将包含导出归档中的可移植配置、记忆、会话和技能。根 `auth.json`、`auth.lock`、`.env` 和 `.op.env` 会被排除，并创建空白私有 `.env`；机器本地的 `home/`、备份/快照/checkpoint 树以及 symlink 也会被排除或拒绝。嵌套项目文件仍会保留，因此共享前请检查归档，并在导入后重新认证 provider。
 
 ### `hermes backup` 与 `hermes profile export` 的对比
 
@@ -791,7 +791,7 @@ hermes profile import ./work-backup.tar.gz work
 | **使用场景** | **整机迁移** | **移植/共享特定 profile** |
 | **范围** | 全局（整个 `~/.hermes` 目录） | 局部（单个 profile 目录） |
 | **包含内容** | 所有 profiles、全局配置、API key、会话 | 单个 profile：SOUL.md、记忆、会话、技能 |
-| **凭据** | **包含**（`.env` 和 `auth.json`） | **排除**（为安全共享而剥离） |
+| **凭据** | 归档包含 `.env` 和 `auth.json`；导入通过规范认证事务恢复，保留主机本地 lock/WAL 状态，并要求在新主机重新认证 Codex | 排除根 `auth.json`、`auth.lock`、`.env` 和 `.op.env`；保留嵌套文件——共享前请检查 |
 | **格式** | `.zip` | `.tar.gz` |
 
 **手动备选方案（rsync）：** 如果您倾向于直接复制文件，请排除代码仓库：
@@ -800,7 +800,7 @@ rsync -av --exclude='hermes-agent' ~/.hermes/ newmachine:~/.hermes/
 ```
 
 :::tip
-`hermes backup` 即使在 Hermes 正在运行时也能生成一致的快照。还原的归档文件不包含机器本地的运行时文件，如 `gateway.pid` 和 `cron.pid`。
+`hermes backup` 即使在 Hermes 正在运行时也能生成一致的快照。导入时会保留机器本地运行时文件、`auth.lock` 以及 Codex refresh lock/key/WAL 状态，而不会用归档副本覆盖它们。
 :::
 
 ### 安装后重新加载 shell 时出现权限拒绝

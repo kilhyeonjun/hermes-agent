@@ -352,14 +352,20 @@ def test_resolve_xai_runtime_credentials_refreshes_expiring_token(tmp_path, monk
     new_access = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
     called = {"count": 0}
 
-    def _fake_refresh(tokens, **kwargs):
+    def _fake_refresh(access_token, refresh_token, **kwargs):
         called["count"] += 1
-        updated = dict(tokens)
-        updated["access_token"] = new_access
-        updated["refresh_token"] = "rt-new"
-        return updated
+        assert access_token == expiring
+        assert refresh_token == "rt-old"
+        return {
+            "access_token": new_access,
+            "refresh_token": "rt-new",
+            "id_token": "",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-13T00:00:00Z",
+        }
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
 
     creds = resolve_xai_oauth_runtime_credentials()
     assert called["count"] == 1
@@ -379,17 +385,77 @@ def test_resolve_xai_runtime_credentials_force_refresh(tmp_path, monkeypatch):
     forced = _jwt_with_exp(int(time.time()) + 7200)
     called = {"count": 0}
 
-    def _fake_refresh(tokens, **kwargs):
+    def _fake_refresh(access_token, refresh_token, **kwargs):
         called["count"] += 1
-        updated = dict(tokens)
-        updated["access_token"] = forced
-        return updated
+        assert access_token == fresh
+        assert refresh_token == "refresh"
+        return {
+            "access_token": forced,
+            "refresh_token": refresh_token,
+            "id_token": "",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-13T00:00:00Z",
+        }
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
 
     creds = resolve_xai_oauth_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
     assert called["count"] == 1
     assert creds["api_key"] == forced
+
+
+def test_direct_xai_refresh_clears_matching_device_alias_health(
+    tmp_path,
+    monkeypatch,
+):
+    """A singleton refresh revives every alias of the same grant."""
+    from agent.credential_pool import load_pool
+
+    hermes_home = tmp_path / "hermes"
+    auth_file = _setup_hermes_auth(
+        hermes_home,
+        access_token="old-access",
+        refresh_token="old-refresh",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    raw = json.loads(auth_file.read_text())
+    raw["credential_pool"] = {
+        "xai-oauth": [
+            {
+                "id": "device-alias",
+                "label": "device-alias",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "device_code",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "last_status": "exhausted",
+                "last_error_code": "rate_limit_exceeded",
+                "last_error_reset_at": time.time() + 3600,
+            }
+        ]
+    }
+    auth_file.write_text(json.dumps(raw))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _refresh(*_args, **_kwargs):
+        return {
+            "access_token": _jwt_with_exp(int(time.time()) + 7200),
+            "refresh_token": "new-refresh",
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-13T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _refresh)
+
+    resolve_xai_oauth_runtime_credentials(force_refresh=True)
+
+    alias = json.loads(auth_file.read_text())["credential_pool"]["xai-oauth"][0]
+    assert alias["last_status"] is None
+    assert alias["last_error_code"] is None
+    assert alias["last_error_reset_at"] is None
+    assert load_pool("xai-oauth").has_available()
 
 
 def test_resolve_xai_runtime_credentials_honours_env_base_url(tmp_path, monkeypatch):
@@ -575,7 +641,7 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
     _seed_xai_oauth_state(hermes_home, dict(_STALE_XAI_OAUTH_STATE), active_provider="nous")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    def _terminal_refresh(tokens, **kwargs):
+    def _terminal_refresh(*_args, **_kwargs):
         raise AuthError(
             "xAI token refresh failed. Response: invalid_grant",
             provider="xai-oauth",
@@ -583,7 +649,7 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
             relogin_required=True,
         )
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _terminal_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _terminal_refresh)
 
     with pytest.raises(AuthError) as exc_info:
         resolve_xai_oauth_runtime_credentials(force_refresh=True)
@@ -606,7 +672,7 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
     assert isinstance(err, dict)
     assert err["provider"] == "xai-oauth"
     assert err["code"] == "xai_refresh_failed"
-    assert err["reason"] == "runtime_refresh_failure"
+    assert err["reason"] == "coordinated_refresh_failure"
     assert err["relogin_required"] is True
     assert "at" in err
 
@@ -625,7 +691,7 @@ def test_resolve_credentials_does_not_quarantine_on_transient_refresh_failure(
     _seed_xai_oauth_state(hermes_home, dict(_STALE_XAI_OAUTH_STATE))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    def _transient_refresh(tokens, **kwargs):
+    def _transient_refresh(*_args, **_kwargs):
         raise AuthError(
             "xAI token refresh failed: connection error",
             provider="xai-oauth",
@@ -633,7 +699,7 @@ def test_resolve_credentials_does_not_quarantine_on_transient_refresh_failure(
             relogin_required=False,
         )
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _transient_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _transient_refresh)
 
     with pytest.raises(AuthError) as exc_info:
         resolve_xai_oauth_runtime_credentials(force_refresh=True)
@@ -1600,49 +1666,49 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
     # Load the pool once so the in-memory entry is seeded with rt-stale.
     pool = load_pool("xai-oauth")
 
-    # Now simulate "another process refreshed the tokens" by overwriting
-    # the singleton on disk WITHOUT touching this process's pool object.
+    # Simulate a cooperating process rotating the source generation under the
+    # canonical transaction. It updates both the singleton alias and the exact
+    # source pool row, while this process retains the stale in-memory entry.
     other_process_at = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
-    raw = json.loads((hermes_home / "auth.json").read_text())
-    raw["providers"]["xai-oauth"]["tokens"] = {
-        "access_token": other_process_at,
-        "refresh_token": "rt-rotated-by-other-process",
-        "id_token": "",
-        "expires_in": 3600,
-        "token_type": "Bearer",
-    }
-    (hermes_home / "auth.json").write_text(json.dumps(raw))
+    from hermes_cli import auth as auth_mod
 
-    refresh_calls = {"refresh_token_seen": None}
-    final_at = _jwt_with_exp(int(time.time()) + 7200)
-
-    def _fake_refresh(access_token, refresh_token, **kwargs):
-        # The pool MUST have adopted the rotated token from auth.json before
-        # POSTing the refresh — otherwise it would replay the stale one.
-        refresh_calls["refresh_token_seen"] = refresh_token
-        return {
-            "access_token": final_at,
-            "refresh_token": "rt-final",
+    def _rotate_source_generation(store):
+        rotated = {
+            "access_token": other_process_at,
+            "refresh_token": "rt-rotated-by-other-process",
             "id_token": "",
             "expires_in": 3600,
             "token_type": "Bearer",
-            "last_refresh": "2026-05-15T05:00:00Z",
         }
+        store["providers"]["xai-oauth"]["tokens"] = dict(rotated)
+        for row in store["credential_pool"]["xai-oauth"]:
+            if row.get("source") == "device_code":
+                row["access_token"] = rotated["access_token"]
+                row["refresh_token"] = rotated["refresh_token"]
 
-    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
+    auth_mod.mutate_auth_store(_rotate_source_generation)
+
+    refresh_calls = {"count": 0}
+
+    def _unexpected_refresh(*_args, **_kwargs):
+        refresh_calls["count"] += 1
+        raise AssertionError("rotated source generation must be adopted without POST")
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _unexpected_refresh)
 
     selected = pool.select()
     assert selected is not None
-    assert refresh_calls["refresh_token_seen"] == "rt-rotated-by-other-process"
-    assert selected.access_token == final_at
+    assert refresh_calls["count"] == 0
+    assert selected.access_token == other_process_at
+    assert selected.refresh_token == "rt-rotated-by-other-process"
 
 
-def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, monkeypatch):
-    """Variant of the multi-process race where the other process refreshes
-    BETWEEN our proactive sync and the HTTP POST.  Our refresh fails with a
-    consumed-token error; we must re-check auth.json, find the fresh pair
-    (written by the racing process), and adopt it instead of marking the
-    entry exhausted."""
+def test_pool_refresh_rejects_noncooperative_peer_write_during_post(tmp_path, monkeypatch):
+    """A writer that bypasses the source lock during POST must trigger CAS.
+
+    The stale caller must not overwrite or claim the peer generation as its
+    own successful refresh result.
+    """
     from agent.credential_pool import load_pool
 
     hermes_home = tmp_path / "hermes"
@@ -1666,6 +1732,10 @@ def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, mo
             "expires_in": 3600,
             "token_type": "Bearer",
         }
+        for row in raw["credential_pool"]["xai-oauth"]:
+            if row.get("source") == "device_code":
+                row["access_token"] = other_process_at
+                row["refresh_token"] = "rt-rotated"
         (hermes_home / "auth.json").write_text(json.dumps(raw))
         raise AuthError(
             "refresh_token_reused",
@@ -1676,12 +1746,14 @@ def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, mo
 
     monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
 
-    selected = pool.select()
-    # Even though refresh_xai_oauth_pure raised, the post-failure
-    # recovery path should adopt the fresher singleton tokens.
-    assert selected is not None
-    assert selected.access_token == other_process_at
-    assert selected.refresh_token == "rt-rotated"
+    from hermes_cli.auth import AuthStoreConflictError
+
+    with pytest.raises(AuthStoreConflictError, match="changed since load"):
+        pool.select()
+
+    raw = json.loads((hermes_home / "auth.json").read_text())
+    assert raw["providers"]["xai-oauth"]["tokens"]["access_token"] == other_process_at
+    assert raw["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "rt-rotated"
 
 
 def test_pool_exhausted_xai_entry_recovers_after_singleton_refresh(tmp_path, monkeypatch):

@@ -79,8 +79,8 @@ hermes profile create <name> [options]
 | 参数 / 选项 | 描述 |
 |-------------------|-------------|
 | `<name>` | 新 profile 的名称。必须是合法的目录名（字母数字、连字符、下划线）。 |
-| `--clone` | 从当前 profile 复制 `config.yaml`、`.env`、`SOUL.md` 和 skills。 |
-| `--clone-all` | 从当前 profile 复制所有内容（config、memories、skills、cron、plugins）。会排除每个 profile 自己的历史数据：sessions、`state.db`、backups、state-snapshots、checkpoints。 |
+| `--clone` | 从当前 profile 复制 `config.yaml`、`.env`、`SOUL.md`、skills，以及整理后的 `memories/MEMORY.md` 和 `memories/USER.md`。会话和运行时状态会重新开始。 |
+| `--clone-all` | 从当前 profile 复制工作状态（config、`.env` 静态凭据、memories、skills、cron、plugins）。会排除规范 `auth.json`/`auth.lock`、根 `.op.env` 和每个 profile 自己的历史数据：sessions、`state.db`、backups、state-snapshots、checkpoints。请检查复制的静态 key，并在克隆后重新认证 OAuth provider。 |
 | `--clone-from <profile>` | 从指定 profile 克隆 config/skills/SOUL，而非当前 profile。除非与 `--clone-all` 配合使用，否则会隐含 `--clone`。 |
 | `--no-alias` | 跳过 wrapper 脚本创建。 |
 | `--description "<text>"` | 一到两句话描述该 profile 的用途。供 kanban 编排器根据角色而非仅凭 profile 名称来路由任务。可跳过，稍后通过 `hermes profile describe` 添加。持久化保存在 `<profile_dir>/profile.yaml` 中。 |
@@ -97,13 +97,13 @@ hermes profile create mybot
 # 仅从当前 profile 克隆 config
 hermes profile create work --clone
 
-# 从当前 profile 克隆所有内容
+# 从当前 profile 克隆工作状态（排除认证和历史）
 hermes profile create backup --clone-all
 
 # 从指定 profile 克隆 config
 hermes profile create work2 --clone-from work
 
-# 从指定 profile 克隆所有内容
+# 从指定 profile 克隆工作状态（排除认证和历史）
 hermes profile create work2-backup --clone-from work --clone-all
 ```
 
@@ -249,6 +249,13 @@ hermes profile export <name> [options]
 
 将 profile 导出为压缩的 tar.gz 归档文件。
 
+归档会排除 profile 根目录的凭据文件 `auth.json`、`auth.lock`、`.env` 和
+`.op.env`（包括其硬链接别名），以及机器本地的 `home/`、`backups/`、
+`state-snapshots/` 和 `checkpoints/`。Export 会拒绝 symlink。嵌套项目文件
+即使名称类似凭据也会保留，因此这不是通用的 secret 清理器。跨越当前信任
+边界共享之前，请先检查归档内容；完整且受信任的本机备份请使用
+`hermes backup`。
+
 | 参数 / 选项 | 描述 |
 |-------------------|-------------|
 | `<name>` | 要导出的 profile。 |
@@ -270,6 +277,11 @@ hermes profile import <archive> [options]
 ```
 
 从 tar.gz 归档文件导入 profile。
+
+导入会拒绝 profile 根目录的 `auth.json`、`auth.lock`、`.env` 和 `.op.env`
+以及所有 symlink 条目，随后为新 profile 创建一个空白的私有根 `.env`
+（`0600`）。嵌套项目文件会保留。命名 profile 不会继承启动 shell 或仓库
+`.env` 中的凭据变量；请在新 profile 中显式配置凭据。
 
 | 参数 / 选项 | 描述 |
 |-------------------|-------------|
@@ -293,12 +305,12 @@ hermes profile import ./work-2026-03-29.tar.gz --name work-restored
 
 发行版将 profile 转变为可共享、有版本的制品，以 **git 仓库**形式发布。接收方只需一条命令即可安装发行版，并可在不影响本地 memories、sessions 或凭据的情况下就地更新。
 
-`auth.json` 和 `.env` 永远不属于发行版的一部分 — 它们保留在安装用户的机器上。
+`auth.json`、`.env` 和 `.op.env` 永远不属于发行版的一部分 — 它们保留在安装用户的机器上。
 
 接收方的用户数据（memories、sessions、auth、对 `.env` 的自有编辑）在初次安装和后续更新中始终得到保留。
 
 :::info
-`hermes profile export` / `import` 仍是在**本机进行 profile 本地备份和恢复**的正确命令。发行版（`install` / `update` / `info`）是独立概念：通过 git 分发 profile，供他人安装。
+`hermes profile export` / `import` 仍是进行**可移植 profile 迁移**的正确命令，并遵守文档所述的根凭据与机器本地数据排除规则。发行版（`install` / `update` / `info`）是独立概念：通过 git 分发 profile，供他人安装。
 :::
 
 ### `hermes profile install`

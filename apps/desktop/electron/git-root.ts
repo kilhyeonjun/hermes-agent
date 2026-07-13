@@ -1,9 +1,17 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { assertHermesAuthPathAllowed } from './fs-mutations'
 import { resolveRequestedPathForIpc } from './hardening'
 
-function findGitRoot(start, fsImpl = fs) {
+type GitRepositoryGuardOptions = {
+  codexRefreshStateDir?: string
+  fs?: typeof fs
+  hermesHome: string
+  purpose?: string
+}
+
+function findGitRoot(start: string, fsImpl: typeof fs = fs): string | null {
   let dir = start
 
   for (let i = 0; i < 50; i += 1) {
@@ -27,7 +35,10 @@ function findGitRoot(start, fsImpl = fs) {
   return null
 }
 
-async function gitRootForIpc(startPath, options: { fs?: typeof fs } = {}) {
+async function gitRootForIpc(
+  startPath: unknown,
+  options: { fs?: typeof fs } = {}
+): Promise<string | null> {
   const fsImpl = options.fs || fs
   let resolved
 
@@ -47,4 +58,33 @@ async function gitRootForIpc(startPath, options: { fs?: typeof fs } = {}) {
   }
 }
 
-export { findGitRoot, gitRootForIpc }
+async function guardGitRepositoryForIpc(
+  startPath: unknown,
+  options: GitRepositoryGuardOptions
+): Promise<string> {
+  const fsImpl = options.fs || fs
+  const purpose = String(options.purpose || 'Git repository operation')
+  const resolved = resolveRequestedPathForIpc(startPath, { purpose })
+  const guardOptions = {
+    codexRefreshStateDir: options.codexRefreshStateDir,
+    fs: fsImpl,
+    hermesHome: options.hermesHome,
+    mode: 'tree' as const,
+    purpose
+  }
+
+  assertHermesAuthPathAllowed(resolved, guardOptions)
+  const repositoryRoot = await gitRootForIpc(resolved, { fs: fsImpl })
+
+  if (!repositoryRoot) {
+    return resolved
+  }
+  assertHermesAuthPathAllowed(repositoryRoot, {
+    ...guardOptions,
+    purpose: `${purpose} repository root`
+  })
+
+  return repositoryRoot
+}
+
+export { findGitRoot, guardGitRepositoryForIpc, gitRootForIpc }

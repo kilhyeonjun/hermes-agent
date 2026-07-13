@@ -532,7 +532,7 @@ same auth gate as the rest of `/api/`.
 | `DELETE /api/webhooks/{name}` | Remove a subscription |
 | `GET /api/credentials/pool` | List pooled rotation keys (redacted) |
 | `POST /api/credentials/pool` | Add a key. Body: `{provider, api_key, label?}` |
-| `DELETE /api/credentials/pool/{provider}/{index}` | Remove a key (1-based index) |
+| `DELETE /api/credentials/pool/{provider}/entries/{credential_id}` | Remove exactly one stable credential ID (URL-encode the ID) |
 | `GET /api/memory` | Active provider + available providers + built-in file sizes |
 | `PUT /api/memory/provider` | Select a provider (empty = built-in only) |
 | `POST /api/memory/reset` | Reset built-in memory. Body: `{target: all\|memory\|user}` |

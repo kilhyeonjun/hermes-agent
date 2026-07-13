@@ -137,6 +137,42 @@ def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_
     ]
 
 
+def test_collect_read_only_disables_pool_reconciliation_and_refresh(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    calls = {"read_only": None, "available": None}
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, *, clear_expired, refresh):
+            calls["available"] = (clear_expired, refresh)
+            return []
+
+        def _routable_entries(self, values):
+            return values
+
+        def entries(self):
+            return []
+
+    def _load_pool(_provider, *, read_only=False):
+        calls["read_only"] = read_only
+        return Pool()
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", _load_pool)
+    monkeypatch.setattr(
+        codex_usage,
+        "ROUTE_POLICY_PATH",
+        tmp_path / "missing-policy.json",
+    )
+
+    codex_usage.collect(mutate=False)
+
+    assert calls == {"read_only": True, "available": (False, False)}
+
+
 def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_path):
     import json
 

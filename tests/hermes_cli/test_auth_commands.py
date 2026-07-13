@@ -153,7 +153,7 @@ def test_auth_add_qwen_oauth_sets_active_provider(tmp_path, monkeypatch):
     # Prevent _seed_from_singletons from calling the real Qwen CLI file path
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
 
     from hermes_cli.auth_commands import auth_add_command
@@ -396,6 +396,145 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert entry["access_token"] == token
     assert entry["refresh_token"] == "refresh-token"
     assert entry["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert len(entry["grant_id"]) == 32
+    assert all(char in "0123456789abcdef" for char in entry["grant_id"])
+
+
+def test_named_profile_auth_add_codex_never_mutates_root_fallback(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    root_store = _codex_pool_only_store()
+    root_store["providers"]["openai-codex"] = {
+        "tokens": {
+            "access_token": "root-singleton-access",
+            "refresh_token": "root-singleton-refresh",
+        },
+        "grant_id": "b" * 32,
+    }
+    root_store["credential_pool"]["openai-codex"].append(
+        {
+            "id": "root-device",
+            "label": "root-singleton",
+            "auth_type": "oauth",
+            "priority": 1,
+            "source": "device_code",
+            "access_token": "root-singleton-access",
+            "refresh_token": "root-singleton-refresh",
+            "grant_id": "b" * 32,
+        }
+    )
+    (root / "auth.json").write_text(json.dumps(root_store, indent=2))
+    (profile / "auth.json").write_text(
+        json.dumps({"version": 1, "providers": {}, "credential_pool": {}}, indent=2)
+    )
+    root_before = (root / "auth.json").read_bytes()
+    token = _jwt_with_email("profile-codex@example.com")
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {
+                "access_token": token,
+                "refresh_token": "profile-refresh-token",
+            },
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "last_refresh": "2026-07-13T15:00:00Z",
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "openai-codex"
+        auth_type = "oauth"
+        api_key = None
+        label = None
+
+    auth_add_command(_Args())
+
+    assert (root / "auth.json").read_bytes() == root_before
+    saved = json.loads((profile / "auth.json").read_text())
+    rows = saved["credential_pool"]["openai-codex"]
+    assert len(rows) == 1
+    assert rows[0]["access_token"] == token
+    assert rows[0]["refresh_token"] == "profile-refresh-token"
+
+
+def test_named_profile_auth_add_xai_never_mutates_root_fallback(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    root.mkdir(parents=True, exist_ok=True)
+    root_path = root / "auth.json"
+    root_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "root-xai-access",
+                            "refresh_token": "root-xai-refresh",
+                        }
+                    }
+                },
+            },
+            indent=2,
+        )
+    )
+    (profile / "auth.json").write_text(
+        json.dumps({"version": 1, "providers": {}, "credential_pool": {}}, indent=2)
+    )
+    root_before = root_path.read_bytes()
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_oauth_device_code_login",
+        lambda **_kwargs: {
+            "tokens": {
+                "access_token": "profile-xai-access",
+                "refresh_token": "profile-xai-refresh",
+                "token_type": "Bearer",
+            },
+            "discovery": {"token_endpoint": "https://auth.x.ai/token"},
+            "redirect_uri": "",
+            "base_url": "https://api.x.ai/v1",
+            "last_refresh": "2026-07-13T15:10:00Z",
+            "source": "oauth-device-code",
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "xai-oauth"
+        auth_type = "oauth"
+        api_key = None
+        label = None
+        timeout = None
+        no_browser = False
+
+    auth_add_command(_Args())
+
+    assert root_path.read_bytes() == root_before
+    saved = json.loads((profile / "auth.json").read_text())
+    assert (
+        saved["providers"]["xai-oauth"]["tokens"]["refresh_token"]
+        == "profile-xai-refresh"
+    )
+    rows = saved["credential_pool"]["xai-oauth"]
+    assert len(rows) == 1
+    assert rows[0]["access_token"] == "profile-xai-access"
 
 
 def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch):
@@ -462,6 +601,8 @@ def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch
         "first-refresh-token",
         "second-refresh-token",
     ]
+    assert len({entry.grant_id for entry in entries}) == 2
+    assert all(len(entry.grant_id or "") == 32 for entry in entries)
 
     payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     # No singleton block — the add path is now pool-only.
@@ -568,7 +709,7 @@ def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     _write_auth_store(
         tmp_path,
@@ -616,7 +757,7 @@ def test_auth_remove_accepts_label_target(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     _write_auth_store(
         tmp_path,
@@ -663,7 +804,7 @@ def test_auth_remove_prefers_exact_numeric_label_over_index(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     _write_auth_store(
         tmp_path,
@@ -1204,7 +1345,7 @@ def test_auth_remove_claude_code_suppresses_reseed(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, {"claude_code"}),
+        lambda provider, entries, **_kwargs: (False, {"claude_code"}),
     )
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -1287,7 +1428,7 @@ def test_auth_remove_codex_device_code_suppresses_reseed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, {"device_code"}),
+        lambda provider, entries, **_kwargs: (False, {"device_code"}),
     )
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -1329,12 +1470,139 @@ def test_auth_remove_codex_device_code_suppresses_reseed(tmp_path, monkeypatch):
     assert "openai-codex" not in updated.get("providers", {})
 
 
+def test_auth_remove_codex_commits_pool_singleton_and_suppression_once(
+    tmp_path,
+    monkeypatch,
+):
+    """Canonical removal is one durable auth-store transaction."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries, **_kwargs: (False, {"device_code"}),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "_auth_revision": 4,
+            "active_provider": "openrouter",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "acc-atomic",
+                        "refresh_token": "ref-atomic",
+                    }
+                },
+                "openrouter": {"opaque": "preserve"},
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-atomic",
+                        "label": "codex-atomic",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "acc-atomic",
+                        "refresh_token": "ref-atomic",
+                    }
+                ],
+                "openrouter": [
+                    {
+                        "id": "unrelated",
+                        "label": "unrelated",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-preserve",
+                    }
+                ],
+            },
+        },
+    )
+
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_remove_command
+
+    auth_remove_command(
+        SimpleNamespace(provider="openai-codex", target="codex-atomic")
+    )
+
+    updated = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert updated["_auth_revision"] == 5
+    assert updated["active_provider"] == "openrouter"
+    assert "openai-codex" not in updated["providers"]
+    assert updated["providers"]["openrouter"] == {"opaque": "preserve"}
+    assert updated["credential_pool"]["openai-codex"] == []
+    assert updated["credential_pool"]["openrouter"][0]["id"] == "unrelated"
+    assert set(updated["suppressed_sources"]["openai-codex"]) == {
+        "device_code"
+    }
+
+
+def test_remove_service_stays_durable_when_external_cleanup_fails(
+    tmp_path,
+    monkeypatch,
+):
+    """Suppression is committed before best-effort external cleanup."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "_auth_revision": 2,
+            "providers": {},
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "env-row",
+                        "label": "env-row",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "env:OPENROUTER_API_KEY",
+                        "access_token": "sk-or-env",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent import credential_sources
+
+    def _boom(_provider, _removed):
+        raise OSError("simulated cleanup failure")
+
+    step = credential_sources.RemovalStep(
+        provider="openrouter",
+        source_id="env:OPENROUTER_API_KEY",
+        remove_fn=_boom,
+    )
+    monkeypatch.setattr(
+        credential_sources,
+        "find_removal_step",
+        lambda _provider, _source: step,
+    )
+
+    outcome = credential_sources.remove_credential_target(
+        "openrouter",
+        "env-row",
+    )
+
+    updated = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert updated["_auth_revision"] == 3
+    assert updated["credential_pool"]["openrouter"] == []
+    assert updated["suppressed_sources"]["openrouter"] == [
+        "env:OPENROUTER_API_KEY"
+    ]
+    assert any("external cleanup failed" in hint for hint in outcome.result.hints)
+
+
 def test_auth_remove_codex_manual_source_suppresses_reseed(tmp_path, monkeypatch):
     """Removing a manually-added (`manual:device_code`) openai-codex credential must also suppress."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        lambda provider, entries, **_kwargs: (False, set()),
     )
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -1374,6 +1642,66 @@ def test_auth_remove_codex_manual_source_suppresses_reseed(tmp_path, monkeypatch
     assert "openai-codex" in suppressed
     assert "device_code" in suppressed["openai-codex"]
     assert "openai-codex" not in updated.get("providers", {})
+
+
+def test_auth_remove_independent_codex_manual_preserves_singleton(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "singleton-access",
+                        "refresh_token": "singleton-refresh",
+                    },
+                    "grant_id": "a" * 32,
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "singleton-row",
+                        "source": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "access_token": "singleton-access",
+                        "refresh_token": "singleton-refresh",
+                        "grant_id": "a" * 32,
+                    },
+                    {
+                        "id": "independent-manual",
+                        "source": "manual:device_code",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "access_token": "manual-access",
+                        "refresh_token": "manual-refresh",
+                        "grant_id": "b" * 32,
+                    },
+                ]
+            },
+        },
+    )
+
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_remove_command
+
+    auth_remove_command(
+        SimpleNamespace(
+            provider="openai-codex",
+            target="independent-manual",
+        )
+    )
+
+    saved = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert saved["providers"]["openai-codex"]["grant_id"] == "a" * 32
+    assert [
+        row["id"] for row in saved["credential_pool"]["openai-codex"]
+    ] == ["singleton-row"]
+    assert "openai-codex" not in saved.get("suppressed_sources", {})
 
 
 def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
@@ -1422,7 +1750,7 @@ def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
 
 
 def test_seed_from_singletons_respects_codex_suppression(tmp_path, monkeypatch):
-    """_seed_from_singletons() for openai-codex must skip auto-import when suppressed."""
+    """Suppression blocks the Hermes singleton from re-seeding the pool."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -1430,19 +1758,17 @@ def test_seed_from_singletons_respects_codex_suppression(tmp_path, monkeypatch):
     # Suppression marker in place
     (hermes_home / "auth.json").write_text(json.dumps({
         "version": 1,
-        "providers": {},
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "hermes-singleton-access",
+                    "refresh_token": "hermes-singleton-refresh",
+                },
+                "auth_mode": "chatgpt",
+            }
+        },
         "suppressed_sources": {"openai-codex": ["device_code"]},
     }))
-
-    # Make _import_codex_cli_tokens return tokens — these would normally trigger
-    # a re-seed, but suppression must skip it.
-    def _fake_import():
-        return {
-            "access_token": "would-be-reimported",
-            "refresh_token": "would-be-reimported",
-        }
-
-    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", _fake_import)
 
     from agent.credential_pool import _seed_from_singletons
 
@@ -1454,9 +1780,9 @@ def test_seed_from_singletons_respects_codex_suppression(tmp_path, monkeypatch):
     assert entries == []
     assert active_sources == set()
 
-    # Verify the auth store was NOT modified (no auto-import happened)
+    # The owning singleton remains intact; only generic pool seeding is blocked.
     after = json.loads((hermes_home / "auth.json").read_text())
-    assert "openai-codex" not in after.get("providers", {})
+    assert after["providers"]["openai-codex"]["tokens"]["access_token"] == "hermes-singleton-access"
 
 
 def test_auth_remove_env_seeded_suppresses_shell_exported_var(tmp_path, monkeypatch, capsys):
@@ -1795,7 +2121,7 @@ def test_credential_sources_registry_has_expected_steps():
         "~/.claude/.credentials.json",
         "~/.hermes/.anthropic_oauth.json",
         "auth.json providers.nous",
-        "auth.json providers.openai-codex + ~/.codex/auth.json",
+        "auth.json providers.openai-codex (native Codex auth remains separate)",
         "auth.json providers.minimax-oauth",
         "~/.qwen/oauth_creds.json",
         "Custom provider config.yaml api_key field",
@@ -1904,9 +2230,9 @@ def test_auth_add_clears_all_suppressions_including_non_env(tmp_path, monkeypatc
 
 
 def test_auth_remove_codex_manual_device_code_suppresses_canonical(tmp_path, monkeypatch):
-    """Removing a manual:device_code entry (from `hermes auth add openai-codex`)
-    must suppress the canonical ``device_code`` key, not ``manual:device_code``.
-    The re-seed gate in _seed_from_singletons checks ``device_code``.
+    """A legacy manual row that exactly aliases the singleton suppresses the
+    canonical ``device_code`` key, not ``manual:device_code``. Independent
+    modern manual grants are covered by the preservation regression above.
     """
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -1925,6 +2251,7 @@ def test_auth_remove_codex_manual_device_code_suppresses_canonical(tmp_path, mon
                     "priority": 0,
                     "source": "manual:device_code",
                     "access_token": "t",
+                    "refresh_token": "r",
                 }]
             },
         },

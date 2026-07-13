@@ -11,7 +11,10 @@ authenticated only at the global root.
 
 from __future__ import annotations
 
+import base64
 import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -50,6 +53,40 @@ def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def _invoke_jwt(*, seconds: int) -> str:
+    def _part(payload: dict) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    claims = {
+        "sub": "profile-fallback-test",
+        "scope": "inference:invoke",
+        "exp": int(time.time() + seconds),
+    }
+    return f"{_part({'alg': 'none', 'typ': 'JWT'})}.{_part(claims)}.sig"
+
+
+def _iso_from_now(seconds: int) -> str:
+    return datetime.fromtimestamp(
+        time.time() + seconds,
+        tz=timezone.utc,
+    ).isoformat()
+
+
+def _nous_state(auth_mod, *, access_token: str, refresh_token: str) -> dict:
+    return {
+        "portal_base_url": auth_mod.DEFAULT_NOUS_PORTAL_URL,
+        "inference_base_url": auth_mod.DEFAULT_NOUS_INFERENCE_URL,
+        "client_id": auth_mod.DEFAULT_NOUS_CLIENT_ID,
+        "token_type": "Bearer",
+        "scope": auth_mod.DEFAULT_NOUS_SCOPE,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": 0,
+        "expires_at": _iso_from_now(-60),
+    }
+
+
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
@@ -76,6 +113,247 @@ def test_profile_with_zero_entries_falls_back_to_global(profile_env):
     assert len(entries) == 1
     assert entries[0]["id"] == "glob-1"
     assert entries[0]["access_token"] == "sk-or-global"
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth", "nous"])
+def test_profile_singleton_claims_pool_source_without_mutating_root(
+    profile_env,
+    provider,
+):
+    """A profile-owned singleton must never be seeded into a root pool."""
+    from agent.credential_pool import load_pool
+
+    def _state(prefix: str) -> dict:
+        if provider in {"openai-codex", "xai-oauth"}:
+            state = {
+                "tokens": {
+                    "access_token": f"{prefix}-access",
+                    "refresh_token": f"{prefix}-refresh",
+                    "token_type": "Bearer",
+                }
+            }
+            if provider == "xai-oauth":
+                state["discovery"] = {
+                    "token_endpoint": "https://auth.x.ai/oauth2/token"
+                }
+            return state
+        return {
+            "access_token": f"{prefix}-access",
+            "refresh_token": f"{prefix}-refresh",
+            "agent_key": f"{prefix}-agent",
+            "agent_key_expires_at": _iso_from_now(3600),
+            "scope": "inference:invoke",
+        }
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    root_entry = {
+        "id": "root-device",
+        "label": "root-device",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "device_code",
+        "access_token": "root-access",
+        "refresh_token": "root-refresh",
+    }
+    if provider == "nous":
+        root_entry.update(
+            {
+                "agent_key": "root-agent",
+                "agent_key_expires_at": _iso_from_now(3600),
+            }
+        )
+    _write(
+        root_path,
+        _make_auth_store(
+            providers={provider: _state("root")},
+            pool={provider: [root_entry]},
+        ),
+    )
+    _write(
+        profile_path,
+        _make_auth_store(providers={provider: _state("profile")}, pool={}),
+    )
+    root_before = root_path.read_bytes()
+
+    pool = load_pool(provider)
+
+    assert pool._source_auth_path == profile_path
+    assert [entry.access_token for entry in pool.entries()] == ["profile-access"]
+    assert root_path.read_bytes() == root_before
+    profile = json.loads(profile_path.read_text())
+    assert profile["credential_pool"][provider][0]["access_token"] == "profile-access"
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth", "nous"])
+def test_quarantined_profile_singleton_blocks_live_root_pool(
+    profile_env,
+    provider,
+):
+    """A dead profile-owned grant must not resurrect the root credential."""
+    from agent.credential_pool import load_pool
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        root_path,
+        _make_auth_store(
+            pool={
+                provider: [
+                    {
+                        "id": "root-live",
+                        "label": "root-live",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                ]
+            }
+        ),
+    )
+    _write(
+        profile_path,
+        _make_auth_store(
+            providers={
+                provider: {
+                    "last_auth_error": {
+                        "code": "invalid_grant",
+                        "relogin_required": True,
+                    }
+                }
+            },
+            pool={},
+        ),
+    )
+    root_before = root_path.read_bytes()
+
+    pool = load_pool(provider)
+
+    assert pool._source_auth_path == profile_path
+    assert pool.entries() == []
+    assert root_path.read_bytes() == root_before
+
+
+@pytest.mark.parametrize("provider", ["xai-oauth", "nous"])
+def test_stale_root_pool_rejects_later_profile_shadow(
+    profile_env,
+    monkeypatch,
+    provider,
+):
+    """A loaded root pool may not silently adopt a newly-created profile grant."""
+    from agent.credential_pool import load_pool
+    from hermes_cli import auth as auth_mod
+
+    def _state(prefix: str) -> dict:
+        if provider == "xai-oauth":
+            return {
+                "tokens": {
+                    "access_token": f"{prefix}-access",
+                    "refresh_token": f"{prefix}-refresh",
+                    "token_type": "Bearer",
+                },
+                "discovery": {
+                    "token_endpoint": "https://auth.x.ai/oauth2/token"
+                },
+            }
+        return {
+            "access_token": f"{prefix}-access",
+            "refresh_token": f"{prefix}-refresh",
+            "agent_key": f"{prefix}-agent",
+            "agent_key_expires_at": _iso_from_now(3600),
+            "scope": "inference:invoke",
+        }
+
+    def _entry(prefix: str) -> dict:
+        row = {
+            "id": "shared-id",
+            "label": f"{prefix}-device",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "device_code",
+            "access_token": f"{prefix}-access",
+            "refresh_token": f"{prefix}-refresh",
+        }
+        if provider == "nous":
+            row.update(
+                {
+                    "agent_key": f"{prefix}-agent",
+                    "agent_key_expires_at": _iso_from_now(3600),
+                }
+            )
+        return row
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        root_path,
+        _make_auth_store(
+            providers={provider: _state("root")},
+            pool={provider: [_entry("root")]},
+        ),
+    )
+    _write(profile_path, _make_auth_store(providers={}, pool={}))
+    pool = load_pool(provider)
+    entry = pool.entries()[0]
+    assert pool._source_auth_path == root_path
+
+    _write(
+        profile_path,
+        _make_auth_store(
+            providers={provider: _state("profile")},
+            pool={provider: [_entry("profile")]},
+        ),
+    )
+    root_before = root_path.read_bytes()
+    if provider == "nous":
+        monkeypatch.setattr(
+            auth_mod,
+            "resolve_nous_runtime_credentials",
+            lambda **_kwargs: {"api_key": "profile-agent"},
+        )
+
+    with pytest.raises(auth_mod.AuthStoreConflictError, match="source changed"):
+        pool._refresh_entry(entry, force=True)
+
+    assert root_path.read_bytes() == root_before
+
+
+def test_stable_id_removal_mutates_global_pool_source_without_profile_shadow(
+    profile_env,
+):
+    """A profile deleting an inherited row must target the owning root store."""
+    global_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        global_path,
+        _make_auth_store(
+            pool={
+                "openrouter": [
+                    {
+                        "id": "global-row",
+                        "label": "global-row",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-global",
+                    }
+                ]
+            }
+        ),
+    )
+    _write(profile_path, _make_auth_store(pool={}))
+    profile_before = profile_path.read_bytes()
+
+    from agent.credential_sources import remove_credential_target
+
+    outcome = remove_credential_target("openrouter", "global-row")
+
+    assert outcome.remaining_count == 0
+    root = json.loads(global_path.read_text())
+    assert root["credential_pool"]["openrouter"] == []
+    assert profile_path.read_bytes() == profile_before
 
 
 def test_profile_with_entries_fully_shadows_global(profile_env):
@@ -301,6 +579,369 @@ def test_load_provider_state_falls_back_to_global(profile_env):
     state = _load_provider_state(auth_store, "nous")
     assert state is not None
     assert state["access_token"] == "global-nous-token"
+
+
+def test_resolve_nous_access_token_refreshes_global_source_without_profile_write(
+    profile_env, monkeypatch
+):
+    """A profile fallback refresh must lock and update only its root source."""
+    from hermes_cli import auth as auth_mod
+
+    _write(
+        profile_env["global"] / "auth.json",
+        {
+            **_make_auth_store(
+            providers={
+                "nous": _nous_state(
+                    auth_mod,
+                    access_token="expired-access",
+                    refresh_token="root-refresh-old",
+                )
+            }
+            ),
+            "active_provider": "openai-codex",
+        },
+    )
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(profile_path, _make_auth_store(providers={"marker": {"keep": True}}))
+    profile_before = profile_path.read_bytes()
+    monkeypatch.setattr(
+        auth_mod,
+        "_merge_shared_nous_oauth_state",
+        lambda _state: False,
+    )
+    monkeypatch.setattr(auth_mod, "_write_shared_nous_state", lambda _state: None)
+    monkeypatch.setattr(
+        auth_mod,
+        "_refresh_access_token",
+        lambda **_kwargs: {
+            "access_token": "root-access-new",
+            "refresh_token": "root-refresh-new",
+            "expires_in": 3600,
+        },
+    )
+
+    token = auth_mod.resolve_nous_access_token()
+
+    assert token == "root-access-new"
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert root["providers"]["nous"]["refresh_token"] == "root-refresh-new"
+    assert root["active_provider"] == "openai-codex"
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_resolve_nous_runtime_refreshes_global_source_without_profile_write(
+    profile_env, monkeypatch
+):
+    """Runtime JWT refresh follows the same single-source lock discipline."""
+    from hermes_cli import auth as auth_mod
+
+    _write(
+        profile_env["global"] / "auth.json",
+        {
+            **_make_auth_store(
+            providers={
+                "nous": _nous_state(
+                    auth_mod,
+                    access_token=_invoke_jwt(seconds=-60),
+                    refresh_token="root-runtime-refresh-old",
+                )
+            }
+            ),
+            "active_provider": "openai-codex",
+        },
+    )
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(profile_path, _make_auth_store(providers={"marker": {"keep": True}}))
+    profile_before = profile_path.read_bytes()
+    fresh_jwt = _invoke_jwt(seconds=3600)
+    monkeypatch.setattr(
+        auth_mod,
+        "_merge_shared_nous_oauth_state",
+        lambda _state: False,
+    )
+    monkeypatch.setattr(auth_mod, "_write_shared_nous_state", lambda _state: None)
+    monkeypatch.setattr(auth_mod, "_sync_nous_pool_from_auth_store", lambda: None)
+    monkeypatch.setattr(
+        auth_mod,
+        "_refresh_access_token",
+        lambda **_kwargs: {
+            "access_token": fresh_jwt,
+            "refresh_token": "root-runtime-refresh-new",
+            "expires_in": 3600,
+            "scope": auth_mod.DEFAULT_NOUS_SCOPE,
+        },
+    )
+
+    credentials = auth_mod.resolve_nous_runtime_credentials(force_refresh=True)
+
+    assert credentials["api_key"] == fresh_jwt
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert (
+        root["providers"]["nous"]["refresh_token"]
+        == "root-runtime-refresh-new"
+    )
+    assert root["active_provider"] == "openai-codex"
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_nous_pool_wrapper_persists_once_to_root_source(
+    profile_env,
+    monkeypatch,
+):
+    """Pool wrapper adopts resolver output without provider write-through."""
+    from agent.credential_pool import load_pool
+    from hermes_cli import auth as auth_mod
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    old_state = _nous_state(
+        auth_mod,
+        access_token="old-access",
+        refresh_token="old-refresh",
+    )
+    old_state.update(
+        {
+            "agent_key": "old-agent",
+            "agent_key_expires_at": _iso_from_now(3600),
+            "inference_base_url": auth_mod.DEFAULT_NOUS_INFERENCE_URL,
+        }
+    )
+    _write(
+        root_path,
+        {
+            **_make_auth_store(providers={"nous": old_state}),
+            "credential_pool": {
+                "nous": [
+                    {
+                        "id": "root-nous",
+                        "label": "root-nous",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "agent_key": "old-agent",
+                        "agent_key_expires_at": _iso_from_now(3600),
+                    }
+                ]
+            },
+        },
+    )
+    _write(profile_path, _make_auth_store(providers={}, pool={}))
+    profile_before = profile_path.read_bytes()
+    pool = load_pool("nous")
+    entry = pool.entries()[0]
+
+    def _resolver(*, force_refresh, sync_pool, **_kwargs):
+        assert force_refresh is True
+        assert sync_pool is False
+        with auth_mod._auth_store_lock(root_path):
+            store = auth_mod._load_auth_store(root_path, strict=True)
+            state = dict(store["providers"]["nous"])
+            state.update(
+                {
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "agent_key": "new-agent",
+                    "agent_key_expires_at": _iso_from_now(7200),
+                }
+            )
+            auth_mod._store_provider_state(
+                store,
+                "nous",
+                state,
+                set_active=False,
+            )
+            auth_mod._save_auth_store(store, target_path=root_path)
+        return {"api_key": "new-agent"}
+
+    monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _resolver)
+    persist_calls = []
+    original_persist = pool._persist
+
+    def _persist_once(*args, **kwargs):
+        persist_calls.append(True)
+        return original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(pool, "_persist", _persist_once)
+    sync_back_calls = []
+    monkeypatch.setattr(
+        pool,
+        "_sync_device_code_entry_to_auth_store",
+        lambda *_args, **_kwargs: sync_back_calls.append(True),
+    )
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "new-refresh"
+    assert refreshed.agent_key == "new-agent"
+    assert len(persist_calls) == 1
+    assert sync_back_calls == []
+    root = json.loads(root_path.read_text())
+    assert root["providers"]["nous"]["refresh_token"] == "new-refresh"
+    assert root["credential_pool"]["nous"][0]["refresh_token"] == "new-refresh"
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_terminal_nous_fallback_persists_root_pool_quarantine(
+    profile_env, monkeypatch, caplog
+):
+    """Provider quarantine and pool removal must commit in one root snapshot."""
+    from hermes_cli import auth as auth_mod
+
+    root_state = _nous_state(
+        auth_mod,
+        access_token="expired-access",
+        refresh_token="revoked-refresh",
+    )
+    _write(
+        profile_env["global"] / "auth.json",
+        {
+            **_make_auth_store(providers={"nous": root_state}),
+            "active_provider": "openai-codex",
+            "credential_pool": {
+                "nous": [
+                    {
+                        "id": "device-code-id",
+                        "source": auth_mod.NOUS_DEVICE_CODE_SOURCE,
+                        "access_token": "expired-access",
+                        "refresh_token": "revoked-refresh",
+                    },
+                    {
+                        "id": "manual-id",
+                        "source": "manual",
+                        "access_token": "manual-access",
+                    },
+                ]
+            },
+        },
+    )
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(profile_path, _make_auth_store(providers={"marker": {"keep": True}}))
+    profile_before = profile_path.read_bytes()
+    monkeypatch.setenv(
+        "HERMES_SHARED_AUTH_DIR",
+        str(profile_env["global"] / "shared-test"),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_merge_shared_nous_oauth_state",
+        lambda _state: False,
+    )
+
+    def terminal_refresh(**_kwargs):
+        raise auth_mod.AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "_refresh_access_token", terminal_refresh)
+    caplog.set_level("WARNING")
+
+    with pytest.raises(auth_mod.AuthError, match="revoked"):
+        auth_mod.resolve_nous_access_token()
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert not root["providers"]["nous"].get("access_token")
+    assert not root["providers"]["nous"].get("refresh_token")
+    assert [row["id"] for row in root["credential_pool"]["nous"]] == [
+        "manual-id"
+    ]
+    assert root["active_provider"] == "openai-codex"
+    assert any(
+        "Nous OAuth state quarantined" in record.message
+        and str(profile_env["global"] / "auth.json") in record.message
+        for record in caplog.records
+    )
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_nous_pool_terminal_refresh_uses_resolver_quarantine_without_profile_shadow(
+    profile_env,
+    monkeypatch,
+):
+    """Wrapper must not repeat terminal writes after source resolver cleanup."""
+    from agent.credential_pool import load_pool
+    from hermes_cli import auth as auth_mod
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    root_state = _nous_state(
+        auth_mod,
+        access_token=_invoke_jwt(seconds=-60),
+        refresh_token="revoked-refresh",
+    )
+    root_state.update(
+        {
+            "agent_key": "expired-agent",
+            "agent_key_expires_at": _iso_from_now(-60),
+        }
+    )
+    _write(
+        root_path,
+        {
+            **_make_auth_store(providers={"nous": root_state}),
+            "credential_pool": {
+                "nous": [
+                    {
+                        "id": "device-code-id",
+                        "label": "device",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": root_state["access_token"],
+                        "refresh_token": "revoked-refresh",
+                        "agent_key": "expired-agent",
+                    },
+                    {
+                        "id": "manual-id",
+                        "label": "manual",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "manual-access",
+                    },
+                ]
+            },
+        },
+    )
+    _write(profile_path, _make_auth_store(providers={}, pool={}))
+    profile_before = profile_path.read_bytes()
+    monkeypatch.setenv(
+        "HERMES_SHARED_AUTH_DIR",
+        str(profile_env["global"] / "shared-test"),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_merge_shared_nous_oauth_state",
+        lambda _state: False,
+    )
+
+    def _terminal(**_kwargs):
+        raise auth_mod.AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "_refresh_access_token", _terminal)
+    pool = load_pool("nous")
+    entry = next(row for row in pool.entries() if row.source == "device_code")
+
+    assert pool._refresh_entry(entry, force=True) is None
+
+    root = json.loads(root_path.read_text())
+    assert not root["providers"]["nous"].get("refresh_token")
+    assert [row["id"] for row in root["credential_pool"]["nous"]] == [
+        "manual-id"
+    ]
+    assert [row.id for row in pool.entries()] == ["manual-id"]
+    assert profile_path.read_bytes() == profile_before
 
 
 def test_load_provider_state_profile_wins_over_global(profile_env):

@@ -46,7 +46,7 @@ hermes profile create researcher --description "Reads source code and external d
 hermes profile create work --clone
 ```
 
-将当前 profile 的 `config.yaml`、`.env`、`SOUL.md` 和 skills 复制到新 profile。API 密钥、模型和能力相同，但会话和记忆是全新的。编辑 `~/.hermes/profiles/work/.env` 可使用不同的 API 密钥，编辑 `~/.hermes/profiles/work/SOUL.md` 可设置不同的人格。
+将当前 profile 的 `config.yaml`、`.env`、`SOUL.md`、skills，以及整理后的 `memories/MEMORY.md` 和 `memories/USER.md` 复制到新 profile。API 密钥、模型、能力和整理后的身份记忆会沿用，但会话和运行时状态会重新开始。编辑 `~/.hermes/profiles/work/.env` 可使用不同的 API 密钥，编辑 `~/.hermes/profiles/work/SOUL.md` 可设置不同的人格。
 
 ### 克隆全部内容（`--clone-all`）
 
@@ -54,7 +54,7 @@ hermes profile create work --clone
 hermes profile create backup --clone-all
 ```
 
-复制**所有内容**——配置、API 密钥、人格、记忆、技能、cron 任务、插件。会排除每个 profile 自己的历史数据（会话历史、`state.db`、`backups/`、`state-snapshots/`、`checkpoints/`），这些数据属于源 profile 且可能达到数十 GB。若要包含历史的完整备份，请使用 `hermes profile export` 或 `hermes backup`。
+复制源 profile 的工作配置、`.env` API 密钥、人格、记忆、技能、cron 任务和插件。它会主动排除规范认证事务文件 `auth.json`/`auth.lock`、根目录的 `.op.env` 1Password bootstrap token，以及每个 profile 自己的历史数据（`sessions/`、`state.db`、`backups/`、`state-snapshots/`、`checkpoints/`）。这样可避免两个 profile 同时使用复制的 OAuth refresh token 或不同的 lock inode。请检查复制的 `.env` 静态 key，并通过 `hermes -p <name> auth add <provider>` 重新认证 OAuth provider。备份可使用 `hermes profile export`（过滤 profile 根凭据）或规范的 `hermes backup` 命令。
 
 ### 从指定 profile 克隆
 
@@ -62,7 +62,7 @@ hermes profile create backup --clone-all
 hermes profile create work --clone-from coder
 ```
 
-`--clone-from <source>` 会直接选择源 profile，并隐含执行 config/skills/SOUL 克隆。若要完整复制该源 profile，请与 `--clone-all` 组合使用：
+`--clone-from <source>` 会直接选择源 profile，并隐含执行 config/skills/SOUL 克隆。若要复制该源 profile 的工作状态（仍排除认证事务文件和历史），请与 `--clone-all` 组合使用：
 
 ```bash
 hermes profile create work-backup --clone-from coder --clone-all
@@ -190,6 +190,10 @@ assistant gateway install     # 创建 hermes-gateway-assistant 服务
 - **`.env`** — API 密钥、bot token
 - **`SOUL.md`** — 人格与指令
 
+:::note 凭据归属
+Profile 的 `.env` 是本地文件，不会从根 profile 或启动 shell 继承。`auth.json` 中的 provider 凭据有一个刻意保留的兼容例外：如果某个 profile 没有该 provider 的本地凭据，Hermes 可以只读使用根目录中的对应凭据。任何 `hermes -p <name> auth add <provider>` 写入都只落到该 profile，并从此覆盖该 provider 的全局 fallback。
+:::
+
 ```bash
 coder config set model.default anthropic/claude-sonnet-4
 echo "You are a focused coding assistant." > ~/.hermes/profiles/coder/SOUL.md
@@ -222,6 +226,15 @@ hermes profile rename coder dev-bot   # 重命名（同步更新别名和服务�
 hermes profile export coder   # 导出为 coder.tar.gz
 hermes profile import coder.tar.gz   # 从归档文件导入
 ```
+
+Profile export/import 提供的是 profile 根凭据边界，而不是递归 secret 清理。
+Export 会排除根 `auth.json`、`auth.lock`、`.env` 和 `.op.env`（包括其硬链接
+别名），以及机器本地的 `home/`、`backups/`、`state-snapshots/` 和
+`checkpoints/`；它会拒绝 symlink，但保留嵌套项目文件。Import 会拒绝这些
+根凭据和所有 symlink 条目、创建空白私有根 `.env`，同时保留嵌套项目文件。
+跨越当前信任边界共享之前，请先检查归档内容。需要完整且受信任的本机备份
+时请使用 `hermes backup`。命名 profile 不会继承启动 shell 或仓库 `.env`
+中的凭据变量，请显式配置其凭据。
 
 ## 删除 profile
 

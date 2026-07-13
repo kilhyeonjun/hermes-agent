@@ -669,14 +669,14 @@ hermes checkpoints clear -f                         # 清除所有内容
 hermes import <zipfile> [options]
 ```
 
-将之前创建的 Hermes 备份恢复到 Hermes 主目录。归档中的所有文件会覆盖 Hermes 主目录中的现有文件；`--force` 仅跳过当目标已有 Hermes 安装时触发的确认提示。
+将之前创建的 Hermes 备份恢复到 Hermes 主目录。普通归档文件会覆盖现有对应文件，而 `auth.json` 通过规范认证事务恢复。主机本地的 `auth.lock`、进程/运行时文件以及 Codex refresh lock/key/WAL 子树不会被覆盖。在新主机上，导入的 Codex OAuth generation 会被移除，必须重新认证；其他受支持的认证状态可以恢复。`--force` 仅跳过当目标已有 Hermes 安装时触发的确认提示。
 
 | 选项 | 说明 |
 |--------|-------------|
 | `-f`, `--force` | 跳过已有安装的确认提示。 |
 
 :::warning
-导入前请停止 gateway，以避免与正在运行的进程冲突。
+导入前请停止 gateway，以避免与正在运行的进程冲突。迁移到新机器后，请先重新认证 Codex 再使用该 provider。
 :::
 
 ### 示例
@@ -1176,13 +1176,13 @@ hermes profile <subcommand>
 |------------|-------------|
 | `list` | 列出所有 profile。 |
 | `use <name>` | 设置粘性默认 profile。 |
-| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias]` | 创建新 profile。`--clone` 从活跃 profile 复制 config、`.env`、`SOUL.md` 和 skills。`--clone-all` 复制所有状态。`--clone-from` 指定源 profile，除非与 `--clone-all` 配合使用，否则会隐含 config 克隆。 |
+| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias]` | 创建新 profile。`--clone` 从活跃 profile 复制 config、`.env`、`SOUL.md`、skills 和整理后的 memory 文件。`--clone-all` 还会复制工作状态（包括 profile `.env` 中的静态凭据），但排除规范 `auth.json`/`auth.lock`、根 `.op.env` 和每个 profile 的历史；请检查复制的静态 key，并在克隆后重新认证 OAuth provider。`--clone-from` 指定源 profile，除非与 `--clone-all` 配合使用，否则会隐含 config 克隆。 |
 | `delete <name> [-y]` | 删除 profile。 |
 | `show <name>` | 显示 profile 详情（主目录、config 等）。 |
 | `alias <name> [--remove] [--name NAME]` | 管理快速访问 profile 的包装脚本。 |
 | `rename <old> <new>` | 重命名 profile。 |
-| `export <name> [-o FILE]` | 将 profile 导出为 `.tar.gz` 归档（本地备份）。 |
-| `import <archive> [--name NAME]` | 从 `.tar.gz` 归档导入 profile（本地恢复）。 |
+| `export <name> [-o FILE]` | 将 profile 导出为可移植 `.tar.gz`，排除根 `auth.json`、`auth.lock`、`.env`、`.op.env` 和机器本地状态。拒绝 symlink，但保留嵌套项目文件。 |
+| `import <archive> [--name NAME]` | 导入 profile 归档；拒绝 profile 根凭据，创建空白私有根 `.env`，并保留嵌套项目文件。 |
 | `install <source> [--name N] [--alias] [--force] [-y]` | 从 git URL 或本地目录安装 profile 发行版。 |
 | `update <name> [--force-config] [-y]` | 重新拉取发行版；保留用户数据（memory、会话、auth）。 |
 | `info <name>` | 显示 profile 的发行版 manifest（版本、依赖、来源）。 |

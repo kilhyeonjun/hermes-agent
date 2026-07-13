@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace, fast_safe_load
 
 
@@ -37,6 +38,66 @@ _SECRET_SOURCES: dict[str, str] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+_NAMED_PROFILE_AUTHORITY_HOME: str | None = None
+_NAMED_PROFILE_FILE_KEYS: dict[str, set[str]] = {}
+
+
+def _is_credential_env_key(key: str) -> bool:
+    return any(key.endswith(suffix) for suffix in _CREDENTIAL_SUFFIXES)
+
+
+def _named_profile_home_key(home_path: Path) -> str | None:
+    expanded = home_path.expanduser()
+    try:
+        lexical = Path(os.path.abspath(os.fspath(expanded)))
+    except OSError:
+        return None
+    if lexical.parent.name != "profiles":
+        return None
+    name = lexical.name
+    if not name or len(name) > 64 or not name[0].isalnum() or any(
+        not (char.isalnum() or char in {"_", "-"}) for char in name
+    ):
+        return None
+    if os.path.lexists(lexical):
+        try:
+            home_stat = lexical.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                "Named-profile home cannot be inspected safely"
+            ) from exc
+        if (
+            not stat.S_ISDIR(home_stat.st_mode)
+            or stat.S_ISLNK(home_stat.st_mode)
+        ):
+            raise RuntimeError(
+                "Named-profile home must be a regular directory, not a link"
+            )
+    try:
+        resolved = lexical.resolve(strict=False)
+    except OSError as exc:
+        raise RuntimeError(
+            "Named-profile home cannot be resolved safely"
+        ) from exc
+    if resolved.parent.name != "profiles" or resolved.name != name:
+        raise RuntimeError(
+            "Named-profile home must remain inside its profiles directory"
+        )
+    return str(resolved)
+
+
+def _credential_keys_in_env_file(path: Path) -> set[str]:
+    if not path.is_file() or path.is_symlink():
+        return set()
+    try:
+        values = dotenv_values(path, encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
+        return set()
+    return {
+        str(key)
+        for key in values
+        if isinstance(key, str) and _is_credential_env_key(key)
+    }
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -62,7 +123,10 @@ def reset_secret_source_cache() -> None:
     next call to re-pull — useful for tests, and for long-running processes
     that want to refresh after a config change.
     """
+    global _NAMED_PROFILE_AUTHORITY_HOME
     _APPLIED_HOMES.clear()
+    _NAMED_PROFILE_AUTHORITY_HOME = None
+    _NAMED_PROFILE_FILE_KEYS.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -230,16 +294,65 @@ def load_hermes_dotenv(
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
+    global _NAMED_PROFILE_AUTHORITY_HOME
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
+    op_env = home_path / ".op.env"
     project_env_path = Path(project_env) if project_env else None
+    named_home_key = _named_profile_home_key(home_path)
+
+    if (
+        _NAMED_PROFILE_AUTHORITY_HOME is not None
+        and named_home_key is None
+    ):
+        raise RuntimeError(
+            "Hermes process cannot switch named-profile secret authority"
+        )
+
+    if named_home_key is not None:
+        for authority_file in (user_env, op_env):
+            if not os.path.lexists(authority_file):
+                continue
+            authority_stat = authority_file.lstat()
+            if (
+                not stat.S_ISREG(authority_stat.st_mode)
+                or stat.S_ISLNK(authority_stat.st_mode)
+                or getattr(authority_stat, "st_nlink", 1) != 1
+            ):
+                raise RuntimeError(
+                    "Named-profile secret authority must be a regular single-link file"
+                )
+        if (
+            _NAMED_PROFILE_AUTHORITY_HOME is not None
+            and _NAMED_PROFILE_AUTHORITY_HOME != named_home_key
+        ):
+            raise RuntimeError(
+                "Hermes process cannot switch named-profile secret authority"
+            )
+        current_file_keys = _credential_keys_in_env_file(
+            user_env
+        ) | _credential_keys_in_env_file(op_env)
+        if _NAMED_PROFILE_AUTHORITY_HOME is None:
+            for key in list(os.environ):
+                if _is_credential_env_key(key):
+                    os.environ.pop(key, None)
+            _NAMED_PROFILE_AUTHORITY_HOME = named_home_key
+        else:
+            for key in _NAMED_PROFILE_FILE_KEYS.get(named_home_key, set()):
+                if key not in current_file_keys and key not in _SECRET_SOURCES:
+                    os.environ.pop(key, None)
+        _NAMED_PROFILE_FILE_KEYS[named_home_key] = current_file_keys
 
     # Fix corrupted .env files before python-dotenv parses them (#8908).
     if user_env.exists():
         _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
+    if (
+        named_home_key is None
+        and project_env_path
+        and project_env_path.exists()
+    ):
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
@@ -256,11 +369,14 @@ def load_hermes_dotenv(
     #   EnvironmentFile=-/path/to/.hermes/.op.env
     # in their gateway unit, which takes precedence (override=False below
     # ensures .op.env never clobbers a token already in the environment).
-    op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
         _load_dotenv_with_fallback(op_env, override=False)
 
-    if project_env_path and project_env_path.exists():
+    if (
+        named_home_key is None
+        and project_env_path
+        and project_env_path.exists()
+    ):
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 

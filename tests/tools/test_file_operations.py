@@ -83,12 +83,18 @@ class TestIsWriteDenied:
 
     @pytest.mark.parametrize(
         "path",
-        ["auth.json", "config.yaml", "webhook_subscriptions.json"],
+        ["config.yaml", "webhook_subscriptions.json"],
     )
-    def test_hermes_control_files_requested_writable(self, path):
+    def test_non_auth_hermes_control_files_requested_writable(self, path):
         from hermes_constants import get_hermes_home
 
         assert _is_write_denied(str(get_hermes_home() / path)) is False
+
+    @pytest.mark.parametrize("path", ["auth.json", "auth.lock"])
+    def test_canonical_auth_store_files_are_denied(self, path):
+        from hermes_constants import get_hermes_home
+
+        assert _is_write_denied(str(get_hermes_home() / path)) is True
 
     @pytest.mark.parametrize(
         "path",
@@ -128,9 +134,9 @@ class TestIsWriteDenied:
 
     @pytest.mark.parametrize(
         "name",
-        ["auth.json", "config.yaml", "webhook_subscriptions.json"],
+        ["config.yaml", "webhook_subscriptions.json"],
     )
-    def test_control_files_requested_writable_in_profile_mode(self, tmp_path, monkeypatch, name):
+    def test_non_auth_control_files_writable_in_profile_mode(self, tmp_path, monkeypatch, name):
         root = tmp_path / "hermes"
         profile = root / "profiles" / "coder"
         profile.mkdir(parents=True)
@@ -138,6 +144,32 @@ class TestIsWriteDenied:
 
         assert _is_write_denied(str(profile / name)) is False
         assert _is_write_denied(str(root / name)) is False
+
+    @pytest.mark.parametrize("name", ["auth.json", "auth.lock"])
+    def test_auth_store_denied_for_root_active_and_other_profile(
+        self, tmp_path, monkeypatch, name
+    ):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "coder"
+        other_profile = root / "profiles" / "default"
+        profile.mkdir(parents=True)
+        other_profile.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+
+        assert _is_write_denied(str(profile / name)) is True
+        assert _is_write_denied(str(root / name)) is True
+        assert _is_write_denied(str(other_profile / name)) is True
+
+    def test_auth_store_symlink_alias_is_denied(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes"
+        root.mkdir()
+        auth_path = root / "auth.json"
+        auth_path.write_text("{}", encoding="utf-8")
+        alias = tmp_path / "auth-alias.json"
+        alias.symlink_to(auth_path)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+
+        assert _is_write_denied(str(alias)) is True
 
     def test_mcp_tokens_dir_protected_in_profile_mode(self, tmp_path, monkeypatch):
         """mcp-tokens/ under profile AND under root must both be denied."""

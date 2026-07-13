@@ -6,12 +6,16 @@ and shell completion generation.
 """
 
 import json
+import gzip
 import io
 import os
 import shutil
+import stat
+import subprocess
 import sys
 import tarfile
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -508,9 +512,9 @@ class TestNoSkillsOptOut:
 class TestBackfillProfileEnvs:
     """Tests for backfill_profile_envs() — the `hermes update` pass that
     gives pre-#44792 profiles (created before .env seeding) their own
-    .env, copied from the default install so credentials don't break."""
+    .env without copying root credentials across profile boundaries."""
 
-    def test_copies_default_env_into_envless_profiles(self, profile_env):
+    def test_creates_placeholder_instead_of_copying_default_secrets(self, profile_env):
         import stat
         tmp_path = profile_env
         (tmp_path / ".hermes" / ".env").write_text("OPENROUTER_API_KEY=root-key\n")
@@ -524,8 +528,28 @@ class TestBackfillProfileEnvs:
 
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
-            assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
+            content = (p / ".env").read_text()
+            assert "root-key" not in content
+            assert all(
+                line.startswith("#") or not line.strip()
+                for line in content.splitlines()
+            )
             assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+
+    def test_rejects_symlink_profile_and_broken_env_symlink(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        profiles_root.mkdir(parents=True, exist_ok=True)
+        outside = profile_env / "outside"
+        outside.mkdir()
+        (profiles_root / "linked").symlink_to(outside, target_is_directory=True)
+        real = profiles_root / "real"
+        real.mkdir()
+        broken_target = profile_env / "must-not-be-created"
+        (real / ".env").symlink_to(broken_target)
+
+        assert backfill_profile_envs(quiet=True) == []
+        assert not broken_target.exists()
+        assert not (outside / ".env").exists()
 
     def test_never_overwrites_existing_profile_env(self, profile_env):
         tmp_path = profile_env
@@ -625,6 +649,87 @@ class TestDeleteProfile:
 
         assert calls["n"] == 2
         assert not profile_dir.is_dir()
+
+    def test_recovers_codex_wal_before_profile_directory_retirement(
+        self, profile_env, monkeypatch
+    ):
+        import hermes_cli.auth as auth_mod
+
+        profile_dir = create_profile("coder", no_alias=True)
+        auth_path = profile_dir / "auth.json"
+        grant_id = "f" * 32
+        auth_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "providers": {
+                        "openai-codex": {
+                            "tokens": {
+                                "access_token": "access-old",
+                                "refresh_token": "refresh-old",
+                            },
+                            "grant_id": grant_id,
+                        }
+                    },
+                }
+            )
+        )
+        state_dir = profile_env / "codex-refresh-state"
+        monkeypatch.setenv(
+            "HERMES_CODEX_REFRESH_STATE_DIR",
+            str(state_dir),
+        )
+        monkeypatch.setattr(
+            auth_mod,
+            "refresh_codex_oauth_pure",
+            lambda *_args, **_kwargs: {
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "last_refresh": "2026-07-13T17:00:00Z",
+            },
+        )
+        real_finish = auth_mod._finish_codex_wal_commit
+        monkeypatch.setattr(
+            auth_mod,
+            "_finish_codex_wal_commit",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated crash before Codex WAL commit")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="before Codex WAL commit"):
+            auth_mod.refresh_codex_oauth_coordinated(
+                expected_access_token="access-old",
+                expected_refresh_token="refresh-old",
+                source_auth_path=auth_path,
+                timeout_seconds=0.1,
+            )
+        assert list(state_dir.glob("grant-*.wal.json"))
+        monkeypatch.setattr(
+            auth_mod,
+            "_finish_codex_wal_commit",
+            real_finish,
+        )
+        real_rmtree = profiles._rmtree_with_retry
+
+        def _assert_retired_outside_inventory(retired, handler):
+            assert retired.parent.name == ".profile-trash"
+            candidates = auth_mod._codex_candidate_auth_paths(
+                profile_dir.parent.parent / "auth.json"
+            )
+            assert retired / "auth.json" not in candidates
+            real_rmtree(retired, handler)
+
+        monkeypatch.setattr(
+            profiles,
+            "_rmtree_with_retry",
+            _assert_retired_outside_inventory,
+        )
+
+        with patch("hermes_cli.profiles._cleanup_gateway_service"):
+            delete_profile("coder", yes=True)
+
+        assert not profile_dir.exists()
+        assert not list(state_dir.glob("grant-*.wal.json"))
 
     def test_backend_scan_only_matches_this_profile(self, profile_env, monkeypatch):
         """The backend PID scan binds by --profile selector and skips self."""
@@ -796,6 +901,18 @@ class TestResolveProfileEnv:
     def test_invalid_name_raises_value_error(self, profile_env):
         with pytest.raises(ValueError):
             resolve_profile_env("INVALID!")
+
+    def test_symlinked_profile_directory_is_rejected(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        profiles_root.mkdir(parents=True, exist_ok=True)
+        outside = profile_env / "outside-profile"
+        outside.mkdir()
+        (profiles_root / "linked").symlink_to(
+            outside, target_is_directory=True
+        )
+
+        with pytest.raises(ValueError, match="regular directory"):
+            resolve_profile_env("linked")
 
 
 # ===================================================================
@@ -1070,6 +1187,38 @@ class TestRenameProfile:
         assert new_dir.is_dir()
         assert new_dir == tmp_path / ".hermes" / "profiles" / "newname"
 
+    def test_quiesces_codex_wal_while_profile_directory_moves(
+        self, profile_env, monkeypatch
+    ):
+        import hermes_cli.auth as auth_mod
+
+        tmp_path = profile_env
+        create_profile("oldname", no_alias=True)
+        old_dir = tmp_path / ".hermes" / "profiles" / "oldname"
+        new_dir = tmp_path / ".hermes" / "profiles" / "newname"
+        events = []
+
+        @contextmanager
+        def fake_retire(auth_path, *, reason):
+            assert auth_path == old_dir / "auth.json"
+            assert reason == "profile_rename"
+            events.append("quiesced")
+            yield
+            assert not old_dir.exists()
+            assert new_dir.is_dir()
+            events.append("moved")
+
+        monkeypatch.setattr(
+            auth_mod, "_retire_codex_auth_store", fake_retire
+        )
+
+        with patch(
+            "hermes_cli.profiles.check_alias_collision", return_value="skip"
+        ):
+            rename_profile("oldname", "newname")
+
+        assert events == ["quiesced", "moved"]
+
     def test_renames_root_honcho_host_without_changing_ai_peer(self, profile_env):
         tmp_path = profile_env
         create_profile("ssi_health", no_alias=True)
@@ -1173,6 +1322,60 @@ class TestExportImport:
         assert Path(result).exists()
         assert tarfile.is_tarfile(str(result))
 
+    def test_export_rejects_tree_that_import_path_rules_would_reject(
+        self, profile_env, tmp_path
+    ):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        (profile_dir / "CON.txt").write_text("not portable to Windows")
+        output = tmp_path / "coder.tar.gz"
+
+        with pytest.raises(ValueError, match="Unsafe archive member path"):
+            export_profile("coder", str(output))
+
+        assert not output.exists()
+
+    def test_export_rejects_tree_that_import_size_rules_would_reject(
+        self, profile_env, tmp_path, monkeypatch
+    ):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        (profile_dir / "marker.txt").write_text("oversized")
+        output = tmp_path / "coder.tar.gz"
+        monkeypatch.setattr(profiles, "_PROFILE_ARCHIVE_MAX_FILE_BYTES", 4)
+
+        with pytest.raises(ValueError, match="member is too large"):
+            export_profile("coder", str(output))
+
+        assert not output.exists()
+
+    def test_export_rejects_source_mutation_between_snapshot_passes(
+        self, profile_env, tmp_path, monkeypatch
+    ):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        marker = profile_dir / "marker.txt"
+        marker.write_text("before")
+        output = tmp_path / "coder.tar.gz"
+        real_copytree = shutil.copytree
+        calls = {"count": 0}
+
+        def _mutating_copytree(*args, **kwargs):
+            result = real_copytree(*args, **kwargs)
+            if Path(args[0]) == profile_dir:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    marker.write_text("after")
+            return result
+
+        monkeypatch.setattr(profiles.shutil, "copytree", _mutating_copytree)
+
+        with pytest.raises(ValueError, match="changed during snapshot"):
+            export_profile("coder", str(output))
+
+        assert calls["count"] == 2
+        assert not output.exists()
+
     def test_import_restores_from_archive(self, profile_env, tmp_path):
         # Create and export a profile
         create_profile("coder", no_alias=True)
@@ -1191,6 +1394,119 @@ class TestExportImport:
         imported = import_profile(str(archive_path), name="coder")
         assert imported.is_dir()
         assert (imported / "marker.txt").read_text() == "hello"
+
+    def test_native_windows_archive_fallback_round_trip(
+        self, profile_env, tmp_path, monkeypatch
+    ):
+        """The Windows path API fallback must not require POSIX dir_fd APIs."""
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        (profile_dir / "marker.txt").write_text("windows-fallback")
+        archive_path = tmp_path / "export" / "coder.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(profiles, "_is_native_windows", lambda: True)
+        real_open = os.open
+
+        def _windows_open(path, flags, mode=0o777, *, dir_fd=None):
+            if dir_fd is not None:
+                raise AssertionError("native Windows must not use dir_fd")
+            if Path(path).is_dir():
+                raise PermissionError("the Windows CRT cannot open directories")
+            return real_open(path, flags, mode)
+
+        def _windows_fchmod(*_args, **_kwargs):
+            raise AssertionError(
+                "Python 3.11/3.12 on native Windows has no os.fchmod"
+            )
+
+        windows_os = types.SimpleNamespace(
+            **{
+                name: getattr(os, name)
+                for name in dir(os)
+                if not name.startswith("__")
+            }
+        )
+        windows_os.open = _windows_open
+        windows_os.fchmod = _windows_fchmod
+        monkeypatch.setattr(profiles, "os", windows_os)
+
+        exported = export_profile("coder", str(archive_path))
+        shutil.rmtree(profile_dir)
+        imported = import_profile(str(exported), name="coder")
+
+        assert imported == profile_dir
+        assert (imported / "marker.txt").read_text() == "windows-fallback"
+
+    def test_windows_reparse_profile_directory_is_not_regular(
+        self, profile_env, monkeypatch
+    ):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        real_lstat = Path.lstat
+
+        def _reparse_lstat(path):
+            result = real_lstat(path)
+            if path == profile_dir:
+                return types.SimpleNamespace(
+                    st_mode=result.st_mode,
+                    st_file_attributes=getattr(
+                        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+                    ),
+                )
+            return result
+
+        monkeypatch.setattr(profiles, "_is_native_windows", lambda: True)
+        monkeypatch.setattr(Path, "lstat", _reparse_lstat)
+
+        assert profiles._is_regular_profile_directory(profile_dir) is False
+        with pytest.raises(ValueError, match="regular directory"):
+            profiles._require_regular_profile_directory(profile_dir)
+
+    def test_windows_reparse_profiles_root_is_rejected(
+        self, profile_env, monkeypatch
+    ):
+        profiles_root = profile_env / "profiles"
+        profiles_root.mkdir(exist_ok=True)
+        real_lstat = Path.lstat
+
+        def _reparse_lstat(path):
+            result = real_lstat(path)
+            if path == profiles_root:
+                return types.SimpleNamespace(
+                    st_mode=result.st_mode,
+                    st_file_attributes=getattr(
+                        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+                    ),
+                )
+            return result
+
+        monkeypatch.setattr(profiles, "_is_native_windows", lambda: True)
+        monkeypatch.setattr(Path, "lstat", _reparse_lstat)
+
+        with pytest.raises(ValueError, match="real directory"):
+            profiles._open_private_profiles_root(profiles_root)
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires native Windows junctions")
+    def test_native_windows_profiles_root_junction_is_rejected(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        junction = tmp_path / "profiles-junction"
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if created.returncode != 0:
+            pytest.skip("native Windows junction creation is unavailable")
+        try:
+            with pytest.raises(ValueError, match="real directory"):
+                profiles._open_private_profiles_root(junction)
+        finally:
+            if os.path.lexists(junction):
+                os.rmdir(junction)
 
     def test_import_to_existing_name_raises(self, profile_env, tmp_path):
         create_profile("coder", no_alias=True)
@@ -1261,6 +1577,30 @@ class TestExportImport:
 
         assert not escape_path.exists()
         assert not get_profile_dir("coder").exists()
+
+    def test_import_rejects_oversized_pax_metadata_before_tarfile_parses_it(
+        self, profile_env, tmp_path, monkeypatch
+    ):
+        archive_path = tmp_path / "oversized-pax.tar.gz"
+        payload = b"x" * 65
+        pax_header = tarfile.TarInfo("././@PaxHeader")
+        pax_header.type = tarfile.XHDTYPE
+        pax_header.size = len(payload)
+        with gzip.open(archive_path, "wb") as archive:
+            archive.write(pax_header.tobuf(format=tarfile.USTAR_FORMAT))
+            archive.write(payload)
+            archive.write(b"\0" * ((-len(payload)) % tarfile.BLOCKSIZE))
+            archive.write(b"\0" * (2 * tarfile.BLOCKSIZE))
+
+        monkeypatch.setattr(
+            profiles,
+            "_PROFILE_ARCHIVE_MAX_METADATA_RECORD_BYTES",
+            64,
+            raising=False,
+        )
+
+        with pytest.raises(ValueError, match="metadata record is too large"):
+            profiles._inspect_profile_archive_roots(archive_path)
 
     def test_import_rejects_absolute_archive_member(self, profile_env, tmp_path):
         archive_path = tmp_path / "export" / "evil-abs.tar.gz"
@@ -1420,14 +1760,8 @@ class TestExportImport:
         assert not any("x11-dev" in n for n in names)
         assert not any("libXi.so" in n for n in names)
 
-    def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
-        """Broken symlinks inside allowed artifacts are preserved, not crashed (#58394).
-
-        ``shutil.copytree``'s default is ``symlinks=False``, which follows
-        symlinks and crashes on broken ones. Use ``symlinks=True`` so stale
-        symlinks inside *allowed* artifacts (e.g. ``skills/``) survive as
-        symlinks; the link and its target are both retained.
-        """
+    def test_export_default_rejects_symlinks(self, profile_env, tmp_path):
+        """Portable exports reject links that the importer will not restore."""
         default_dir = get_profile_dir("default")
         (default_dir / "config.yaml").write_text("ok")
         # Place broken symlink *inside* the allowed ``skills/`` tree so the
@@ -1445,23 +1779,50 @@ class TestExportImport:
 
         output = tmp_path / "export" / "default.tar.gz"
         output.parent.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(ValueError, match="cannot include symlinks"):
+            export_profile("default", str(output))
+
+        assert not output.exists()
+
+    def test_export_default_ignores_symlink_inside_excluded_checkout(
+        self, profile_env, tmp_path
+    ):
+        default_dir = get_profile_dir("default")
+        (default_dir / "config.yaml").write_text("ok")
+        outside = tmp_path / "outside-checkout"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("not-portable")
+        (default_dir / "hermes-agent").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        output = tmp_path / "default.tar.gz"
+
         result = export_profile("default", str(output))
 
-        assert result.exists()
-        with tarfile.open(str(result), "r:gz") as tf:
+        with tarfile.open(result, "r:gz") as tf:
             names = set(tf.getnames())
-        # Allowed artifact survived
-        assert any(n.endswith("config.yaml") for n in names)
-        # Broken symlink inside an allowed dir was preserved as a symlink
-        # (without crashing) — tar entry name recorded as the link path.
-        assert any(
-            "with-broken-links/broken_link" in n for n in names
-        ), (
-            f"broken_link should survive; tarfile names: {sorted(names)[:30]}"
-        )
-        # Valid symlink + target also kept
-        assert any("valid_link" in n for n in names)
-        assert any("valid_target.txt" in n for n in names)
+        assert not any(name.startswith("default/hermes-agent") for name in names)
+
+    def test_export_default_keeps_portable_profile_metadata_and_package_json(
+        self, profile_env, tmp_path
+    ):
+        default_dir = get_profile_dir("default")
+        (default_dir / "config.yaml").write_text("ok")
+        (default_dir / "profile.yaml").write_text("role: chief-of-staff\n")
+        (default_dir / NO_BUNDLED_SKILLS_MARKER).write_text("")
+        project = default_dir / "workspace" / "project"
+        project.mkdir(parents=True)
+        (project / "package.json").write_text('{"name":"portable"}')
+        output = tmp_path / "default.tar.gz"
+
+        result = export_profile("default", str(output))
+
+        with tarfile.open(result, "r:gz") as tf:
+            names = set(tf.getnames())
+        assert "default/profile.yaml" in names
+        assert f"default/{NO_BUNDLED_SKILLS_MARKER}" in names
+        assert "default/workspace/project/package.json" in names
 
     def test_import_default_without_name_raises(self, profile_env, tmp_path):
         """Importing a default export without --name gives clear guidance."""
@@ -1896,3 +2257,282 @@ class TestProfilesToServe:
     def test_on_no_named_profiles_returns_just_default(self, profile_env):
         serve = profiles_to_serve(multiplex=True)
         assert [n for n, _ in serve] == ["default"]
+
+    def test_on_rejects_symlinked_profile_home(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        profiles_root.mkdir(parents=True, exist_ok=True)
+        outside = profile_env / "outside-profile"
+        outside.mkdir()
+        (profiles_root / "linked").symlink_to(
+            outside, target_is_directory=True
+        )
+
+        with pytest.raises(ValueError, match="regular directory"):
+            profiles_to_serve(multiplex=True)
+
+
+def test_clone_all_excludes_root_auth_store_but_keeps_nested_project_auth(
+    profile_env,
+):
+    default_home = profile_env / ".hermes"
+    (default_home / "auth.json").write_text('{"credential": "do-not-copy"}')
+    (default_home / "auth.lock").write_text("locked")
+    (default_home / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=do-not-copy"
+    )
+    nested = default_home / "workspace" / "project" / "auth.json"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text('{"project": true}')
+
+    cloned = create_profile("credential-safe", clone_all=True, no_alias=True)
+
+    assert not (cloned / "auth.json").exists()
+    assert not (cloned / "auth.lock").exists()
+    assert not (cloned / ".op.env").exists()
+    assert (cloned / "workspace" / "project" / "auth.json").read_text() == '{"project": true}'
+
+
+def test_clone_all_from_named_profile_excludes_root_auth_store(profile_env):
+    source = create_profile("source-auth", no_alias=True)
+    (source / "auth.json").write_text('{"credential": "do-not-copy"}')
+    (source / "auth.lock").write_text("locked")
+
+    cloned = create_profile(
+        "named-auth-clone",
+        clone_from="source-auth",
+        clone_all=True,
+        no_alias=True,
+    )
+
+    assert not (cloned / "auth.json").exists()
+    assert not (cloned / "auth.lock").exists()
+
+
+def test_clone_all_rejects_symlinked_source_env(profile_env):
+    source = create_profile("source-env-link", no_alias=True)
+    (source / ".env").unlink()
+    outside = profile_env / "outside-secret.env"
+    outside.write_text("OPENAI_API_KEY=outside\n")
+    (source / ".env").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="source .env"):
+        create_profile(
+            "clone-env-link",
+            clone_from="source-env-link",
+            clone_all=True,
+            no_alias=True,
+        )
+
+    assert not get_profile_dir("clone-env-link").exists()
+
+
+@pytest.mark.parametrize(
+    "credential_name",
+    ["auth.json", "auth.lock", ".env", ".op.env", "AUTH.JSON"],
+)
+def test_import_rejects_root_credential_files(
+    profile_env,
+    tmp_path,
+    credential_name,
+):
+    archive_path = tmp_path / f"credential-{credential_name.replace('.', '_')}.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        marker_data = b"safe"
+        marker = tarfile.TarInfo("portable/marker.txt")
+        marker.size = len(marker_data)
+        tf.addfile(marker, io.BytesIO(marker_data))
+        secret_data = b"credential-material"
+        secret = tarfile.TarInfo(f"portable/{credential_name}")
+        secret.size = len(secret_data)
+        tf.addfile(secret, io.BytesIO(secret_data))
+
+    with pytest.raises(ValueError, match="credential-bearing"):
+        import_profile(str(archive_path), name="credential-rejected")
+
+    assert not get_profile_dir("credential-rejected").exists()
+
+
+def test_import_allows_nested_project_auth_json(profile_env, tmp_path):
+    archive_path = tmp_path / "nested-project-auth.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b'{"project": true}'
+        info = tarfile.TarInfo("portable/workspace/project/auth.json")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    imported = import_profile(str(archive_path), name="nested-auth-ok")
+
+    assert (imported / "workspace" / "project" / "auth.json").read_bytes() == data
+
+
+def test_import_creates_private_profile_env_placeholder(profile_env, tmp_path):
+    import stat
+
+    archive_path = tmp_path / "portable.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b"model:\n  provider: openai-codex\n"
+        info = tarfile.TarInfo("portable/config.yaml")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    imported = import_profile(str(archive_path), name="imported-safe")
+
+    env_path = imported / ".env"
+    assert env_path.is_file()
+    assert not env_path.is_symlink()
+    assert env_path.stat().st_nlink == 1
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    assert all(
+        line.startswith("#") or not line.strip()
+        for line in env_path.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [
+        "auth.json.",
+        ".env ",
+        "auth.json:stream",
+        "CON",
+        "nested/NUL.txt",
+        "less<than",
+        "greater>than",
+        'double"quote',
+        "vertical|bar",
+        "question?mark",
+        "asterisk*name",
+        "COM¹.txt",
+        "LPT³.log",
+    ],
+)
+def test_import_rejects_windows_ambiguous_archive_components(
+    profile_env, tmp_path, unsafe_name
+):
+    archive_path = tmp_path / "windows-ambiguous.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b"unsafe"
+        info = tarfile.TarInfo(f"portable/{unsafe_name}")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    with pytest.raises(ValueError, match="Unsafe archive member path"):
+        import_profile(str(archive_path), name="windows-rejected")
+
+    assert not get_profile_dir("windows-rejected").exists()
+
+
+def test_import_rejects_duplicate_casefolded_paths(profile_env, tmp_path):
+    archive_path = tmp_path / "duplicate.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        for name in ("portable/data.txt", "portable/DATA.txt"):
+            data = b"value"
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    with pytest.raises(ValueError, match="duplicate paths"):
+        import_profile(str(archive_path), name="duplicate-rejected")
+
+
+def test_import_rejects_member_over_size_limit(
+    profile_env, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(profiles, "_PROFILE_ARCHIVE_MAX_FILE_BYTES", 4)
+    archive_path = tmp_path / "oversized.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b"12345"
+        info = tarfile.TarInfo("portable/data.bin")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    with pytest.raises(ValueError, match="too large"):
+        import_profile(str(archive_path), name="oversized-rejected")
+
+
+def test_import_enforces_member_cap_without_getmembers(
+    profile_env, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(profiles, "_PROFILE_ARCHIVE_MAX_MEMBERS", 2)
+    archive_path = tmp_path / "too-many.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        for index in range(3):
+            data = str(index).encode()
+            info = tarfile.TarInfo(f"portable/{index}.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    monkeypatch.setattr(
+        tarfile.TarFile,
+        "getmembers",
+        lambda _self: pytest.fail("import must stream archive headers"),
+    )
+
+    with pytest.raises(ValueError, match="too many members"):
+        import_profile(str(archive_path), name="too-many")
+
+
+@pytest.mark.parametrize(
+    "machine_root",
+    ["home", "backups", "state-snapshots", "checkpoints"],
+)
+def test_import_rejects_machine_local_root(
+    profile_env, tmp_path, machine_root
+):
+    archive_path = tmp_path / f"{machine_root}.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b"machine-local"
+        info = tarfile.TarInfo(f"portable/{machine_root}/state.bin")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    with pytest.raises(ValueError, match="machine-local"):
+        import_profile(str(archive_path), name=f"reject-{machine_root}")
+
+
+def test_import_noreplace_preserves_destination_that_appears_after_check(
+    profile_env, tmp_path, monkeypatch
+):
+    archive_path = tmp_path / "raced.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b"archive"
+        info = tarfile.TarInfo("raced/marker.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    destination = get_profile_dir("raced")
+    real_lexists = profiles.os.path.lexists
+    appeared = {}
+
+    def _race(path):
+        if Path(path) == destination and "inode" not in appeared:
+            destination.mkdir()
+            appeared["inode"] = destination.stat().st_ino
+            return False
+        return real_lexists(path)
+
+    monkeypatch.setattr(profiles.os.path, "lexists", _race)
+
+    with pytest.raises(FileExistsError):
+        import_profile(str(archive_path), name="raced")
+
+    assert destination.stat().st_ino == appeared["inode"]
+
+
+def test_import_rejects_symlinked_profiles_root_without_external_write(
+    profile_env, tmp_path, monkeypatch
+):
+    archive_path = tmp_path / "portable.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        data = b"archive"
+        info = tarfile.TarInfo("portable/marker.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    outside = tmp_path / "outside-profiles"
+    outside.mkdir()
+    linked_root = tmp_path / "linked-profiles"
+    linked_root.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: linked_root)
+
+    with pytest.raises(ValueError, match="profiles root"):
+        import_profile(str(archive_path), name="portable")
+
+    assert list(outside.iterdir()) == []

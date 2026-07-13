@@ -35,12 +35,19 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     profile_create.add_argument(
         "--clone",
         action="store_true",
-        help="Copy config.yaml, .env, SOUL.md, and skills from active profile",
+        help=(
+            "Copy config.yaml, .env, SOUL.md, curated memory files, and "
+            "skills from active profile"
+        ),
     )
     profile_create.add_argument(
         "--clone-all",
         action="store_true",
-        help="Full copy of active profile (all state, excluding per-profile history)",
+        help=(
+            "Copy working state including .env secrets; exclude auth.json, "
+            "auth.lock, .op.env, sessions/state databases, backups, snapshots, "
+            "and checkpoints (re-authenticate OAuth providers)"
+        ),
     )
     profile_create.add_argument(
         "--clone-from",
@@ -125,7 +132,8 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     profile_rename.add_argument("new_name", help="New profile name")
 
     profile_export = profile_subparsers.add_parser(
-        "export", help="Export a profile to archive"
+        "export",
+        help="Export without profile-root auth.json/auth.lock/.env/.op.env",
     )
     profile_export.add_argument("profile_name", help="Profile to export")
     profile_export.add_argument(
@@ -133,7 +141,7 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     )
 
     profile_import = profile_subparsers.add_parser(
-        "import", help="Import a profile from archive"
+        "import", help="Import an archive; reject profile-root credentials"
     )
     profile_import.add_argument("archive", help="Path to .tar.gz archive")
     profile_import.add_argument(

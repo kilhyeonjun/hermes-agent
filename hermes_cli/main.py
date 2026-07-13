@@ -512,12 +512,15 @@ def _apply_profile_override() -> None:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
         except Exception as exc:
-            # A bug in profiles.py must NEVER prevent hermes from starting
+            selection = (
+                "explicit" if profile_index is not None and consume > 0
+                else "sticky"
+            )
             print(
-                f"Warning: profile override failed ({exc}), using default",
+                f"Error: {selection} profile resolution failed ({exc})",
                 file=sys.stderr,
             )
-            return
+            sys.exit(1)
         os.environ["HERMES_HOME"] = hermes_home
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:
@@ -10087,9 +10090,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception:
             pass  # profiles module not available or no profiles
 
-        # Backfill per-profile .env files for profiles created before the
-        # .env-seeding fix (#44792). Copies the default install's .env so
-        # those profiles keep the credentials they were effectively using.
+        # Backfill private per-profile .env placeholders for profiles created
+        # before the .env-seeding fix (#44792). Root credentials are never
+        # copied across profile boundaries.
         try:
             from hermes_cli.profiles import backfill_profile_envs
 
@@ -10097,8 +10100,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if backfilled:
                 print()
                 print(
-                    f"→ Seeded .env for {len(backfilled)} profile(s) "
-                    f"(copied from default): {', '.join(backfilled)}"
+                    f"→ Created private .env placeholders for "
+                    f"{len(backfilled)} profile(s) (no credentials copied): "
+                    f"{', '.join(backfilled)}"
                 )
         except Exception:
             pass  # profiles module not available or no profiles
@@ -11234,11 +11238,14 @@ def cmd_profile(args):
                 if clone_all:
                     print(
                         f"Full copy from {source_label} "
-                        "(excluding session history, backups, and snapshots)."
+                        "(excluding sessions/state databases, backups, "
+                        "state snapshots, checkpoints, auth.json, auth.lock, "
+                        "and .op.env)."
                     )
                 else:
                     print(
-                        f"Cloned config, .env, SOUL.md, and skills from {source_label}."
+                        f"Cloned config, .env, SOUL.md, curated memory files, "
+                        f"and skills from {source_label}."
                     )
 
             # Auto-clone Honcho config for the new profile (only with clone operations)
@@ -11302,14 +11309,14 @@ def cmd_profile(args):
             print(f"  {name} setup              Configure API keys and model")
             print(f"  {name} chat               Start chatting")
             print(f"  {name} gateway start      Start the messaging gateway")
-            if clone or clone_all:
+            if clone_config or clone_all:
                 print(f"\n  Edit {profile_dir_display}/.env for different API keys")
                 print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
             else:
                 print(
                     f"\n  ⚠ This profile has no API keys yet. Run '{name} setup' first,"
                 )
-                print("    or it will inherit keys from your shell environment.")
+                print("    or add keys explicitly to this profile's private .env file.")
                 print(f"  Edit {profile_dir_display}/SOUL.md to customize personality")
             print()
 

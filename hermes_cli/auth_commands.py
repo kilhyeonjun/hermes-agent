@@ -175,14 +175,20 @@ def auth_add_command(args) -> None:
         else:
             requested_type = AUTH_TYPE_OAUTH if provider in _OAUTH_CAPABLE_PROVIDERS else AUTH_TYPE_API_KEY
 
-    pool = load_pool(provider)
+    # Explicit mutation is always owned by the active profile. Runtime reads
+    # may fall back to root credentials, but an add must never write through
+    # that borrowed source path.
+    pool = load_pool(provider, local_only=True)
 
     # Clear ALL suppressions for this provider — re-adding a credential is
     # a strong signal the user wants auth re-enabled.  This covers env:*
     # (shell-exported vars), gh_cli (copilot), claude_code, qwen-cli,
     # device_code (codex), etc.  One consistent re-engagement pattern.
     # Matches the Codex device_code re-link pattern that predates this.
-    if not provider.startswith(CUSTOM_POOL_PREFIX):
+    if (
+        not provider.startswith(CUSTOM_POOL_PREFIX)
+        and provider != "openai-codex"
+    ):
         try:
             from hermes_cli.auth import (
                 _load_auth_store,
@@ -309,39 +315,46 @@ def auth_add_command(args) -> None:
 
     if provider == "openai-codex":
         creds = auth_mod._codex_device_code_login()
-        label = (getattr(args, "label", None) or "").strip() or label_from_token(
-            creds["tokens"]["access_token"],
-            _oauth_default_label(provider, len(pool.entries()) + 1),
-        )
-        # Add a distinct, self-contained pool entry per account (matching the
-        # xai-oauth / qwen-oauth patterns) instead of
-        # routing through the singleton ``_save_codex_tokens`` save path.
-        # The singleton round-trip collapsed every added account into the
-        # latest login: a second ``hermes auth add openai-codex`` overwrote
-        # the first account's singleton-mirrored ``device_code`` entry rather
-        # than creating an independent one (#39236). ``manual:device_code``
-        # entries refresh from their own token pair, so they need no singleton
-        # shadow.
-        entry = PooledCredential(
-            provider=provider,
-            id=uuid.uuid4().hex[:6],
-            label=label,
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source=SOURCE_MANUAL_DEVICE_CODE,
-            access_token=creds["tokens"]["access_token"],
-            refresh_token=creds["tokens"].get("refresh_token"),
-            base_url=creds.get("base_url"),
-            last_refresh=creds.get("last_refresh"),
-        )
-        first_credential = not pool.entries()
-        pool.add_entry(entry)
-        # Adding the first Codex credential should make it the active provider
-        # (the old singleton save path did this implicitly via
-        # _save_provider_state). Subsequent adds leave the active provider as-is.
-        if first_credential:
-            auth_mod.mark_provider_active_if_unset(provider)
-        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        with auth_mod._codex_auth_store_mutation(
+            reason="fresh_account_add",
+            supersede_ambiguous=False,
+            grant_ids=(),
+        ):
+            # Re-engagement clears suppression under the same host-wide lock as
+            # the pool insert; refresh/login/remove can no longer interleave.
+            suppressed = auth_mod._load_auth_store().get(
+                "suppressed_sources", {}
+            )
+            for src in list(suppressed.get(provider, []) or []):
+                auth_mod.unsuppress_credential_source(provider, src)
+
+            pool = load_pool(provider, local_only=True)
+            label = (getattr(args, "label", None) or "").strip() or label_from_token(
+                creds["tokens"]["access_token"],
+                _oauth_default_label(provider, len(pool.entries()) + 1),
+            )
+            # Add a distinct, self-contained pool entry per account (matching the
+            # xai-oauth / qwen-oauth patterns) instead of routing through the
+            # singleton save path.
+            entry = PooledCredential(
+                provider=provider,
+                id=uuid.uuid4().hex[:6],
+                label=label,
+                auth_type=AUTH_TYPE_OAUTH,
+                priority=0,
+                source=SOURCE_MANUAL_DEVICE_CODE,
+                access_token=creds["tokens"]["access_token"],
+                refresh_token=creds["tokens"].get("refresh_token"),
+                grant_id=uuid.uuid4().hex,
+                base_url=creds.get("base_url"),
+                last_refresh=creds.get("last_refresh"),
+            )
+            first_credential = not pool.entries()
+            pool.add_entry(entry)
+            if first_credential:
+                auth_mod.mark_provider_active_if_unset(provider)
+            entry_count = len(pool.entries())
+        print(f'Added {provider} OAuth credential #{entry_count}: "{entry.label}"')
         return
 
     if provider == "xai-oauth":
@@ -356,7 +369,7 @@ def auth_add_command(args) -> None:
             last_refresh=creds.get("last_refresh"),
             auth_mode="oauth_device_code",
         )
-        pool = load_pool(provider)
+        pool = load_pool(provider, local_only=True)
         entry = next((e for e in pool.entries() if getattr(e, "source", "") == "device_code"), None)
         shown_label = entry.label if entry is not None else label_from_token(
             creds["tokens"]["access_token"], _oauth_default_label(provider, 1)
@@ -448,31 +461,22 @@ def auth_remove_command(args) -> None:
     index, matched, error = pool.resolve_target(target)
     if matched is None or index is None:
         raise SystemExit(f"{error} Provider: {provider}.")
-    removed = pool.remove_index(index)
-    if removed is None:
-        raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
-    print(f"Removed {provider} credential #{index} ({removed.label})")
+    from agent.credential_sources import (
+        CredentialRemovalNotFoundError,
+        remove_credential_target,
+    )
 
-    # Unified removal dispatch.  Every credential source Hermes reads from
-    # (env vars, external OAuth files, auth.json blocks, custom config)
-    # has a RemovalStep registered in agent.credential_sources.  The step
-    # handles its source-specific cleanup and we centralise suppression +
-    # user-facing output here so every source behaves identically from
-    # the user's perspective.
-    from agent.credential_sources import find_removal_step
-    from hermes_cli.auth import suppress_credential_source
-
-    step = find_removal_step(provider, removed.source)
-    if step is None:
-        # Unregistered source — e.g. "manual", which has nothing external
-        # to clean up.  The pool entry is already gone; we're done.
-        return
-
-    result = step.remove_fn(provider, removed)
+    try:
+        outcome = remove_credential_target(provider, matched.id)
+    except CredentialRemovalNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    removed = outcome.removed
+    print(
+        f"Removed {provider} credential #{outcome.index} ({removed.label})"
+    )
+    result = outcome.result
     for line in result.cleaned:
         print(line)
-    if result.suppress:
-        suppress_credential_source(provider, removed.source)
     for line in result.hints:
         print(line)
 

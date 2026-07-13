@@ -200,3 +200,23 @@ def test_save_auth_store_uses_os_open_with_0o600_mode(tmp_path, monkeypatch):
             f"auth.json temp open mode 0o{mode:o} != 0o{expected:o} — "
             f"umask would apply and potentially expose tokens"
         )
+
+
+def test_auth_store_lock_rejects_symlink_without_opening_target(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import auth as auth_mod
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    auth_path = hermes_home / "auth.json"
+    outside = tmp_path / "outside.lock"
+    outside.write_text("preserve", encoding="utf-8")
+    (hermes_home / "auth.lock").symlink_to(outside)
+
+    with pytest.raises(auth_mod.AuthStoreCorruptError):
+        with auth_mod._auth_store_lock(auth_path):
+            pass
+
+    assert outside.read_text(encoding="utf-8") == "preserve"

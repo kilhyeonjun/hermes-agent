@@ -1081,9 +1081,9 @@ export const api = {
         body: JSON.stringify({ provider, api_key, label }),
       },
     ),
-  removeCredentialPoolEntry: (provider: string, index: number) =>
+  removeCredentialPoolEntry: (provider: string, credentialId: string) =>
     fetchJSON<{ ok: boolean; provider: string; count: number }>(
-      `/api/credentials/pool/${encodeURIComponent(provider)}/${index}`,
+      `/api/credentials/pool/${encodeURIComponent(provider)}/entries/${encodeURIComponent(credentialId)}`,
       { method: "DELETE" },
     ),
 
@@ -1551,7 +1551,7 @@ export interface WebhookCreate {
 
 export interface CredentialPoolEntry {
   index: number;
-  id: string | null;
+  id: string;
   label: string | null;
   auth_type: string | null;
   source: string | null;

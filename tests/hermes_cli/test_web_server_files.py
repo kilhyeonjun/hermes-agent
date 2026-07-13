@@ -678,3 +678,73 @@ def test_benign_subdir_file_still_browsable(forced_files_client):
     listing = client.get("/api/files", params={"path": str(sub)})
     assert "todo.txt" in [e["name"] for e in listing.json()["entries"]]
     assert client.get("/api/files/read", params={"path": str(p)}).status_code == 200
+
+
+def test_sensitive_managed_file_mutations_are_denied(forced_files_client):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    auth_path = root / "auth.json"
+    auth_path.write_text('{"sentinel": true}\n', encoding="utf-8")
+    before = auth_path.read_bytes()
+
+    upload = client.post(
+        "/api/files/upload",
+        json={
+            "path": str(auth_path),
+            "data_url": "data:application/json;base64,e30=",
+            "overwrite": True,
+        },
+    )
+    assert upload.status_code == 403
+
+    stream = client.post(
+        "/api/files/upload-stream",
+        data={"path": str(auth_path), "overwrite": "true"},
+        files={"file": ("auth.json", b"{}", "application/json")},
+    )
+    assert stream.status_code == 403
+
+    delete = client.request(
+        "DELETE",
+        "/api/files",
+        json={"path": str(auth_path)},
+    )
+    assert delete.status_code == 403
+    assert auth_path.read_bytes() == before
+
+    auth_lock_dir = root / "auth.lock"
+    mkdir = client.post(
+        "/api/files/mkdir",
+        json={"path": str(auth_lock_dir)},
+    )
+    assert mkdir.status_code == 403
+    assert not auth_lock_dir.exists()
+
+
+def test_fs_endpoints_block_canonical_auth_store(
+    forced_files_client, monkeypatch
+):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    auth_path = root / "auth.json"
+    auth_path.write_text('{"sentinel": true}\n', encoding="utf-8")
+    before = auth_path.read_bytes()
+
+    write = client.post(
+        "/api/fs/write-text",
+        json={"path": str(auth_path), "content": "{}"},
+    )
+    assert write.status_code == 403
+    assert auth_path.read_bytes() == before
+
+    assert client.get(
+        "/api/fs/read-text", params={"path": str(auth_path)}
+    ).status_code == 403
+    assert client.get(
+        "/api/fs/read-data-url", params={"path": str(auth_path)}
+    ).status_code == 403
+
+    listing = client.get("/api/fs/list", params={"path": str(root)})
+    assert listing.status_code == 200
+    assert "auth.json" not in [entry["name"] for entry in listing.json()["entries"]]

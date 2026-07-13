@@ -98,6 +98,22 @@ class TestShouldExclude:
         assert _should_exclude(Path("gateway.pid"))
         assert _should_exclude(Path("cron.pid"))
 
+    def test_excludes_auth_lock_inode(self):
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(Path("auth.lock"))
+        assert _should_exclude(Path("profiles/coder/auth.lock"))
+
+    def test_excludes_codex_refresh_runtime_state(self):
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(Path("state/codex-refresh/refresh.lock"))
+        assert _should_exclude(Path("state/codex-refresh/refresh.hmac.key"))
+        assert _should_exclude(
+            Path("profiles/coder/state/codex-refresh/grant-deadbeef.wal.json")
+        )
+        assert not _should_exclude(Path("workspace/state/codex-refresh-notes.md"))
+
     def test_excludes_checkpoints(self):
         """checkpoints/ is session-local trajectory cache — hash-keyed,
         regenerated per-session, won't port to another machine anyway."""
@@ -109,6 +125,13 @@ class TestShouldExclude:
         """backups/ is excluded so pre-update backups don't nest exponentially."""
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
+
+    def test_excludes_profile_retirement_trash(self):
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(
+            Path(".profile-trash/coder.deleting-deadbeef/auth.json")
+        )
 
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
@@ -224,6 +247,35 @@ class TestBackup:
             assert "logs/agent.log" in names
             # Skins
             assert "skins/cyber.yaml" in names
+
+    def test_excludes_codex_refresh_runtime_subtrees(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        runtime_paths = (
+            "state/codex-refresh/refresh.lock",
+            "state/codex-refresh/refresh.hmac.key",
+            "state/codex-refresh/grant-deadbeef.wal.json",
+            "profiles/coder/state/codex-refresh/grant-deadbeef.wal.tmp.1.x",
+        )
+        for rel in runtime_paths:
+            path = hermes_home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("host-only-runtime-state")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / "backup.zip"
+
+        from hermes_cli.backup import run_backup
+
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+        assert "config.yaml" in names
+        assert not names.intersection(runtime_paths)
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
         """SQLite staging temp files must be created on the output zip's
@@ -794,9 +846,14 @@ class TestImport:
         self._make_backup_zip(zip_path, {
             "config.yaml": "model: openrouter\n",
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
-            "auth.json": '{"providers": {"nous": "token"}}',
+            ".op.env": "OP_SERVICE_ACCOUNT_TOKEN=op-secret\n",
+            "auth.json": json.dumps({
+                "version": 1,
+                "providers": {"nous": {"access_token": "token"}},
+            }),
             "state.db": b"SQLite format 3\x00",
             "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
+            "profiles/coder/.op.env": "OP_SERVICE_ACCOUNT_TOKEN=profile-op-secret\n",
         })
 
         args = Namespace(zipfile=str(zip_path), force=True)
@@ -804,9 +861,175 @@ class TestImport:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        for rel in (".env", "auth.json", "state.db", "profiles/coder/.env"):
+        for rel in (
+            ".env",
+            ".op.env",
+            "auth.json",
+            "state.db",
+            "profiles/coder/.env",
+            "profiles/coder/.op.env",
+        ):
             mode = (hermes_home / rel).stat().st_mode & 0o777
             assert mode == 0o600, f"{rel} restored with mode {oct(mode)}, expected 0o600"
+
+    def test_auth_import_uses_canonical_revision_and_preserves_lock_inode(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "_auth_revision": 7,
+            "providers": {"old": {"api_key": "old"}},
+        }))
+        lock_path = hermes_home / "auth.lock"
+        lock_path.write_text("host-lock-inode", encoding="utf-8")
+        lock_inode = lock_path.stat().st_ino
+
+        zip_path = tmp_path / "backup.zip"
+        self._make_backup_zip(zip_path, {
+            "config.yaml": "model: restored\n",
+            "auth.json": json.dumps({
+                "version": 1,
+                "_auth_revision": 999,
+                "providers": {"restored": {"api_key": "new"}},
+            }),
+            "auth.lock": "archive-lock-must-never-land",
+        })
+
+        from hermes_cli.backup import run_import
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        restored = json.loads((hermes_home / "auth.json").read_text())
+        assert restored["_auth_revision"] == 8
+        assert "restored" in restored["providers"]
+        assert lock_path.stat().st_ino == lock_inode
+        assert lock_path.read_text(encoding="utf-8") == "host-lock-inode"
+        assert (hermes_home / "auth.json").stat().st_mode & 0o777 == 0o600
+
+    def test_import_never_overwrites_codex_refresh_runtime_state(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        runtime_dir = hermes_home / "state" / "codex-refresh"
+        runtime_dir.mkdir(parents=True)
+        live = {
+            "refresh.lock": b"live-lock-inode",
+            "refresh.hmac.key": b"live-key",
+            "grant-deadbeef.wal.json": b"live-wal",
+        }
+        before_inodes = {}
+        for name, payload in live.items():
+            path = runtime_dir / name
+            path.write_bytes(payload)
+            before_inodes[name] = path.stat().st_ino
+        zip_path = tmp_path / "legacy-backup.zip"
+        self._make_backup_zip(
+            zip_path,
+            {
+                "config.yaml": "model: restored\n",
+                **{
+                    f"state/codex-refresh/{name}": b"archive-stale"
+                    for name in live
+                },
+            },
+        )
+
+        from hermes_cli.backup import run_import
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert (hermes_home / "config.yaml").read_text() == "model: restored\n"
+        for name, payload in live.items():
+            path = runtime_dir / name
+            assert path.read_bytes() == payload
+            assert path.stat().st_ino == before_inodes[name]
+
+    def test_fresh_host_import_excludes_codex_oauth_but_keeps_other_auth(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        zip_path = tmp_path / "backup.zip"
+        self._make_backup_zip(
+            zip_path,
+            {
+                "config.yaml": "model: restored\n",
+                "auth.json": json.dumps(
+                    {
+                        "version": 1,
+                        "active_provider": "openai-codex",
+                        "providers": {
+                            "openai-codex": {
+                                "tokens": {
+                                    "access_token": "stale-access",
+                                    "refresh_token": "stale-refresh",
+                                },
+                                "grant_id": "e" * 32,
+                            },
+                            "nous": {"api_key": "keep-nous"},
+                        },
+                        "credential_pool": {
+                            "openai-codex": [
+                                {
+                                    "id": "stale-codex",
+                                    "source": "device_code",
+                                    "auth_type": "oauth",
+                                    "access_token": "stale-access",
+                                    "refresh_token": "stale-refresh",
+                                    "grant_id": "e" * 32,
+                                }
+                            ]
+                        },
+                    }
+                ),
+            },
+        )
+
+        from hermes_cli.backup import run_import
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        saved = json.loads((hermes_home / "auth.json").read_text())
+        assert "openai-codex" not in saved["providers"]
+        assert "openai-codex" not in saved.get("credential_pool", {})
+        assert saved["providers"]["nous"] == {"api_key": "keep-nous"}
+        assert saved.get("active_provider") != "openai-codex"
+
+    def test_malformed_auth_import_preserves_live_bytes(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        auth_path = hermes_home / "auth.json"
+        auth_path.write_text(json.dumps({
+            "version": 1,
+            "_auth_revision": 3,
+            "providers": {"safe": {"api_key": "keep"}},
+        }))
+        before = auth_path.read_bytes()
+        zip_path = tmp_path / "backup.zip"
+        self._make_backup_zip(zip_path, {
+            "config.yaml": "model: restored\n",
+            "auth.json": '{"providers": [',
+        })
+
+        from hermes_cli.backup import run_import
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert auth_path.read_bytes() == before
+        assert "auth restore refused" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -1493,6 +1716,73 @@ class TestQuickSnapshot:
         conn.close()
         assert len(rows) == 1
 
+    def test_restore_legacy_snapshot_skips_codex_refresh_runtime_state(
+        self, hermes_home
+    ):
+        from hermes_cli.backup import restore_quick_snapshot
+
+        runtime_dir = hermes_home / "state" / "codex-refresh"
+        runtime_dir.mkdir(parents=True)
+        live_lock = runtime_dir / "refresh.lock"
+        live_key = runtime_dir / "refresh.hmac.key"
+        live_lock.write_bytes(b"live-lock")
+        live_key.write_bytes(b"live-key")
+        lock_inode = live_lock.stat().st_ino
+        snap_dir = hermes_home / "state-snapshots" / "legacy"
+        archived_runtime = snap_dir / "state" / "codex-refresh"
+        archived_runtime.mkdir(parents=True)
+        (archived_runtime / "refresh.lock").write_bytes(b"stale-lock")
+        (archived_runtime / "refresh.hmac.key").write_bytes(b"stale-key")
+        (snap_dir / "config.yaml").write_text("model: restored\n")
+        (snap_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "files": {
+                        "config.yaml": 16,
+                        "state/codex-refresh/refresh.lock": 10,
+                        "state/codex-refresh/refresh.hmac.key": 9,
+                    }
+                }
+            )
+        )
+
+        assert restore_quick_snapshot("legacy", hermes_home=hermes_home)
+
+        assert (hermes_home / "config.yaml").read_text() == "model: restored\n"
+        assert live_lock.read_bytes() == b"live-lock"
+        assert live_lock.stat().st_ino == lock_inode
+        assert live_key.read_bytes() == b"live-key"
+
+    def test_restore_skips_credentials_by_default_and_opt_in_is_transactional(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        auth_path = hermes_home / "auth.json"
+        auth_path.write_text(json.dumps({
+            "version": 1,
+            "_auth_revision": 5,
+            "providers": {"newer": {"api_key": "keep-by-default"}},
+        }))
+        default_bytes = auth_path.read_bytes()
+
+        assert restore_quick_snapshot(
+            snap_id, hermes_home=hermes_home
+        ) is True
+        assert auth_path.read_bytes() == default_bytes
+
+        assert restore_quick_snapshot(
+            snap_id,
+            hermes_home=hermes_home,
+            restore_credentials=True,
+        ) is True
+        restored = json.loads(auth_path.read_text())
+        assert restored["providers"] == {}
+        assert restored["_auth_revision"] == 6
+        assert auth_path.stat().st_mode & 0o777 == 0o600
+
     def test_restore_nonexistent(self, hermes_home):
         from hermes_cli.backup import restore_quick_snapshot
         assert restore_quick_snapshot("nonexistent", hermes_home=hermes_home) is False
@@ -2044,7 +2334,7 @@ class TestRunPreUpdateBackup:
         # Bust caches for hermes_cli.config + hermes_constants so they pick up HERMES_HOME
         for mod in list(__import__("sys").modules.keys()):
             if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
-                del __import__("sys").modules[mod]
+                monkeypatch.delitem(__import__("sys").modules, mod)
         return root
 
     def test_backup_flag_creates_backup(self, hermes_home, capsys):

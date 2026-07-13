@@ -11,6 +11,8 @@ import pytest
 from agent.file_safety import (
     _BLOCKED_PROJECT_ENV_BASENAMES,
     get_read_block_error,
+    is_canonical_auth_store_path,
+    is_write_denied,
 )
 
 
@@ -159,3 +161,31 @@ class TestCombinedGuards:
             error = get_read_block_error(str(cache))
             assert error is not None
             assert "internal Hermes cache" in error
+
+
+class TestCanonicalAuthStoreAliases:
+    """Generic file surfaces must reject inode aliases of auth state."""
+
+    def test_hardlink_alias_of_auth_store_is_blocked_for_read_and_write(
+        self, tmp_path
+    ):
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+        auth_path = hermes_root / "auth.json"
+        auth_path.write_text('{"version": 1}', encoding="utf-8")
+        alias = tmp_path / "innocent.json"
+        try:
+            alias.hardlink_to(auth_path)
+        except OSError as exc:
+            pytest.skip(f"hardlinks are unavailable on this filesystem: {exc}")
+
+        with (
+            patch("agent.file_safety._hermes_home_path", return_value=hermes_root),
+            patch("agent.file_safety._hermes_root_path", return_value=hermes_root),
+        ):
+            assert is_canonical_auth_store_path(str(alias)) is True
+            assert is_write_denied(str(alias)) is True
+            error = get_read_block_error(str(alias))
+
+        assert error is not None
+        assert "credential" in error.lower() or "auth" in error.lower()

@@ -104,3 +104,21 @@ describe("api OAuth helpers", () => {
     }
   });
 });
+
+describe("api credential pool helpers", () => {
+  it("deletes by stable credential ID", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ ok: true, count: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.removeCredentialPoolEntry("openai-codex", "legacy/id?");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/credentials/pool/openai-codex/entries/legacy%2Fid%3F",
+      expect.objectContaining({
+        credentials: "include",
+        method: "DELETE",
+      }),
+    );
+  });
+});

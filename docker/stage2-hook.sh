@@ -19,6 +19,7 @@ set -eu
 
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 INSTALL_DIR="/opt/hermes"
+S6_CONTAINER_ENV_DIR="${S6_CONTAINER_ENV_DIR:-/run/s6/container_environment}"
 
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
 as_hermes() { [ "$(id -u)" = 0 ] || { "$@"; return; }; s6-setuidgid hermes "$@"; }
@@ -430,22 +431,35 @@ if [ -f "$HERMES_HOME/config.yaml" ]; then
         || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
 fi
 
-# auth.json: bootstrap from env on first boot only. Same semantics as the
-# pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
-# rotated refresh tokens on container restart.
-if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP:-}" ]; then
+# Consume credential-bearing seed variables before supervised processes start.
+# s6-overlay materializes the original container environment in this envdir;
+# unset alone would only clean this hook's shell and with-contenv would restore
+# the secrets for every later service. Keep a non-exported, short-lived copy and
+# pass it only to the one canonical helper process.
+auth_bootstrap_seed=${HERMES_AUTH_JSON_BOOTSTRAP:-}
+auth_rebootstrap_seed=${HERMES_AUTH_JSON_REBOOTSTRAP:-}
+unset HERMES_AUTH_JSON_BOOTSTRAP HERMES_AUTH_JSON_REBOOTSTRAP
+rm -f "$S6_CONTAINER_ENV_DIR/HERMES_AUTH_JSON_BOOTSTRAP" \
+      "$S6_CONTAINER_ENV_DIR/HERMES_AUTH_JSON_REBOOTSTRAP"
+
+# auth.json: bootstrap from env on first boot only. The helper re-checks file
+# absence while holding the canonical auth lock, validates the complete JSON
+# shape, and commits with revision/CAS + 0600 atomic replace + fsync.
+if [ -n "$auth_bootstrap_seed" ]; then
     if refuse_symlinked_path "seed" "$HERMES_HOME/auth.json"; then
         :
     else
-        printf '%s' "$HERMES_AUTH_JSON_BOOTSTRAP" > "$HERMES_HOME/auth.json"
-        chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
-        chmod 600 "$HERMES_HOME/auth.json"
+        as_hermes env HERMES_AUTH_JSON_BOOTSTRAP="$auth_bootstrap_seed" \
+            "$INSTALL_DIR/.venv/bin/python" \
+            "$INSTALL_DIR/scripts/docker_rebootstrap_nous_session.py" \
+            --bootstrap "$HERMES_HOME/auth.json" \
+            || echo "[stage2] Warning: canonical auth bootstrap failed; continuing"
     fi
 fi
 
 # auth.json: re-seed a TERMINALLY-DEAD Nous bootstrap session (self-heal).
 #
-# The [ ! -f ] guard above deliberately refuses to clobber an existing
+# The canonical create-only transaction above refuses to clobber an existing
 # auth.json, so a container whose Nous bootstrap session took a terminal
 # invalid_grant (tokens cleared, providers.nous.last_auth_error.relogin_required
 # stamped) can NOT recover from a plain restart — it stays unauthenticated until
@@ -455,18 +469,20 @@ fi
 # providers.nous entry, and ONLY when the on-disk entry is provably terminal.
 # Every other case (healthy, rotating, absent, or unparseable auth.json) is a
 # no-op, so it is safe to leave the env set across restarts and never risks
-# clobbering a good/rotated token. Runs as its own stdlib-only subprocess (no
-# app imports) and always exits 0.
-if [ -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_REBOOTSTRAP:-}" ]; then
+# clobbering a good/rotated token. The subprocess imports the canonical auth
+# protocol lazily and fails closed if it is unavailable.
+if [ -f "$HERMES_HOME/auth.json" ] && [ -n "$auth_rebootstrap_seed" ]; then
     if refuse_symlinked_path "reseed" "$HERMES_HOME/auth.json"; then
         :
     else
-        s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" \
+        as_hermes env HERMES_AUTH_JSON_REBOOTSTRAP="$auth_rebootstrap_seed" \
+            "$INSTALL_DIR/.venv/bin/python" \
             "$INSTALL_DIR/scripts/docker_rebootstrap_nous_session.py" \
             "$HERMES_HOME/auth.json" \
             || echo "[stage2] Warning: docker_rebootstrap_nous_session.py failed; continuing"
     fi
 fi
+unset auth_bootstrap_seed auth_rebootstrap_seed
 
 # gateway_state.json: declare the gateway's INITIAL supervised state on a
 # fresh volume. Same first-boot-only env-seed pattern as auth.json above.
@@ -556,8 +572,8 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
         # Idempotent: each boot overwrites with the current path.
         # Some container runtimes / s6-overlay versions do not create the
         # envdir before cont-init hooks run, so create it defensively.
-        mkdir -p /run/s6/container_environment
-        printf '%s' "$browser_bin" > /run/s6/container_environment/AGENT_BROWSER_EXECUTABLE_PATH
+        mkdir -p "$S6_CONTAINER_ENV_DIR"
+        printf '%s' "$browser_bin" > "$S6_CONTAINER_ENV_DIR/AGENT_BROWSER_EXECUTABLE_PATH"
     else
         echo "[stage2] Warning: no Chromium binary under $PLAYWRIGHT_BROWSERS_PATH; browser tool may fail"
     fi

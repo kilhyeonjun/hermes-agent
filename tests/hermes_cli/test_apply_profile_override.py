@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 
 def _run_apply_profile_override(
@@ -163,6 +165,51 @@ class TestApplyProfileOverrideHermesHomeGuard:
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") is None
+
+    def test_explicit_profile_unexpected_resolution_error_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(sys, "argv", ["hermes", "-p", "coder", "chat"])
+        monkeypatch.setattr(
+            "hermes_cli.profiles.resolve_profile_env",
+            lambda _name: (_ for _ in ()).throw(RuntimeError("resolver bug")),
+        )
+
+        from hermes_cli.main import _apply_profile_override
+
+        with pytest.raises(SystemExit) as exc:
+            _apply_profile_override()
+
+        assert exc.value.code == 1
+        assert "HERMES_HOME" not in os.environ
+
+    def test_sticky_profile_unexpected_resolution_error_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        """A broken named sticky selection must not run the default agent."""
+        hermes_root = tmp_path / ".hermes"
+        profile_dir = hermes_root / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        (hermes_root / "active_profile").write_text("coder\n")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
+        monkeypatch.setattr(
+            "hermes_cli.profiles.resolve_profile_env",
+            lambda _name: (_ for _ in ()).throw(RuntimeError("resolver bug")),
+        )
+
+        from hermes_cli.main import _apply_profile_override
+
+        with pytest.raises(SystemExit) as exc:
+            _apply_profile_override()
+
+        assert exc.value.code == 1
+        assert "HERMES_HOME" not in os.environ
 
     def test_subcommand_profile_flag_is_not_consumed(self, tmp_path, monkeypatch):
         """Command argv flags named --profile must stay with that command.
@@ -323,3 +370,43 @@ class TestSupervisedChildIgnoresStickyProfile:
         assert result is not None
         assert result.endswith("coder")
 
+
+def test_cmd_profile_clone_from_reports_cloned_credentials(
+    tmp_path, monkeypatch, capsys
+):
+    """--clone-from implies clone_config in both behavior and next steps."""
+    target = tmp_path / ".hermes" / "profiles" / "work"
+    target.mkdir(parents=True)
+    captured: dict[str, object] = {}
+
+    def _create_profile(**kwargs):
+        captured.update(kwargs)
+        return target
+
+    monkeypatch.setattr("hermes_cli.profiles.create_profile", _create_profile)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.seed_profile_skills",
+        lambda *_args, **_kwargs: pytest.fail(
+            "clone-from must not seed a fresh bundled skill set"
+        ),
+    )
+
+    from hermes_cli.main import cmd_profile
+
+    cmd_profile(
+        SimpleNamespace(
+            profile_action="create",
+            profile_name="work",
+            clone=False,
+            clone_all=False,
+            clone_from="source",
+            no_alias=True,
+            no_skills=False,
+            description=None,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert captured["clone_config"] is True
+    assert "Edit " in output and "/.env for different API keys" in output
+    assert "has no API keys yet" not in output

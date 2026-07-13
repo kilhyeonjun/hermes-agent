@@ -63,6 +63,14 @@ import {
 } from './desktop-uninstall'
 import { installEmbedReferer } from './embed-referer'
 import { readDirForIpc } from './fs-read-dir'
+import {
+  assertHermesAuthPathAllowed,
+  isHermesAuthPathProtected,
+  renamePathWithAuthGuard,
+  trashPathWithAuthGuard,
+  writeBufferWithAuthGuard,
+  writeTextWithAuthGuard
+} from './fs-mutations'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
 import {
@@ -80,7 +88,7 @@ import {
   reviewStage,
   reviewUnstage
 } from './git-review-ops'
-import { gitRootForIpc } from './git-root'
+import { guardGitRepositoryForIpc, gitRootForIpc } from './git-root'
 import { addWorktree, listBranches, listWorktrees, removeWorktree, switchBranch } from './git-worktree-ops'
 import {
   DATA_URL_READ_MAX_BYTES,
@@ -332,6 +340,118 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+
+function resolveHermesAuthRoot() {
+  const parent = path.dirname(HERMES_HOME)
+
+  return path.basename(parent).toLowerCase() === 'profiles'
+    ? path.dirname(parent)
+    : HERMES_HOME
+}
+
+const HERMES_AUTH_ROOT = resolveHermesAuthRoot()
+
+function resolveCodexRefreshStateDir() {
+  const override = String(process.env.HERMES_CODEX_REFRESH_STATE_DIR || '').trim()
+
+  if (override) {
+    return path.resolve(expandUserPath(override))
+  }
+  return path.join(HERMES_AUTH_ROOT, 'state', 'codex-refresh')
+}
+
+const CODEX_REFRESH_STATE_DIR = resolveCodexRefreshStateDir()
+
+function guardGitTreePath(rawPath, purpose) {
+  const resolved = resolveRequestedPathForIpc(rawPath, { purpose })
+  assertHermesAuthPathAllowed(resolved, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    mode: 'tree',
+    purpose
+  })
+
+  return resolved
+}
+
+async function guardGitRepoPath(repoPath, purpose = 'Git repository operation') {
+  return guardGitRepositoryForIpc(repoPath, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    purpose
+  })
+}
+
+async function guardGitFileTarget(repoPath, filePath, purpose) {
+  const resolvedRepo = await guardGitRepoPath(repoPath, purpose)
+
+  if (filePath == null) {
+    return { repoPath: resolvedRepo, filePath: null }
+  }
+  const requested = String(filePath || '').trim()
+
+  if (!requested) {
+    throw new Error(`${purpose} requires a file path`)
+  }
+  const resolvedTarget = resolveRequestedPathForIpc(
+    path.isAbsolute(requested) ? requested : path.join(resolvedRepo, requested),
+    { purpose }
+  )
+  const relative = path.relative(resolvedRepo, resolvedTarget)
+
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${purpose} path must stay inside the repository`)
+  }
+  assertHermesAuthPathAllowed(resolvedTarget, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    mode: 'entry',
+    purpose
+  })
+
+  return { repoPath: resolvedRepo, filePath: relative }
+}
+
+async function resolveDesktopReadableFileForIpc(filePath, options: any = {}) {
+  const result = await resolveReadableFileForIpc(filePath, options)
+  assertHermesAuthPathAllowed(result.resolvedPath, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    mode: 'entry',
+    purpose: options.purpose || 'File read'
+  })
+
+  return result
+}
+
+async function readDirForDesktopIpc(dirPath) {
+  assertHermesAuthPathAllowed(dirPath, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    mode: 'entry',
+    purpose: 'Directory read'
+  })
+  const result = await readDirForIpc(dirPath)
+
+  if (!Array.isArray(result.entries)) {
+    return result
+  }
+
+  return {
+    ...result,
+    entries: result.entries.filter(entry => {
+      try {
+        return !isHermesAuthPathProtected(entry.path, {
+          codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+          hermesHome: HERMES_AUTH_ROOT,
+          mode: 'entry'
+        })
+      } catch {
+        return false
+      }
+    })
+  }
+}
 
 function hermesManagedNodePathEntries() {
   // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
@@ -778,7 +898,7 @@ function registerMediaProtocol() {
 
       const filePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
 
-      ;({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
+      ;({ resolvedPath } = await resolveDesktopReadableFileForIpc(filePath, { purpose: 'Media stream' }))
     } catch {
       return new Response('Media not found', { status: 404 })
     }
@@ -1027,6 +1147,12 @@ function openExternalUrl(rawUrl) {
 
     try {
       localPath = resolveRequestedPathForIpc(parsed.toString(), { purpose: 'Open external file' })
+      assertHermesAuthPathAllowed(localPath, {
+        codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+        hermesHome: HERMES_AUTH_ROOT,
+        mode: 'entry',
+        purpose: 'Open external file'
+      })
     } catch {
       return false
     }
@@ -1100,6 +1226,12 @@ async function openPreviewInBrowser(rawUrl) {
 
     try {
       localPath = resolveRequestedPathForIpc(parsed.toString(), { purpose: 'Open preview in browser' })
+      assertHermesAuthPathAllowed(localPath, {
+        codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+        hermesHome: HERMES_AUTH_ROOT,
+        mode: 'entry',
+        purpose: 'Open preview in browser'
+      })
     } catch {
       return false
     }
@@ -1492,7 +1624,7 @@ function unwrapWindowsVenvHermesCommand(command, backendArgs) {
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     bootstrap: false,
     env: buildDesktopBackendEnv({
-      hermesHome: HERMES_HOME,
+      hermesHome: HERMES_AUTH_ROOT,
       pythonPathEntries: [...(directoryExists(root) ? [root] : []), ...getVenvSitePackagesEntries(venvRoot)],
       venvRoot
     }),
@@ -3318,7 +3450,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     command,
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     env: buildDesktopBackendEnv({
-      hermesHome: HERMES_HOME,
+      hermesHome: HERMES_AUTH_ROOT,
       pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
       venvRoot
     }),
@@ -3342,7 +3474,7 @@ function createActiveBackend(backendArgs) {
     command,
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     env: buildDesktopBackendEnv({
-      hermesHome: HERMES_HOME,
+      hermesHome: HERMES_AUTH_ROOT,
       pythonPathEntries: [ACTIVE_HERMES_ROOT, ...getVenvSitePackagesEntries(VENV_ROOT)],
       venvRoot: VENV_ROOT
     }),
@@ -3560,7 +3692,7 @@ async function ensureRuntime(backend) {
       installStamp: backend.installStamp,
       activeRoot: backend.activeRoot,
       sourceRepoRoot: SOURCE_REPO_ROOT,
-      hermesHome: HERMES_HOME,
+      hermesHome: HERMES_AUTH_ROOT,
       logRoot: path.join(HERMES_HOME, 'logs'),
       abortSignal: bootstrapAbortController.signal,
       onEvent: ev => {
@@ -4195,7 +4327,7 @@ async function resourceBufferFromUrl(rawUrl) {
   }
 
   if (/^file:/i.test(rawUrl)) {
-    const { resolvedPath } = await resolveReadableFileForIpc(rawUrl, { purpose: 'Image file' })
+    const { resolvedPath } = await resolveDesktopReadableFileForIpc(rawUrl, { purpose: 'Image file' })
     const buffer = await fs.promises.readFile(resolvedPath)
 
     return { buffer, mimeType: mimeTypeForPath(resolvedPath) }
@@ -4250,7 +4382,11 @@ async function saveImageFromUrl(rawUrl) {
   if (result.canceled || !result.filePath) {
     return false
   }
-  await fs.promises.writeFile(result.filePath, buffer)
+  await writeBufferWithAuthGuard(result.filePath, buffer, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    purpose: 'Save image'
+  })
 
   return true
 }
@@ -4309,7 +4445,7 @@ async function previewFileTarget(rawTarget, baseDir) {
     return null
   }
 
-  ;({ resolvedPath: resolved } = await resolveReadableFileForIpc(resolved, { purpose: 'Preview target' }))
+  ;({ resolvedPath: resolved } = await resolveDesktopReadableFileForIpc(resolved, { purpose: 'Preview target' }))
 
   const mimeType = mimeTypeForPath(resolved)
   const metadata = previewFileMetadata(resolved, mimeType)
@@ -4375,7 +4511,7 @@ async function normalizePreviewTarget(rawTarget, baseDir) {
 }
 
 async function filePathFromPreviewUrl(rawUrl) {
-  const { resolvedPath } = await resolveReadableFileForIpc(String(rawUrl || ''), { purpose: 'Preview file' })
+  const { resolvedPath } = await resolveDesktopReadableFileForIpc(String(rawUrl || ''), { purpose: 'Preview file' })
 
   return resolvedPath
 }
@@ -7488,7 +7624,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
 })
 
 ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  const { resolvedPath } = await resolveReadableFileForIpc(filePath, {
+  const { resolvedPath } = await resolveDesktopReadableFileForIpc(filePath, {
     maxBytes: DATA_URL_READ_MAX_BYTES,
     purpose: 'File preview'
   })
@@ -7499,7 +7635,7 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
-  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
+  const { resolvedPath, stat } = await resolveDesktopReadableFileForIpc(filePath, {
     maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
     purpose: 'Text preview'
   })
@@ -7871,7 +8007,7 @@ function disposeTerminalSession(id) {
   return true
 }
 
-ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(dirPath))
+ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForDesktopIpc(dirPath))
 
 ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => gitRootForIpc(startPath))
 
@@ -7896,13 +8032,14 @@ ipcMain.handle('hermes:fs:reveal', async (_event, targetPath) => {
 // base name; the destination is resolved in the SAME parent dir so a rename can
 // never move the item elsewhere or traverse out. Rejects on a name collision.
 ipcMain.handle('hermes:fs:rename', async (_event, targetPath, newName) => {
-  const src = String(targetPath || '').trim()
+  const raw = String(targetPath || '').trim()
   const name = String(newName || '').trim()
 
-  if (!src || !name || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+  if (!raw || !name || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
     throw new Error('Invalid rename')
   }
 
+  const src = resolveRequestedPathForIpc(expandUserPath(raw), { purpose: 'Rename path' })
   const dst = path.join(path.dirname(src), name)
 
   if (dst === src) {
@@ -7913,15 +8050,19 @@ ipcMain.handle('hermes:fs:rename', async (_event, targetPath, newName) => {
     throw new Error(`"${name}" already exists`)
   }
 
-  await fs.promises.rename(src, dst)
+  await renamePathWithAuthGuard(src, dst, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    purpose: 'Rename path'
+  })
 
   return { path: dst }
 })
 
-// Write a small UTF-8 text file (e.g. a project's IDEA.md at creation). The path
-// is hardened (resolveRequestedPathForIpc) and the parent must already exist —
-// this never creates directory trees or escapes the allowed roots, and content
-// is size-capped so it can't be abused as a bulk-write primitive.
+// Write a small UTF-8 text file (e.g. a project's IDEA.md at creation). Path
+// syntax is normalized, the parent must already exist, and the canonical
+// root/profile auth stores are denied through the shared mutation guard.
+// Content is size-capped so this cannot be abused as a bulk-write primitive.
 ipcMain.handle('hermes:fs:writeText', async (_event, filePath, content) => {
   const raw = String(filePath || '').trim()
 
@@ -7941,7 +8082,11 @@ ipcMain.handle('hermes:fs:writeText', async (_event, filePath, content) => {
     throw new Error('Parent directory does not exist')
   }
 
-  await fs.promises.writeFile(resolved, text, 'utf8')
+  await writeTextWithAuthGuard(resolved, text, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    purpose: 'Write text file'
+  })
 
   return { path: resolved }
 })
@@ -7949,75 +8094,104 @@ ipcMain.handle('hermes:fs:writeText', async (_event, filePath, content) => {
 // Move a file/folder to the OS trash (recoverable) — the VS Code "Delete"
 // default. `shell.trashItem` routes to Finder/Explorer/Files trash per platform.
 ipcMain.handle('hermes:fs:trash', async (_event, targetPath) => {
-  const target = String(targetPath || '').trim()
+  const raw = String(targetPath || '').trim()
 
-  if (!target) {
+  if (!raw) {
     throw new Error('Invalid delete')
   }
 
-  await shell.trashItem(target)
+  const target = resolveRequestedPathForIpc(expandUserPath(raw), { purpose: 'Move path to trash' })
+  await trashPathWithAuthGuard(target, {
+    codexRefreshStateDir: CODEX_REFRESH_STATE_DIR,
+    hermesHome: HERMES_AUTH_ROOT,
+    purpose: 'Move path to trash',
+    trashItem: item => shell.trashItem(item)
+  })
 
   return true
 })
 
 // Git-driven worktree management ("Start work" flow). Errors surface to the
 // renderer as rejected promises so it can toast a friendly message.
-ipcMain.handle('hermes:git:worktreeList', async (_event, repoPath) => listWorktrees(repoPath, resolveGitBinary()))
+ipcMain.handle('hermes:git:worktreeList', async (_event, repoPath) =>
+  listWorktrees(await guardGitRepoPath(repoPath, 'Worktree list'), resolveGitBinary())
+)
 
 ipcMain.handle('hermes:git:worktreeAdd', async (_event, repoPath, options) =>
-  addWorktree(repoPath, options || {}, resolveGitBinary())
+  addWorktree(await guardGitRepoPath(repoPath, 'Worktree add'), options || {}, resolveGitBinary())
 )
 
-ipcMain.handle('hermes:git:worktreeRemove', async (_event, repoPath, worktreePath, options) =>
-  removeWorktree(repoPath, worktreePath, options || {}, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:worktreeRemove', async (_event, repoPath, worktreePath, options) => {
+  const resolvedRepo = await guardGitRepoPath(repoPath, 'Worktree remove repository')
+  const resolvedTree = guardGitTreePath(worktreePath, 'Worktree remove target')
+
+  return removeWorktree(resolvedRepo, resolvedTree, options || {}, resolveGitBinary())
+})
 
 ipcMain.handle('hermes:git:branchSwitch', async (_event, repoPath, branch) =>
-  switchBranch(repoPath, branch, resolveGitBinary())
+  switchBranch(await guardGitRepoPath(repoPath, 'Branch switch'), branch, resolveGitBinary())
 )
 
-ipcMain.handle('hermes:git:branchList', async (_event, repoPath) => listBranches(repoPath, resolveGitBinary()))
+ipcMain.handle('hermes:git:branchList', async (_event, repoPath) =>
+  listBranches(await guardGitRepoPath(repoPath, 'Branch list'), resolveGitBinary())
+)
 
 // Compact repo status (branch, ahead/behind, change counts + files) for the
 // composer coding rail. Returns null on a non-repo / remote backend so the rail
 // hides cleanly rather than erroring.
-ipcMain.handle('hermes:git:repoStatus', async (_event, repoPath) => repoStatus(repoPath, resolveGitBinary()))
+ipcMain.handle('hermes:git:repoStatus', async (_event, repoPath) =>
+  repoStatus(await guardGitRepoPath(repoPath, 'Repository status'), resolveGitBinary())
+)
 
 // Codex-style review pane: list changed files for a scope, fetch one file's
 // unified diff, and stage / unstage / revert. Reads return empty on failure;
 // mutations reject so the renderer can toast.
 ipcMain.handle('hermes:git:review:list', async (_event, repoPath, scope, baseRef) =>
-  reviewList(repoPath, scope, baseRef, resolveGitBinary())
+  reviewList(await guardGitRepoPath(repoPath, 'Review list'), scope, baseRef, resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:diff', async (_event, repoPath, filePath, scope, baseRef, staged) =>
-  reviewDiff(repoPath, filePath, scope, baseRef, staged, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:review:diff', async (_event, repoPath, filePath, scope, baseRef, staged) => {
+  const target = await guardGitFileTarget(repoPath, filePath, 'Review diff')
+
+  return reviewDiff(target.repoPath, target.filePath, scope, baseRef, staged, resolveGitBinary())
+})
 // Working-tree-vs-HEAD diff for one file (the preview's "show the diff" view).
-ipcMain.handle('hermes:git:fileDiff', async (_event, repoPath, filePath) =>
-  fileDiffVsHead(repoPath, filePath, resolveGitBinary())
-)
-ipcMain.handle('hermes:git:review:stage', async (_event, repoPath, filePath) =>
-  reviewStage(repoPath, filePath ?? null, resolveGitBinary())
-)
-ipcMain.handle('hermes:git:review:unstage', async (_event, repoPath, filePath) =>
-  reviewUnstage(repoPath, filePath ?? null, resolveGitBinary())
-)
-ipcMain.handle('hermes:git:review:revert', async (_event, repoPath, filePath) =>
-  reviewRevert(repoPath, filePath ?? null, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:fileDiff', async (_event, repoPath, filePath) => {
+  const target = await guardGitFileTarget(repoPath, filePath, 'File diff')
+
+  return fileDiffVsHead(target.repoPath, target.filePath, resolveGitBinary())
+})
+ipcMain.handle('hermes:git:review:stage', async (_event, repoPath, filePath) => {
+  const target = await guardGitFileTarget(repoPath, filePath ?? null, 'Review stage')
+
+  return reviewStage(target.repoPath, target.filePath, resolveGitBinary())
+})
+ipcMain.handle('hermes:git:review:unstage', async (_event, repoPath, filePath) => {
+  const target = await guardGitFileTarget(repoPath, filePath ?? null, 'Review unstage')
+
+  return reviewUnstage(target.repoPath, target.filePath, resolveGitBinary())
+})
+ipcMain.handle('hermes:git:review:revert', async (_event, repoPath, filePath) => {
+  const target = await guardGitFileTarget(repoPath, filePath ?? null, 'Review revert')
+
+  return reviewRevert(target.repoPath, target.filePath, resolveGitBinary())
+})
 ipcMain.handle('hermes:git:review:revParse', async (_event, repoPath, ref) =>
-  reviewRevParse(repoPath, ref, resolveGitBinary())
+  reviewRevParse(await guardGitRepoPath(repoPath, 'Review rev-parse'), ref, resolveGitBinary())
 )
 ipcMain.handle('hermes:git:review:commit', async (_event, repoPath, message, push) =>
-  reviewCommit(repoPath, message, Boolean(push), resolveGitBinary())
+  reviewCommit(await guardGitRepoPath(repoPath, 'Review commit'), message, Boolean(push), resolveGitBinary())
 )
 ipcMain.handle('hermes:git:review:commitContext', async (_event, repoPath) =>
-  reviewCommitContext(repoPath, resolveGitBinary())
+  reviewCommitContext(await guardGitRepoPath(repoPath, 'Review commit context'), resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => reviewPush(repoPath, resolveGitBinary()))
-ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewShipInfo(repoPath, resolveGhBinary()))
+ipcMain.handle('hermes:git:review:push', async (_event, repoPath) =>
+  reviewPush(await guardGitRepoPath(repoPath, 'Review push'), resolveGitBinary())
+)
+ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) =>
+  reviewShipInfo(await guardGitRepoPath(repoPath, 'Review ship info'), resolveGhBinary())
+)
 ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) =>
-  reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
+  reviewCreatePr(await guardGitRepoPath(repoPath, 'Review create PR'), resolveGitBinary(), resolveGhBinary())
 )
 
 // Repo-first project discovery: scan bounded roots for git repos (pure fs walk,
@@ -8325,7 +8499,7 @@ async function runDesktopUninstall(mode) {
     agentRoot: ACTIVE_HERMES_ROOT,
     uninstallArgs,
     appPath: removeBundle,
-    hermesHome: HERMES_HOME
+    hermesHome: HERMES_AUTH_ROOT
   }
 
   let scriptPath

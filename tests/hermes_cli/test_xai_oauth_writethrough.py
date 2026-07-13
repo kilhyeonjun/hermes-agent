@@ -48,8 +48,8 @@ def profile_and_root(tmp_path, monkeypatch):
     return profile_path, root_path
 
 
-def test_refresh_writes_through_to_root_when_profile_has_no_own_state(profile_and_root):
-    """Profile reading root's grant must push rotated tokens back to root."""
+def test_fresh_save_creates_profile_state_without_touching_root(profile_and_root):
+    """Fresh device login belongs only to the active profile."""
     profile_path, root_path = profile_and_root
     # Profile has NO own xai-oauth block (reads root via fallback).
     _write_store(profile_path, {"version": 1, "providers": {}})
@@ -79,10 +79,11 @@ def test_refresh_writes_through_to_root_when_profile_has_no_own_state(profile_an
     profile = _read_store(profile_path)
     assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-refresh"
 
-    # AND the global root no longer holds the revoked refresh token (#43589).
+    # Runtime fallback rotation uses the exact-source coordinator; a fresh
+    # login must never overwrite the independent root grant.
     root = _read_store(root_path)
-    assert root["providers"]["xai-oauth"]["tokens"]["access_token"] == "new-access"
-    assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-refresh"
+    assert root["providers"]["xai-oauth"]["tokens"]["access_token"] == "old-access"
+    assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "old-refresh"
 
 
 def test_refresh_does_not_touch_root_when_profile_has_own_state(profile_and_root):
@@ -167,3 +168,282 @@ def test_write_through_failure_does_not_break_profile_save(profile_and_root, mon
 
     profile = _read_store(profile_path)
     assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "r"
+
+
+def test_xai_write_through_refuses_stale_same_provider_state(profile_and_root):
+    """A profile refresh must never roll a newer root grant backward."""
+    _profile_path, root_path = profile_and_root
+    old_state = {
+        "tokens": {
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+        }
+    }
+    newer_state = {
+        "tokens": {
+            "access_token": "peer-access",
+            "refresh_token": "peer-refresh",
+        }
+    }
+    _write_store(
+        root_path,
+        {"version": 1, "providers": {"xai-oauth": newer_state}},
+    )
+
+    auth._write_through_xai_oauth_to_global_root(
+        {
+            "tokens": {
+                "access_token": "stale-writer-access",
+                "refresh_token": "stale-writer-refresh",
+            }
+        },
+        expected_token_pair_fingerprint=(
+            auth.provider_oauth_token_pair_fingerprint("xai-oauth", old_state)
+        ),
+    )
+
+    root = _read_store(root_path)
+    assert root["providers"]["xai-oauth"] == newer_state
+
+
+def test_runtime_refresh_updates_root_source_without_creating_profile_shadow(
+    profile_and_root,
+    monkeypatch,
+):
+    """A profile refresh must mutate the root grant it actually resolved."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    },
+                    "discovery": {
+                        "token_endpoint": "https://auth.x.ai/oauth/token",
+                    },
+                    "auth_mode": "oauth_device_code",
+                }
+            },
+        },
+    )
+
+    calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        calls.append((access_token, refresh_token, kwargs["token_endpoint"]))
+        return {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-13T12:34:56Z",
+        }
+
+    monkeypatch.setattr(auth, "refresh_xai_oauth_pure", _refresh)
+
+    resolved = auth.resolve_xai_oauth_runtime_credentials(
+        force_refresh=True,
+        refresh_if_expiring=False,
+    )
+
+    assert calls == [
+        ("old-access", "old-refresh", "https://auth.x.ai/oauth/token")
+    ]
+    assert resolved["api_key"] == "new-access"
+    assert (
+        _read_store(root_path)["providers"]["xai-oauth"]["tokens"]
+        ["refresh_token"]
+        == "new-refresh"
+    )
+    assert _read_store(profile_path).get("providers") == {}
+
+
+def test_terminal_runtime_refresh_quarantines_root_source_without_profile_shadow(
+    profile_and_root,
+    monkeypatch,
+):
+    """A terminal fallback refresh must quarantine the owning root store."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "dead-access",
+                        "refresh_token": "dead-refresh",
+                    },
+                    "discovery": {
+                        "token_endpoint": "https://auth.x.ai/oauth/token",
+                    },
+                }
+            },
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "device-alias",
+                        "source": "device_code",
+                        "access_token": "dead-access",
+                        "refresh_token": "dead-refresh",
+                    },
+                    {
+                        "id": "manual-keep",
+                        "source": "manual",
+                        "access_token": "manual-access",
+                        "refresh_token": "manual-refresh",
+                    },
+                ]
+            },
+        },
+    )
+
+    def _terminal(*_args, **_kwargs):
+        raise auth.AuthError(
+            "refresh token rejected",
+            provider="xai-oauth",
+            code="xai_refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "refresh_xai_oauth_pure", _terminal)
+
+    with pytest.raises(auth.AuthError, match="refresh token rejected"):
+        auth.resolve_xai_oauth_runtime_credentials(
+            force_refresh=True,
+            refresh_if_expiring=False,
+        )
+
+    root_state = _read_store(root_path)["providers"]["xai-oauth"]
+    assert "access_token" not in root_state["tokens"]
+    assert "refresh_token" not in root_state["tokens"]
+    assert root_state["last_auth_error"]["relogin_required"] is True
+    root_rows = _read_store(root_path)["credential_pool"]["xai-oauth"]
+    assert [row["id"] for row in root_rows] == ["manual-keep"]
+    assert _read_store(profile_path).get("providers") == {}
+
+
+def test_runtime_refresh_updates_root_pool_source_in_place(
+    profile_and_root,
+    monkeypatch,
+):
+    """Pool-only fallback rotation must update its exact owning row."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "pool-owner",
+                        "source": "device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    },
+                    {
+                        "id": "manual-keep",
+                        "source": "manual",
+                        "access_token": "manual-access",
+                        "refresh_token": "manual-refresh",
+                    },
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        auth,
+        "_xai_oauth_discovery",
+        lambda _timeout: {"token_endpoint": "https://auth.x.ai/oauth/token"},
+    )
+    monkeypatch.setattr(
+        auth,
+        "refresh_xai_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-13T12:34:56Z",
+        },
+    )
+
+    resolved = auth.resolve_xai_oauth_runtime_credentials(
+        force_refresh=True,
+        refresh_if_expiring=False,
+    )
+
+    root = _read_store(root_path)
+    rows = {row["id"]: row for row in root["credential_pool"]["xai-oauth"]}
+    assert resolved["api_key"] == "new-access"
+    assert rows["pool-owner"]["access_token"] == "new-access"
+    assert rows["pool-owner"]["refresh_token"] == "new-refresh"
+    assert rows["manual-keep"]["refresh_token"] == "manual-refresh"
+    assert root.get("providers") == {}
+    assert _read_store(profile_path).get("providers") == {}
+
+
+def test_terminal_runtime_refresh_removes_only_root_pool_source(
+    profile_and_root,
+    monkeypatch,
+):
+    """Pool-only terminal death removes its row while preserving manual rows."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "pool-owner",
+                        "source": "device_code",
+                        "access_token": "dead-access",
+                        "refresh_token": "dead-refresh",
+                    },
+                    {
+                        "id": "manual-keep",
+                        "source": "manual",
+                        "access_token": "manual-access",
+                        "refresh_token": "manual-refresh",
+                    },
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        auth,
+        "_xai_oauth_discovery",
+        lambda _timeout: {"token_endpoint": "https://auth.x.ai/oauth/token"},
+    )
+
+    def _terminal(*_args, **_kwargs):
+        raise auth.AuthError(
+            "refresh token rejected",
+            provider="xai-oauth",
+            code="xai_refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "refresh_xai_oauth_pure", _terminal)
+
+    with pytest.raises(auth.AuthError, match="refresh token rejected"):
+        auth.resolve_xai_oauth_runtime_credentials(
+            force_refresh=True,
+            refresh_if_expiring=False,
+        )
+
+    root = _read_store(root_path)
+    assert [
+        row["id"] for row in root["credential_pool"]["xai-oauth"]
+    ] == ["manual-keep"]
+    assert root.get("providers") == {}
+    assert _read_store(profile_path).get("providers") == {}

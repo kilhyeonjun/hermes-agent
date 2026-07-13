@@ -50,7 +50,7 @@ You can also set or auto-generate the description later with `hermes profile des
 hermes profile create work --clone
 ```
 
-Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into the new profile. Same API keys, model, and capabilities, but fresh sessions and memory. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
+Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, skills, and curated `memories/MEMORY.md` and `memories/USER.md` files into the new profile. API keys, model, capabilities, and curated identity carry over, while sessions and runtime state start fresh. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
 
 ### Clone everything (`--clone-all`)
 
@@ -58,7 +58,7 @@ Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into 
 hermes profile create backup --clone-all
 ```
 
-Copies **everything** — config, API keys, personality, all memories, skills, cron jobs, plugins. A complete working snapshot. Per-profile history is excluded (session history, `state.db`, `backups/`, `state-snapshots/`, `checkpoints/`) — these belong to the source profile and can reach tens of GB. For a full backup including history, use `hermes profile export` or `hermes backup` instead.
+Copies the source's working configuration, `.env` API keys, personality, memories, skills, cron jobs, and plugins. It deliberately excludes the canonical `auth.json`/`auth.lock` transaction files, the root `.op.env` 1Password bootstrap token, and per-profile history (`sessions/`, `state.db`, `backups/`, `state-snapshots/`, `checkpoints/`). This prevents copied OAuth refresh tokens and stale lock inodes from being used by two profiles. Review the copied static `.env` keys and re-authenticate OAuth providers in the clone with `hermes -p <name> auth add <provider>`. For a backup workflow, use `hermes profile export` (profile-root credentials filtered) or the canonical `hermes backup` command.
 
 ### Clone from a specific profile
 
@@ -66,7 +66,7 @@ Copies **everything** — config, API keys, personality, all memories, skills, c
 hermes profile create work --clone-from coder
 ```
 
-`--clone-from <source>` selects the source profile directly and implies a config/skills/SOUL clone. Combine it with `--clone-all` when you want a full copy of that source profile:
+`--clone-from <source>` selects the source profile directly and implies a config/skills/SOUL clone. Combine it with `--clone-all` when you want the source's working state, still excluding auth transaction files and history:
 
 ```bash
 hermes profile create work-backup --clone-from coder --clone-all
@@ -194,6 +194,10 @@ Each profile has its own:
 - **`.env`** — API keys, bot tokens
 - **`SOUL.md`** — personality and instructions
 
+:::note Credential ownership
+Profile `.env` files are local and are never inherited from the root profile or launching shell. Provider credentials stored in `auth.json` have one deliberate compatibility exception: when a profile has no local credential for a provider, Hermes may read that provider's global-root credential as a read-only fallback. Any `hermes -p <name> auth add <provider>` write stays in the profile and then shadows the global fallback for that provider.
+:::
+
 ```bash
 coder config set model.default anthropic/claude-sonnet-4
 echo "You are a focused coding assistant." > ~/.hermes/profiles/coder/SOUL.md
@@ -240,6 +244,17 @@ hermes profile rename coder dev-bot   # rename (updates alias + service)
 hermes profile export coder   # export to coder.tar.gz
 hermes profile import coder.tar.gz   # import from archive
 ```
+
+Profile export/import is a profile-root credential boundary, not a recursive
+secret scrubber. Export omits root `auth.json`, `auth.lock`, `.env`, and `.op.env`
+(including hard-link aliases), plus machine-local `home/`, `backups/`,
+`state-snapshots/`, and `checkpoints/`. It rejects symlinks and retains nested
+project files. Import rejects those root credentials and all symlink entries,
+creates a blank private root `.env`, and likewise retains nested project files.
+Inspect the archive before sharing it outside its trust boundary. Use
+`hermes backup` when you need a complete, trusted local backup.
+Named profiles do not inherit credential variables from the launching shell or
+repository `.env`; configure their credentials explicitly.
 
 ## Deleting a profile
 

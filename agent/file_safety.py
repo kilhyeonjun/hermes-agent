@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Optional
+
+
+_CANONICAL_AUTH_STORE_BASENAMES = {"auth.json", "auth.lock"}
 
 
 def _hermes_home_path() -> Path:
@@ -95,10 +99,99 @@ def get_safe_write_roots() -> set[str]:
     return roots
 
 
+def is_canonical_auth_store_path(path: str) -> bool:
+    """Return True for every root/profile auth store path or symlink alias.
+
+    Generic file tools must never mutate these files. Only the canonical auth
+    transaction layer may replace ``auth.json`` or coordinate on ``auth.lock``.
+    Both lexical and real paths are checked so a named-profile path, a symlinked
+    profile directory, or an arbitrary symlink alias cannot bypass the guard.
+    """
+    try:
+        expanded = os.path.expanduser(str(path))
+        lexical = Path(os.path.abspath(expanded))
+        resolved = Path(os.path.realpath(expanded))
+    except (OSError, TypeError, ValueError):
+        return False
+
+    candidates = {lexical, resolved}
+    bases: set[Path] = set()
+    for raw_base in (_hermes_home_path(), _hermes_root_path()):
+        try:
+            expanded_base = os.path.expanduser(str(raw_base))
+            bases.add(Path(os.path.abspath(expanded_base)))
+            bases.add(Path(os.path.realpath(expanded_base)))
+        except (OSError, TypeError, ValueError):
+            continue
+
+    for candidate in candidates:
+        if candidate.name.casefold() not in _CANONICAL_AUTH_STORE_BASENAMES:
+            continue
+        if any(candidate.parent == base for base in bases):
+            return True
+
+        for root in bases:
+            profiles_dir = root / "profiles"
+            try:
+                relative = candidate.relative_to(profiles_dir)
+            except ValueError:
+                continue
+            if (
+                len(relative.parts) == 2
+                and relative.parts[-1].casefold()
+                in _CANONICAL_AUTH_STORE_BASENAMES
+            ):
+                return True
+
+    # ``realpath`` cannot distinguish a hardlink alias because both directory
+    # entries are already canonical paths. Compare the existing candidate's
+    # filesystem identity with every root/profile auth store without reading
+    # credential contents.
+    try:
+        candidate_stat = os.stat(expanded, follow_symlinks=True)
+    except (OSError, TypeError, ValueError):
+        return False
+    if not stat.S_ISREG(candidate_stat.st_mode) or not candidate_stat.st_ino:
+        return False
+
+    canonical_paths: set[Path] = set()
+    for base in bases:
+        for basename in _CANONICAL_AUTH_STORE_BASENAMES:
+            canonical_paths.add(base / basename)
+        profiles_dir = base / "profiles"
+        try:
+            profile_dirs = tuple(profiles_dir.iterdir())
+        except OSError:
+            continue
+        for profile_dir in profile_dirs:
+            for basename in _CANONICAL_AUTH_STORE_BASENAMES:
+                canonical_paths.add(profile_dir / basename)
+
+    candidate_identity = (candidate_stat.st_dev, candidate_stat.st_ino)
+    for canonical_path in canonical_paths:
+        try:
+            canonical_stat = os.stat(canonical_path, follow_symlinks=True)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(canonical_stat.st_mode)
+            and canonical_stat.st_ino
+            and (canonical_stat.st_dev, canonical_stat.st_ino)
+            == candidate_identity
+        ):
+            return True
+    return False
+
+
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
+
+    # This hard deny intentionally precedes HERMES_WRITE_SAFE_ROOT. Auth state
+    # may only be changed through the lock/CAS/revision/atomic-write protocol.
+    if is_canonical_auth_store_path(path):
+        return True
 
     if resolved in build_write_denied_paths(home):
         return True
@@ -204,6 +297,14 @@ def get_read_block_error(path: str) -> Optional[str]:
     terminal cwd differs from the process cwd.
     """
     resolved = Path(path).expanduser().resolve()
+
+    if is_canonical_auth_store_path(path):
+        return (
+            f"Access denied: {path} is a Hermes credential store and cannot "
+            "be read directly. Provider tools consume these credentials "
+            "through internal channels. (Defense-in-depth — not a security "
+            "boundary; the terminal tool can still bypass.)"
+        )
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also

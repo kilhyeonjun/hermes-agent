@@ -1,9 +1,12 @@
 """Reset-aware Codex credential priority sync.
 
 Policy:
-- Pick the available Codex account whose 7d/secondary window resets soonest.
-- Do not promote credentials that are currently exhausted/dead or whose 5h/7d
-  windows are unsafe for immediate routing.
+- Global reset-aware routing promotes only available Codex credentials whose
+  5h/7d windows are safe, preferring the soonest secondary reset.
+- Profile affinity preserves the canonical non-dead account as priority owner
+  while exhausted; CredentialPool skips cooldown/dead entries at request time.
+- An explicit global fixed route wins and fails closed unless its exact target
+  is healthy and available.
 - Hermes uses lower numeric priority first; CLIProxyAPI uses higher priority first.
 
 Prints only when a change/error occurs unless --report is passed.
@@ -13,12 +16,14 @@ Never prints tokens or credential material.
 from __future__ import annotations
 
 import argparse
+import inspect
 from enum import Enum
 from http.client import HTTPConnection, HTTPException
 from ipaddress import ip_address
 import json
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,12 +48,12 @@ CLIPROXY_FIXED_ROUTE_STATE_PATH = (
     GLOBAL_HERMES_HOME / "state" / "cliproxy_fixed_route_state.json"
 )
 WARMUP_COOLDOWN_SECONDS = 6 * 60 * 60
+COLLECTED_PAYLOAD_MAX_AGE_SECONDS = 15.0
+INTERNAL_PAYLOAD_VERSION = 1
+INTERNAL_PAYLOAD_MAX_BYTES = 1024 * 1024
 
 from hermes_cli.codex_usage import (
-    annotate_usage_trends,
     collect,
-    load_history,
-    DEFAULT_HISTORY,
 )  # noqa: E402
 from hermes_cli.codex_route_lock import (  # noqa: E402
     assert_test_path_not_live,
@@ -723,10 +728,67 @@ def _sidecar_alignment_error(
     )
 
 
-def collect_payload() -> dict[str, Any]:
-    payload = collect()
-    annotate_usage_trends(payload, history=load_history(DEFAULT_HISTORY))
-    return payload
+def collect_payload(*, mutate: bool = True) -> dict[str, Any]:
+    # Trend history is a reporting concern. It does not participate in the
+    # priority recommendation, so loading and annotating it here only adds
+    # filesystem work to every routing pass.
+    return collect(mutate=mutate)
+
+
+def _collect_payload_for_run(*, dry_run: bool) -> dict[str, Any]:
+    """Collect outside the route lock; dry-run must not refresh auth state."""
+    try:
+        parameters = inspect.signature(collect_payload).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "mutate" in parameters:
+        return collect_payload(mutate=not dry_run)
+    # Compatibility for injected collectors used by embedders and tests.
+    return collect_payload()
+
+
+def _validate_precollected_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("payload must be an object")
+    accounts = value.get("accounts")
+    routing = value.get("routing")
+    recommendation = value.get("recommendation")
+    if (
+        not isinstance(accounts, list)
+        or any(not isinstance(row, dict) for row in accounts)
+        or not isinstance(routing, dict)
+        or not isinstance(recommendation, dict)
+    ):
+        raise ValueError("payload shape is invalid")
+    return value
+
+
+def _encode_precollected_payload(payload: dict[str, Any]) -> str:
+    envelope = {
+        "version": INTERNAL_PAYLOAD_VERSION,
+        "payload": _validate_precollected_payload(payload),
+    }
+    encoded = json.dumps(
+        envelope,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > INTERNAL_PAYLOAD_MAX_BYTES:
+        raise ValueError("payload exceeds internal transport limit")
+    return encoded
+
+
+def _decode_precollected_payload(raw: str) -> dict[str, Any]:
+    if len(raw.encode("utf-8")) > INTERNAL_PAYLOAD_MAX_BYTES:
+        raise ValueError("payload exceeds internal transport limit")
+    envelope = json.loads(raw)
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"version", "payload"}
+        or envelope.get("version") != INTERNAL_PAYLOAD_VERSION
+    ):
+        raise ValueError("payload envelope is invalid")
+    return _validate_precollected_payload(envelope.get("payload"))
 
 
 def load_route_policy() -> dict[str, Any]:
@@ -775,7 +837,11 @@ def choose_route_recommendation(payload: dict[str, Any]) -> dict[str, Any]:
     for row in payload.get("accounts") or []:
         if str(row.get("credential_id") or "") != credential_id:
             continue
-        if not row.get("ok") or not row.get("available", True):
+        if (
+            not row.get("ok")
+            or not row.get("available", True)
+            or str(row.get("last_status") or "ok") != "ok"
+        ):
             break
         return {
             "label": str(row.get("label") or policy.get("label") or credential_id),
@@ -1924,7 +1990,7 @@ def _rollback_completed_transaction(
     )
 
 
-def _main_unlocked(argv: list[str] | None = None) -> int:
+def _parse_main_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Sync Codex priorities from 7d-reset-aware Hermes recommendation"
     )
@@ -1946,13 +2012,32 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
         action="store_true",
         help="if an available Codex account has no 7d reset timestamp yet, promote it and make one tiny model call to start the 7d window",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--internal-collect-payload",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--internal-payload-stdin",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    return parser.parse_args(argv)
+
+
+def _main_unlocked(
+    argv: list[str] | None = None,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> int:
+    args = _parse_main_args(argv)
 
     if args.profile_account and (args.skip_hermes or not args.skip_cliproxy):
         print("profile-account requires Hermes-only profile sync")
         return 1
 
-    payload = collect_payload()
+    if payload is None:
+        payload = _collect_payload_for_run(dry_run=bool(args.dry_run))
     state = load_state()
     policy_recommendation = choose_effective_recommendation(
         payload, args.profile_account
@@ -2110,22 +2195,71 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = _parse_main_args(argv)
+    if args.internal_collect_payload:
+        if args.internal_payload_stdin:
+            print("Codex route sync rejected incompatible internal payload modes")
+            return 1
+        try:
+            payload = _collect_payload_for_run(dry_run=bool(args.dry_run))
+            print(_encode_precollected_payload(payload))
+        except Exception:  # noqa: BLE001 - never echo payload or credential metadata
+            print("Codex route sync failed to collect a valid payload")
+            return 1
+        return 0
+
+    if args.internal_payload_stdin:
+        if os.environ.get("HERMES_CODEX_ROUTE_LOCK_HELD") != "1":
+            print("Codex route sync rejected payload without inherited route lock")
+            return 1
+        try:
+            raw = sys.stdin.read(INTERNAL_PAYLOAD_MAX_BYTES + 1)
+            payload = _decode_precollected_payload(raw)
+        except Exception:  # noqa: BLE001 - fail closed without echoing IPC data
+            print("Codex route sync rejected invalid precollected payload")
+            return 1
+        return _main_unlocked(argv, payload=payload)
+
     if os.environ.get("HERMES_CODEX_ROUTE_LOCK_HELD") == "1":
         return _main_unlocked(argv)
-    try:
-        with route_lock(path=ROUTE_LOCK_PATH, timeout=ROUTE_LOCK_TIMEOUT):
-            prior_marker = os.environ.get("HERMES_CODEX_ROUTE_LOCK_HELD")
-            os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] = "1"
-            try:
-                return _main_unlocked(argv)
-            finally:
-                if prior_marker is None:
-                    os.environ.pop("HERMES_CODEX_ROUTE_LOCK_HELD", None)
-                else:
-                    os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] = prior_marker
-    except (TimeoutError, RuntimeError) as exc:
-        print(f"Codex route sync skipped: {exc}")
+    if args.profile_account and (args.skip_hermes or not args.skip_cliproxy):
+        print("profile-account requires Hermes-only profile sync")
         return 1
+
+    for attempt in range(2):
+        collected_at = time.monotonic()
+        payload = _collect_payload_for_run(dry_run=bool(args.dry_run))
+        retry_stale = False
+        try:
+            with route_lock(path=ROUTE_LOCK_PATH, timeout=ROUTE_LOCK_TIMEOUT):
+                age = time.monotonic() - collected_at
+                if age > COLLECTED_PAYLOAD_MAX_AGE_SECONDS:
+                    retry_stale = True
+                else:
+                    prior_marker = os.environ.get(
+                        "HERMES_CODEX_ROUTE_LOCK_HELD"
+                    )
+                    os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] = "1"
+                    try:
+                        return _main_unlocked(argv, payload=payload)
+                    finally:
+                        if prior_marker is None:
+                            os.environ.pop(
+                                "HERMES_CODEX_ROUTE_LOCK_HELD", None
+                            )
+                        else:
+                            os.environ[
+                                "HERMES_CODEX_ROUTE_LOCK_HELD"
+                            ] = prior_marker
+        except (TimeoutError, RuntimeError) as exc:
+            print(f"Codex route sync skipped: {exc}")
+            return 1
+        if not retry_stale:
+            break
+        if attempt == 0:
+            continue
+    print("Codex route sync skipped: collected usage became stale")
+    return 1
 
 
 if __name__ == "__main__":
