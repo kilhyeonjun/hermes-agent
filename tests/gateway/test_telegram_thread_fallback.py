@@ -8,6 +8,7 @@ user message. If either anchor is unavailable or rejected, the adapter must
 avoid retrying with a partial topic route that can render outside the lane.
 """
 
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -901,6 +902,292 @@ async def test_session_runtime_picker_sends_detailed_and_preset_buttons_in_the_s
 
 
 @pytest.mark.asyncio
+async def test_codex_account_picker_uses_native_account_buttons_and_callback():
+    adapter = _make_adapter()
+    adapter._codex_account_picker_state = {}
+    sent = []
+
+    async def mock_send_message(**kwargs):
+        sent.append(kwargs)
+        return SimpleNamespace(message_id=782)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    result = await adapter.send_codex_account_picker(
+        chat_id="123",
+        current_account="personal",
+        current_mode="fixed",
+        on_selected=None,
+        metadata={"thread_id": "20197"},
+        owner_user_id="user-1",
+    )
+
+    assert result.success is True
+    buttons = [
+        button
+        for row in sent[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert {button.callback_data for button in buttons} == {
+        "ca:personal", "ca:company", "ca:auto"
+    }
+    assert "✓ 개인" in {button.text for button in buttons}
+    assert adapter._codex_account_picker_state[("123", 782)]["owner_user_id"] == "user-1"
+
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=782),
+        from_user=SimpleNamespace(id="user-1"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    async def select_account(mode):
+        query.answer.assert_awaited_once_with(text=f"{mode} 계정 전환 중…")
+        return PickerCallbackOutcome(
+            "✅ Native Codex CLI: company", status="success"
+        )
+
+    callback = AsyncMock(side_effect=select_account)
+    adapter._codex_account_picker_state[("123", 782)]["on_selected"] = callback
+    await adapter._handle_codex_account_picker_callback(query, "ca:company", "123")
+
+    callback.assert_awaited_once_with("company")
+    query.answer.assert_awaited_once_with(text="company 계정 전환 중…")
+    assert ("123", 782) not in adapter._codex_account_picker_state
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_reports_failed_native_switch():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value=PickerCallbackOutcome(
+        "🎛 Codex 계정 · company\n\n❌ Mac mini\nfailed", status="failure"
+    ))
+    adapter._codex_account_picker_state = {
+        ("123", 783): {
+            "on_selected": callback,
+            "owner_user_id": "user-1",
+            "created_at": __import__("time").monotonic(),
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=783),
+        from_user=SimpleNamespace(id="user-1"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_codex_account_picker_callback(query, "ca:company", "123")
+
+    query.answer.assert_awaited_once_with(text="company 계정 전환 중…")
+    query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_rejects_missing_owner_binding():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value="should not run")
+    adapter._codex_account_picker_state = {
+        ("123", 784): {
+            "on_selected": callback,
+            "owner_user_id": "",
+            "created_at": __import__("time").monotonic(),
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=784),
+        from_user=SimpleNamespace(id="user-1"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_codex_account_picker_callback(query, "ca:company", "123")
+
+    query.answer.assert_awaited_once_with(
+        text="⛔ 이 선택기를 연 사용자만 사용할 수 있습니다."
+    )
+    callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_rejects_mismatched_owner():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value="should not run")
+    adapter._codex_account_picker_state = {
+        ("123", 787): {
+            "on_selected": callback,
+            "owner_user_id": "owner-user",
+            "created_at": __import__("time").monotonic(),
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=787),
+        from_user=SimpleNamespace(id="different-user"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_codex_account_picker_callback(
+        query, "ca:company", "123"
+    )
+
+    query.answer.assert_awaited_once_with(
+        text="⛔ 이 선택기를 연 사용자만 사용할 수 있습니다."
+    )
+    callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_expires_before_mutation():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value="should not run")
+    adapter._codex_account_picker_state = {
+        ("123", 788): {
+            "on_selected": callback,
+            "owner_user_id": "user-1",
+            "created_at": (
+                __import__("time").monotonic()
+                - adapter._PICKER_TTL_SECONDS
+                - 1
+            ),
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=788),
+        from_user=SimpleNamespace(id="user-1"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_codex_account_picker_callback(
+        query, "ca:auto", "123"
+    )
+
+    assert ("123", 788) not in adapter._codex_account_picker_state
+    assert "만료" in query.answer.await_args.kwargs["text"]
+    callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_double_click_mutates_once():
+    adapter = _make_adapter()
+    callback = AsyncMock(return_value=PickerCallbackOutcome(
+        "✅ Native Codex CLI: company", status="success"
+    ))
+    adapter._codex_account_picker_state = {
+        ("123", 789): {
+            "on_selected": callback,
+            "owner_user_id": "user-1",
+            "created_at": __import__("time").monotonic(),
+        }
+    }
+
+    def query():
+        return SimpleNamespace(
+            message=SimpleNamespace(message_id=789),
+            from_user=SimpleNamespace(id="user-1"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+    first = query()
+    second = query()
+    await asyncio.gather(
+        adapter._handle_codex_account_picker_callback(
+            first, "ca:company", "123"
+        ),
+        adapter._handle_codex_account_picker_callback(
+            second, "ca:company", "123"
+        ),
+    )
+
+    callback.assert_awaited_once_with("company")
+    assert ("123", 789) not in adapter._codex_account_picker_state
+    answers = [
+        first.answer.await_args.kwargs["text"],
+        second.answer.await_args.kwargs["text"],
+    ]
+    assert sum("전환 중" in text for text in answers) == 1
+    assert sum("만료" in text for text in answers) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_redacts_callback_exception(caplog):
+    adapter = _make_adapter()
+    secret = "sk" + "-proj-" + ("Z" * 40)
+    callback = AsyncMock(side_effect=OSError("Authorization: Bearer " + secret))
+    adapter._codex_account_picker_state = {
+        ("123", 785): {
+            "on_selected": callback,
+            "owner_user_id": "user-1",
+            "created_at": __import__("time").monotonic(),
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=785),
+        from_user=SimpleNamespace(id="user-1"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_codex_account_picker_callback(query, "ca:auto", "123")
+
+    assert secret not in caplog.text
+    query.answer.assert_awaited_once_with(text="auto 계정 전환 중…")
+    query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_redacts_message_edit_exceptions(caplog):
+    adapter = _make_adapter()
+    secret = "sk" + "-proj-" + ("E" * 40)
+    callback = AsyncMock(return_value=PickerCallbackOutcome(
+        "✅ Native Codex CLI: company", status="success"
+    ))
+    adapter._codex_account_picker_state = {
+        ("123", 786): {
+            "on_selected": callback,
+            "owner_user_id": "user-1",
+            "created_at": __import__("time").monotonic(),
+        }
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=786),
+        from_user=SimpleNamespace(id="user-1"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(
+            side_effect=OSError("Authorization: Bearer " + secret)
+        ),
+    )
+    caplog.set_level("DEBUG")
+
+    await adapter._handle_codex_account_picker_callback(
+        query, "ca:company", "123"
+    )
+
+    assert query.edit_message_text.await_count == 2
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_codex_account_picker_redacts_send_exception():
+    adapter = _make_adapter()
+    adapter._bot = object()
+    secret = "sk" + "-proj-" + ("Y" * 40)
+    adapter._send_message_with_thread_fallback = AsyncMock(
+        side_effect=OSError("Authorization: Bearer " + secret)
+    )
+
+    result = await adapter.send_codex_account_picker(
+        chat_id="123",
+        current_account="personal",
+        current_mode="fixed",
+        on_selected=AsyncMock(),
+        owner_user_id="user-1",
+    )
+
+    assert result.success is False
+    assert secret not in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_session_fast_picker_uses_buttons_and_session_callback():
     adapter = _make_adapter()
     adapter._session_runtime_picker_state = {}
@@ -1057,10 +1344,11 @@ async def test_session_runtime_picker_callbacks_do_not_cross_chats_with_same_mes
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("callback_data", ["sr:sol", "sf:fast", "mm:0"])
+@pytest.mark.parametrize("callback_data", ["ca:company", "sr:sol", "sf:fast", "mm:0"])
 async def test_model_picker_callbacks_reject_unauthorized_users(callback_data):
     adapter = _make_adapter()
     adapter._is_callback_user_authorized = MagicMock(return_value=False)
+    adapter._handle_codex_account_picker_callback = AsyncMock()
     adapter._handle_session_runtime_picker_callback = AsyncMock()
     adapter._handle_model_picker_callback = AsyncMock()
     query = SimpleNamespace(
@@ -1079,6 +1367,7 @@ async def test_model_picker_callbacks_reject_unauthorized_users(callback_data):
     )
 
     adapter._is_callback_user_authorized.assert_called_once()
+    adapter._handle_codex_account_picker_callback.assert_not_awaited()
     adapter._handle_session_runtime_picker_callback.assert_not_awaited()
     adapter._handle_model_picker_callback.assert_not_awaited()
     assert "authorized" in query.answer.await_args.kwargs["text"]

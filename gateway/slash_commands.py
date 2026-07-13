@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import sys
 import time
 from datetime import datetime
@@ -44,6 +45,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
+from hermes_constants import get_default_hermes_root
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
     atomic_json_write,
@@ -4573,8 +4575,8 @@ class GatewaySlashCommandsMixin:
             return output or "❌ Codex 라우팅 변경에 실패했습니다."
         return output or "✅ Codex 라우팅 설정을 적용했습니다."
 
-    async def _handle_codex_account_command(self, event: MessageEvent) -> str:
-        """Handle /codex-account for the Mac mini only."""
+    async def _handle_codex_account_command(self, event: MessageEvent) -> Optional[str]:
+        """Control the Mac mini's native Codex account, with Telegram buttons."""
         import subprocess
 
         raw_args = event.get_command_args().strip() if event else ""
@@ -4589,7 +4591,7 @@ class GatewaySlashCommandsMixin:
         if not mode or len(parts) > 1:
             return (
                 "사용법 (Mac mini만 적용):\n"
-                "/codex_account — 현재 상태\n"
+                "/codex_account — 계정 선택 버튼\n"
                 "/codex_account auto — 자동 추천\n"
                 "/codex_account personal — 개인 고정\n"
                 "/codex_account company — 회사 고정\n\n"
@@ -4598,37 +4600,89 @@ class GatewaySlashCommandsMixin:
 
         from hermes_cli.codex_route import ROUTE_COMMAND_TIMEOUT
 
-        def _run_local():
-            return subprocess.run(
-                [sys.executable, "-m", "hermes_cli.codex_route", mode],
-                text=True,
-                capture_output=True,
-                timeout=ROUTE_COMMAND_TIMEOUT,
-                shell=False,
-            )
-
-        try:
-            proc = await asyncio.to_thread(_run_local)
-        except (OSError, subprocess.SubprocessError) as exc:
-            safe_exc = redact_sensitive_text(str(exc), force=True)
-            logger.warning("/codex-account failed: %s", safe_exc)
-            return f"❌ Codex 계정 명령 실패: {safe_exc}"
-
-        output = redact_sensitive_text(
-            (proc.stdout or proc.stderr or "출력 없음").strip(),
-            force=True,
+        native_account_script = (
+            get_default_hermes_root() / "scripts" / "codex_native_account.py"
         )
-        marker = "✅" if proc.returncode == 0 else "❌"
-        cards = [f"🎛 Codex 계정 · {mode}", "", f"{marker} Mac mini", output]
-        if mode != "status":
-            cards.extend(
-                [
-                    "",
-                    "ℹ️ 실행 중인 Codex는 기존 계정을 계속 사용합니다.",
-                    "현재 작업을 종료한 뒤 `codex resume --last`로 다시 시작하세요.",
-                ]
+        try:
+            script_stat = native_account_script.lstat()
+        except FileNotFoundError:
+            return "❌ Native Codex 계정 제어 스크립트를 찾지 못했습니다."
+        if (
+            not stat.S_ISREG(script_stat.st_mode)
+            or script_stat.st_uid != os.geteuid()
+            or script_stat.st_mode & 0o022
+            or script_stat.st_nlink != 1
+        ):
+            return "❌ Native Codex 계정 제어 스크립트를 신뢰할 수 없습니다."
+
+        async def _execute(selected_mode: str) -> PickerCallbackOutcome:
+            def _run_local():
+                return subprocess.run(
+                    [sys.executable, str(native_account_script), selected_mode],
+                    text=True,
+                    capture_output=True,
+                    timeout=ROUTE_COMMAND_TIMEOUT,
+                    shell=False,
+                )
+
+            try:
+                proc = await asyncio.to_thread(_run_local)
+            except (OSError, subprocess.SubprocessError) as exc:
+                safe_exc = redact_sensitive_text(str(exc), force=True)
+                logger.warning("/codex-account failed: %s", safe_exc)
+                return PickerCallbackOutcome(
+                    f"❌ Codex 계정 명령 실패: {safe_exc}", status="failure"
+                )
+
+            output = redact_sensitive_text(
+                (proc.stdout or proc.stderr or "출력 없음").strip(),
+                force=True,
             )
-        return "\n".join(cards)
+            marker = "✅" if proc.returncode == 0 else "❌"
+            cards = [f"🎛 Codex 계정 · {selected_mode}", "", f"{marker} Mac mini", output]
+            if selected_mode != "status":
+                cards.extend(
+                    [
+                        "",
+                        "ℹ️ 실행 중인 Codex는 기존 계정을 계속 사용합니다.",
+                        "현재 작업을 종료한 뒤 `codex resume --last`로 다시 시작하세요.",
+                    ]
+                )
+            return PickerCallbackOutcome(
+                "\n".join(cards),
+                status="success" if proc.returncode == 0 else "failure",
+            )
+
+        if parts:
+            return await _execute(mode)
+
+        status_card = await _execute("status")
+        if status_card.status != "success":
+            return status_card
+        adapter = self.adapters.get(event.source.platform) if event and event.source else None
+        if adapter is None or not hasattr(adapter, "send_codex_account_picker"):
+            return status_card
+        match = re.search(r"Native Codex CLI:\s*(personal|company|none|legacy|unknown)", status_card)
+        current_account = match.group(1) if match else "unknown"
+        mode_match = re.search(r"Codex account mode:\s*(fixed|auto|unknown)", status_card)
+        current_mode = mode_match.group(1) if mode_match else "unknown"
+
+        async def _on_selected(selected_mode: str) -> PickerCallbackOutcome:
+            return await _execute(selected_mode)
+
+        result = await adapter.send_codex_account_picker(
+            chat_id=event.source.chat_id,
+            current_account=current_account,
+            current_mode=current_mode,
+            on_selected=_on_selected,
+            metadata=self._thread_metadata_for_source(
+                event.source, self._reply_anchor_for_event(event)
+            ),
+            owner_user_id=str(event.source.user_id or ""),
+        )
+        if not getattr(result, "success", False):
+            return status_card + "\n\n❌ 계정 선택 버튼을 열지 못했습니다."
+        return None
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""

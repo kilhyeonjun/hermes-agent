@@ -312,12 +312,14 @@ def _reset_aware_blocker(row: Dict[str, Any]) -> Optional[str]:
         exhausted_until = row.get("exhausted_until") or "?"
         return f"cooldown/exhausted until {short_reset(exhausted_until)}"
     primary_used = _percent(row, "primary_window")
+    secondary_window = row.get("secondary_window")
     secondary_used = _percent(row, "secondary_window")
     # Do not route into a near-full 5h window unless it is effectively about to
     # reset; the proxy cannot wait, so promoting it would just create 429s.
     if primary_used >= 95 and _window_remaining_seconds(row, "primary_window") > 15 * 60:
         return "5h 95%+ and reset >15m"
-    if secondary_used >= 100 and _window_remaining_seconds(row, "secondary_window") > 15 * 60:
+    # An absent secondary window means the weekly clock has not started yet.
+    if secondary_window and secondary_used >= 100 and _window_remaining_seconds(row, "secondary_window") > 15 * 60:
         return "7d 100% and reset >15m"
     return None
 
@@ -331,12 +333,13 @@ def _recommendation_sort_key(row: Dict[str, Any]) -> tuple[Any, ...]:
     # clock, maximizing usable weekly rotation. After every candidate has a
     # reset timestamp, reset time becomes the primary policy. When reset times
     # tie, burn the fuller soon-resetting window first.
+    priority = row.get("priority")
     return (
         0 if secondary_missing else 1,
         secondary_reset or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
         secondary_used if secondary_missing else -secondary_used,
         _percent(row, "primary_window"),
-        int(row.get("priority") or 999),
+        int(priority) if priority is not None else 999,
     )
 
 

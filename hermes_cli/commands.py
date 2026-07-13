@@ -1178,7 +1178,8 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - session-model, session-fast: Telegram session-local picker controls.
-#   - codex-route, codex-account: Mac-mini/profile-local routing controls.
+#   - codex-route: host-global Hermes/CLIProxy routing; the Telegram
+#     codex-account picker is a host-global native-Codex-only selector.
 #   - version: lower-frequency info surface kept reachable through /hermes so
 #     the 50-slot cap is explicit.
 _SLACK_VIA_HERMES_ONLY = frozenset({
