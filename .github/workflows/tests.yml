@@ -148,8 +148,9 @@ jobs:
           scripts/run_tests.sh \
             tests/hermes_cli/test_profiles.py \
             tests/hermes_cli/test_codex_refresh_coordinator.py \
+            tests/hermes_cli/test_backup.py \
             -q \
-            -k 'native_windows_archive_fallback_round_trip or native_windows_profiles_root_junction_is_rejected or native_windows_refresh_uses_platform_durability_without_posix_modes or native_windows_codex_refresh_is_single_flight_across_processes'
+            -k 'native_windows_archive_fallback_round_trip or native_windows_profiles_root_junction_is_rejected or native_windows_refresh_uses_platform_durability_without_posix_modes or native_windows_codex_refresh_is_single_flight_across_processes or native_windows_uses_acl_boundary_without_posix_modes or native_windows_snapshot_root_junction_is_rejected'
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
