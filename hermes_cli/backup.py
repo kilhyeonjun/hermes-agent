@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -798,6 +799,270 @@ _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 _QUICK_DEFAULT_KEEP = 20
 
 
+class SnapshotPermissionError(RuntimeError):
+    """A quick snapshot could not satisfy its private-mode contract."""
+
+
+def _is_native_windows() -> bool:
+    return os.name == "nt"
+
+
+def _is_windows_reparse_point(entry_stat: os.stat_result) -> bool:
+    if not _is_native_windows():
+        return False
+    attributes = int(getattr(entry_stat, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & reparse_flag)
+
+
+def _verify_private_snapshot_path(path: Path, *, directory: bool) -> None:
+    """Verify one snapshot path is a non-link object with its exact mode."""
+    expected_mode = 0o700 if directory else 0o600
+    expected_kind = "directory" if directory else "regular file"
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Could not inspect snapshot {expected_kind} {path}: {exc}"
+        ) from exc
+
+    if stat.S_ISLNK(info.st_mode) or _is_windows_reparse_point(info):
+        raise SnapshotPermissionError(
+            f"Snapshot path must not be a symlink or reparse point: {path}"
+        )
+    if directory and not stat.S_ISDIR(info.st_mode):
+        raise SnapshotPermissionError(f"Snapshot path is not a directory: {path}")
+    if not directory and not stat.S_ISREG(info.st_mode):
+        raise SnapshotPermissionError(f"Snapshot path is not a regular file: {path}")
+
+    actual_mode = stat.S_IMODE(info.st_mode)
+    if not _is_native_windows() and actual_mode != expected_mode:
+        raise SnapshotPermissionError(
+            f"Snapshot {expected_kind} {path} has mode {actual_mode:04o}; "
+            f"expected {expected_mode:04o}"
+        )
+
+
+def _ensure_private_snapshot_path(path: Path, *, directory: bool) -> None:
+    """Force and verify the private mode for one non-symlink snapshot path."""
+    expected_mode = 0o700 if directory else 0o600
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or _is_windows_reparse_point(info):
+            raise SnapshotPermissionError(
+                f"Snapshot path must not be a symlink or reparse point: {path}"
+            )
+        # Native Windows chmod exposes only the read-only attribute, not
+        # POSIX 0600/0700. Access control comes from the user's private
+        # profile ACL; type + reparse validation remains fail-closed.
+        if not _is_native_windows():
+            os.chmod(path, expected_mode)
+    except SnapshotPermissionError:
+        raise
+    except (OSError, NotImplementedError) as exc:
+        raise SnapshotPermissionError(
+            f"Could not set snapshot mode {expected_mode:04o} on {path}: {exc}"
+        ) from exc
+    _verify_private_snapshot_path(path, directory=directory)
+
+
+def _is_unsafe_quick_snapshot_source(path: Path) -> bool:
+    """Return True for symlink/reparse sources that could escape HERMES_HOME."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or _is_windows_reparse_point(info)
+
+
+def _iter_quick_snapshot_files(root: Path):
+    """Yield regular files without traversing source links or junctions."""
+    for current_root, dir_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        current = Path(current_root)
+        safe_dirs = []
+        for name in dir_names:
+            candidate = current / name
+            if _is_unsafe_quick_snapshot_source(candidate):
+                logger.warning("Skipping linked directory in quick snapshot: %s", candidate)
+                continue
+            safe_dirs.append(name)
+        dir_names[:] = safe_dirs
+
+        for name in file_names:
+            candidate = current / name
+            if _is_unsafe_quick_snapshot_source(candidate):
+                logger.warning("Skipping linked file in quick snapshot: %s", candidate)
+                continue
+            try:
+                if stat.S_ISREG(candidate.lstat().st_mode):
+                    yield candidate
+            except OSError:
+                continue
+
+
+def _quick_snapshot_source_identity(path: Path) -> tuple[int, int]:
+    """Return a stable file identity or fail if a copy source became unsafe."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Quick snapshot source changed during copy: {path}"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or _is_windows_reparse_point(info)
+    ):
+        raise SnapshotPermissionError(
+            f"Quick snapshot source changed during copy: {path}"
+        )
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _remove_partial_snapshot_file(path: Path) -> None:
+    """Remove a failed destination or abort the whole snapshot if it remains."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Could not remove partial snapshot file {path}: {exc}"
+        ) from exc
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Could not verify partial snapshot removal for {path}: {exc}"
+        ) from exc
+    raise SnapshotPermissionError(f"Partial snapshot file still exists: {path}")
+
+
+def _ensure_private_snapshot_parents(parent: Path, snap_dir: Path) -> None:
+    """Create and harden every directory from ``snap_dir`` through ``parent``."""
+    try:
+        relative = parent.relative_to(snap_dir)
+    except ValueError as exc:
+        raise SnapshotPermissionError(
+            f"Snapshot destination escapes its root: {parent}"
+        ) from exc
+
+    current = snap_dir
+    _ensure_private_snapshot_path(current, directory=True)
+    for component in relative.parts:
+        current = current / component
+        try:
+            current.mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise SnapshotPermissionError(
+                f"Could not create snapshot directory {current}: {exc}"
+            ) from exc
+        _ensure_private_snapshot_path(current, directory=True)
+
+
+def _copy_quick_snapshot_file(src: Path, dst: Path, snap_dir: Path) -> bool:
+    """Best-effort content copy with fail-closed destination permissions."""
+    if _is_unsafe_quick_snapshot_source(src):
+        logger.warning("Skipping linked source in quick snapshot: %s", src)
+        return False
+
+    try:
+        source_identity = _quick_snapshot_source_identity(src)
+    except SnapshotPermissionError as exc:
+        logger.warning("Could not snapshot %s: %s", src, exc)
+        return False
+
+    _ensure_private_snapshot_parents(dst.parent, snap_dir)
+    try:
+        if src.suffix == ".db":
+            copied = _safe_copy_db(src, dst)
+        else:
+            shutil.copyfile(src, dst, follow_symlinks=False)
+            copied = True
+    except (OSError, PermissionError) as exc:
+        logger.warning("Could not snapshot %s: %s", src, exc)
+        copied = False
+
+    if not copied:
+        _remove_partial_snapshot_file(dst)
+        return False
+
+    try:
+        if _quick_snapshot_source_identity(src) != source_identity:
+            raise SnapshotPermissionError(
+                f"Quick snapshot source changed during copy: {src}"
+            )
+    except SnapshotPermissionError as exc:
+        _remove_partial_snapshot_file(dst)
+        if "source changed during copy" in str(exc):
+            raise
+        raise SnapshotPermissionError(
+            f"Quick snapshot source changed during copy: {src}"
+        ) from exc
+
+    try:
+        _ensure_private_snapshot_path(dst, directory=False)
+    except SnapshotPermissionError:
+        _remove_partial_snapshot_file(dst)
+        raise
+    return True
+
+
+def _write_private_snapshot_manifest(path: Path, payload: Dict[str, Any]) -> None:
+    """Create a new manifest without following links and verify mode 0600."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _ensure_private_snapshot_path(path, directory=False)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _verify_private_snapshot_tree(snap_dir: Path) -> None:
+    """Audit a completed snapshot tree before publishing its ID."""
+    _verify_private_snapshot_path(snap_dir, directory=True)
+    for path in snap_dir.rglob("*"):
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            _verify_private_snapshot_path(path, directory=True)
+        else:
+            _verify_private_snapshot_path(path, directory=False)
+
+
+def _validate_quick_snapshot_label(label: Optional[str]) -> Optional[str]:
+    """Reject labels that cannot be one safe, portable path component."""
+    if label is None:
+        return None
+    if (
+        not isinstance(label, str)
+        or not label
+        or label in {".", ".."}
+        or "/" in label
+        or "\\" in label
+        or "\x00" in label
+        or any(ord(char) < 32 for char in label)
+    ):
+        raise ValueError("Invalid quick snapshot label: use one safe path component")
+    return label
+
+
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     home = hermes_home or get_hermes_home()
     return home / _QUICK_SNAPSHOTS_DIR
@@ -829,6 +1094,15 @@ def create_quick_snapshot(
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+    label = _validate_quick_snapshot_label(label)
+
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Could not create quick snapshot root {root}: {exc}"
+        ) from exc
+    _ensure_private_snapshot_path(root, directory=True)
 
     def _too_large(path: Path, rel_name: str) -> bool:
         """True (and warn) when ``path`` exceeds the max_file_size cap."""
@@ -853,87 +1127,115 @@ def create_quick_snapshot(
         return True
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    snap_id = f"{ts}-{label}" if label else ts
-    snap_dir = root / snap_id
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    base_snap_id = f"{ts}-{label}" if label else ts
+    snap_id = base_snap_id
+    snap_dir: Optional[Path] = None
+    for collision_index in range(10_000):
+        if collision_index:
+            snap_id = f"{base_snap_id}-{collision_index}"
+        candidate = root / snap_id
+        try:
+            candidate.mkdir(mode=0o700, exist_ok=False)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise SnapshotPermissionError(
+                f"Could not create quick snapshot directory {candidate}: {exc}"
+            ) from exc
+        snap_dir = candidate
+        break
+    if snap_dir is None:
+        raise FileExistsError(
+            f"Could not allocate a unique quick snapshot ID for {base_snap_id}"
+        )
+    try:
+        _ensure_private_snapshot_path(snap_dir, directory=True)
+    except BaseException:
+        try:
+            if not snap_dir.is_symlink():
+                shutil.rmtree(snap_dir)
+        except OSError:
+            logger.error(
+                "Failed to remove unusable private snapshot %s",
+                snap_dir,
+                exc_info=True,
+            )
+        raise
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
+    try:
+        for rel in _QUICK_STATE_FILES:
+            src = home / rel
+            if _is_unsafe_quick_snapshot_source(src):
+                logger.warning("Skipping linked source in quick snapshot: %s", src)
+                continue
+            if not src.exists():
+                continue
 
-    for rel in _QUICK_STATE_FILES:
-        src = home / rel
-        if not src.exists():
-            continue
+            if src.is_dir():
+                # Walk the directory and record each file individually in the
+                # manifest so restore can treat them uniformly. Empty dirs are
+                # skipped (nothing to snapshot).
+                for sub in _iter_quick_snapshot_files(src):
+                    sub_rel = sub.relative_to(home).as_posix()
+                    # Skip heavy, regenerable per-board subtrees (scratch
+                    # workspaces and task attachments can be large); we only
+                    # need board databases + metadata to restore a board.
+                    if (
+                        "/workspaces/" in f"/{sub_rel}/"
+                        or "/attachments/" in f"/{sub_rel}/"
+                    ):
+                        continue
+                    if _too_large(sub, sub_rel):
+                        continue
+                    dst = snap_dir / sub_rel
+                    if _copy_quick_snapshot_file(sub, dst, snap_dir):
+                        manifest[sub_rel] = dst.stat().st_size
+                continue
 
-        if src.is_dir():
-            # Walk the directory and record each file individually in the
-            # manifest so restore can treat them uniformly.  Empty dirs are
-            # skipped (nothing to snapshot).
-            for sub in src.rglob("*"):
-                if not sub.is_file():
-                    continue
-                sub_rel = sub.relative_to(home).as_posix()
-                # Skip heavy, regenerable per-board subtrees (scratch
-                # workspaces and task attachments can be large); we only need
-                # the board databases + their metadata to restore a board.
-                if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
-                    continue
-                if _too_large(sub, sub_rel):
-                    continue
-                dst = snap_dir / sub_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    # Route SQLite DBs through the WAL-safe backup() path so a
-                    # board DB with an open WAL (the gateway may hold it at
-                    # snapshot time) is captured consistently.
-                    if sub.suffix == ".db":
-                        if not _safe_copy_db(sub, dst):
-                            continue
-                    else:
-                        shutil.copy2(sub, dst)
-                    manifest[sub_rel] = dst.stat().st_size
-                except (OSError, PermissionError) as exc:
-                    logger.warning("Could not snapshot %s: %s", sub_rel, exc)
-            continue
+            if not src.is_file():
+                continue
+            if _too_large(src, rel):
+                continue
 
-        if not src.is_file():
-            continue
+            dst = snap_dir / rel
+            if _copy_quick_snapshot_file(src, dst, snap_dir):
+                manifest[rel] = dst.stat().st_size
 
-        if _too_large(src, rel):
-            continue
+        if not manifest:
+            shutil.rmtree(snap_dir)
+            return None
 
-        dst = snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "id": snap_id,
+            "timestamp": ts,
+            "label": label,
+            "file_count": len(manifest),
+            "total_size": sum(manifest.values()),
+            "files": manifest,
+        }
+        _write_private_snapshot_manifest(snap_dir / "manifest.json", meta)
+        _verify_private_snapshot_tree(snap_dir)
 
+        # Auto-prune. Defaults preserve historical manual /snapshot behavior;
+        # known high-churn callers can pass a smaller keep value.
+        _prune_quick_snapshots(
+            root,
+            keep=_QUICK_DEFAULT_KEEP if keep is None else keep,
+        )
+    except BaseException:
+        # The root and snapshot directory are already 0700, so even cleanup
+        # failure leaves no public residue. Never publish a partial ID.
         try:
-            if src.suffix == ".db":
-                if not _safe_copy_db(src, dst):
-                    continue
-            else:
-                shutil.copy2(src, dst)
-            manifest[rel] = dst.stat().st_size
-        except (OSError, PermissionError) as exc:
-            logger.warning("Could not snapshot %s: %s", rel, exc)
-
-    if not manifest:
-        shutil.rmtree(snap_dir, ignore_errors=True)
-        return None
-
-    # Write manifest
-    meta = {
-        "id": snap_id,
-        "timestamp": ts,
-        "label": label,
-        "file_count": len(manifest),
-        "total_size": sum(manifest.values()),
-        "files": manifest,
-    }
-    with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-    # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
-    # with known high-churn safety snapshots (for example pre-update) can pass a
-    # smaller keep value so large state.db copies do not accumulate indefinitely.
-    _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
+            if not snap_dir.is_symlink() and snap_dir.exists():
+                shutil.rmtree(snap_dir)
+        except OSError:
+            logger.error(
+                "Failed to remove incomplete private snapshot %s",
+                snap_dir,
+                exc_info=True,
+            )
+        raise
 
     logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
     return snap_id
