@@ -75,6 +75,83 @@ class TestRefreshTools:
             assert "mcp__live_srv__new_tool" in resolve_toolset("live_srv")
             assert server._registered_tool_names == ["mcp__live_srv__new_tool"]
 
+    @pytest.mark.asyncio
+    async def test_failed_refresh_restores_entire_committed_surface(self, mock_registry):
+        """A partial dynamic publication rolls back entries, state, and provenance."""
+        from tools.mcp_tool import (
+            _lock,
+            _mcp_tool_server_names,
+            _publish_server_tools,
+            _server_connect_errors,
+            _servers,
+        )
+
+        server = MCPServerTask("atomic_refresh")
+        server._refresh_lock = asyncio.Lock()
+        server._config = {}
+        old_tools = [_make_mcp_tool("keep"), _make_mcp_tool("old")]
+        server._tools = old_tools
+        server.session = SimpleNamespace(
+            list_tools=AsyncMock(
+                return_value=SimpleNamespace(
+                    tools=[_make_mcp_tool("keep"), _make_mcp_tool("new")]
+                )
+            )
+        )
+
+        with _lock:
+            provenance_at_start = dict(_mcp_tool_server_names)
+            previous_owner = _servers.get("atomic_refresh")
+            _servers["atomic_refresh"] = server
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                _publish_server_tools("atomic_refresh", server, {})
+                entries_before = {
+                    name: mock_registry.get_entry(name)
+                    for name in server._registered_tool_names
+                }
+                aliases_before = mock_registry.get_registered_toolset_aliases()
+                with _lock:
+                    provenance_before = dict(_mcp_tool_server_names)
+                generation_before = mock_registry._generation
+                real_register = mock_registry.register
+
+                def fail_new_tool(*args, **kwargs):
+                    if kwargs.get("name") == "mcp__atomic_refresh__new":
+                        raise RuntimeError("registry write failed")
+                    return real_register(*args, **kwargs)
+
+                with patch.object(
+                    mock_registry,
+                    "register",
+                    side_effect=fail_new_tool,
+                ):
+                    with pytest.raises(RuntimeError, match="registry write failed"):
+                        await server._refresh_tools()
+
+            assert {
+                name: mock_registry.get_entry(name)
+                for name in entries_before
+            } == entries_before
+            assert mock_registry.get_entry("mcp__atomic_refresh__new") is None
+            assert mock_registry.get_registered_toolset_aliases() == aliases_before
+            with _lock:
+                assert _mcp_tool_server_names == provenance_before
+                assert "atomic_refresh" not in _server_connect_errors
+            assert server._registered_tool_names == list(entries_before)
+            assert server._registration_complete is True
+            assert server._tools is old_tools
+            assert mock_registry._generation > generation_before
+        finally:
+            with _lock:
+                _mcp_tool_server_names.clear()
+                _mcp_tool_server_names.update(provenance_at_start)
+                _server_connect_errors.pop("atomic_refresh", None)
+                if previous_owner is None:
+                    _servers.pop("atomic_refresh", None)
+                else:
+                    _servers["atomic_refresh"] = previous_owner
+
 
 class TestMessageHandler:
     """Tests for MCPServerTask._make_message_handler dispatch."""

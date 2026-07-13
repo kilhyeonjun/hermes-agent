@@ -1724,7 +1724,8 @@ class MCPServerTask:
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
         "_tools", "_error", "_config",
         "_sampling", "_elicitation",
-        "_registered_tool_names", "_auth_type", "_refresh_lock",
+        "_registered_tool_names", "_registration_complete",
+        "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at",
@@ -1752,6 +1753,7 @@ class MCPServerTask:
         self._sampling: Optional[SamplingHandler] = None
         self._elicitation: Optional[ElicitationHandler] = None
         self._registered_tool_names: list[str] = []
+        self._registration_complete: bool = False
         self._reconnect_retries: int = 0
         self._auth_type: str = ""
         self._refresh_lock = asyncio.Lock()
@@ -1966,8 +1968,6 @@ class MCPServerTask:
         After the initial ``await`` (list_tools), all mutations are synchronous
         — atomic from the event loop's perspective.
         """
-        from tools.registry import registry
-
         if not self._advertises_tools():
             # A server that doesn't implement tools/* should never send
             # tools/list_changed, but guard anyway — calling tools/list
@@ -1977,6 +1977,7 @@ class MCPServerTask:
         async with self._refresh_lock:
             # Capture old tool names for change diff
             old_tool_names = set(self._registered_tool_names)
+            old_mcp_tools = self._tools
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
@@ -1984,28 +1985,29 @@ class MCPServerTask:
                     self.session.list_tools, "tools", self.name
                 )
 
-            # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
-            # all names: live agent turns may already have tool-call IDs
-            # pointing at existing handler functions. Replacing entries
-            # in-place is enough for unchanged names and avoids transient
-            # "tool not connected" / stale-handler races during startup
-            # notifications. Tools absent from the fresh list are no longer
-            # callable, so remove only those stale registry entries first.
-            stale_tool_names = old_tool_names - {
-                mcp_prefixed_tool_name(self.name, tool.name)
-                for tool in new_mcp_tools
-            }
-            for tool_name in stale_tool_names:
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
-
-            # 3. Re-register with fresh tool list
+            # 2. Re-register with the fresh tool list. Avoid nuke-and-repave
+            # outside the publication transaction: live agent turns may
+            # already have tool-call IDs pointing at existing handler
+            # functions. The transaction replaces unchanged names in place
+            # and removes stale names only after all new registrations pass.
             self._tools = new_mcp_tools
-            self._registered_tool_names = _register_server_tools(
-                self.name, self, self._config
-            )
+            try:
+                _publish_server_tools(self.name, self, self._config)
+            except BaseException as exc:
+                # Registry publication is transactional, so keep the matching
+                # in-memory discovery snapshot aligned with the restored tool
+                # surface as well. Record the refresh failure without turning
+                # a still-usable prior publication into a phantom success.
+                self._tools = old_mcp_tools
+                with _lock:
+                    if (
+                        _servers.get(self.name) is self
+                        and not self._registration_complete
+                    ):
+                        _server_connect_errors[self.name] = _format_connect_error(exc)
+                raise
 
-            # 5. Log what changed (user-visible notification)
+            # 3. Log what changed (user-visible notification)
             new_tool_names = set(self._registered_tool_names)
             added = new_tool_names - old_tool_names
             removed = old_tool_names - new_tool_names
@@ -2790,20 +2792,24 @@ class MCPServerTask:
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:
-        """Re-register tools after a post-ready reconnect if needed.
+        """Register tools after an owned initial failure or later reconnect.
 
         Initial registration is performed by ``_discover_and_register_server``
-        after ``start()`` completes. During a later reconnect, however,
-        ``_ready`` remains set; if outage handling previously deregistered
-        stale tools (parking calls ``_deregister_tools``), a successful
-        revival must publish the freshly discovered tools again — otherwise
-        the transport comes back alive with zero registered tools.
+        after ``start()`` completes.  A server whose first connection attempt
+        parks is published in ``_servers`` before ``start()`` returns, though,
+        and its first successful reconnect discovers tools before ``_ready``
+        is set.  Later reconnects keep ``_ready`` set.  In both cases an owned
+        server with no registered tools must publish the freshly discovered
+        tools or the transport comes back alive with zero registered tools.
         """
-        if not self._ready.is_set() or self._registered_tool_names:
+        with _lock:
+            is_published_owner = _servers.get(self.name) is self
+        if (
+            (not self._ready.is_set() and not is_published_owner)
+            or self._registration_complete
+        ):
             return
-        self._registered_tool_names = _register_server_tools(
-            self.name, self, self._config
-        )
+        _publish_server_tools(self.name, self, self._config)
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -3093,6 +3099,8 @@ class MCPServerTask:
             # release the child process / FDs.
             if self._task and not self._task.done():
                 self._task.cancel()
+            if self._task:
+                await asyncio.gather(self._task, return_exceptions=True)
             raise
         if self._error:
             raise self._error
@@ -3138,10 +3146,27 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
-        self._registered_tool_names = []
+        toolset_name = f"mcp-{self.name}"
+        removed_names: List[str] = []
+        with registry.mutation_transaction():
+            with _lock:
+                owner = _servers.get(self.name)
+                owns_publication = owner is None or owner is self
+                if owns_publication:
+                    for tool_name in list(
+                        getattr(self, "_registered_tool_names", [])
+                    ):
+                        # Another raw server name can sanitize to the same MCP
+                        # prefix and legitimately overwrite this entry. Also
+                        # reject a stale instance after same-name replacement.
+                        if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                            continue
+                        registry.deregister(tool_name)
+                        removed_names.append(tool_name)
+                for tool_name in removed_names:
+                    _mcp_tool_server_names.pop(tool_name, None)
+                self._registered_tool_names = []
+                self._registration_complete = False
 
     async def _wait_for_lazy_reconnect(self) -> None:
         """Wait while an intentionally recycled stdio server is dormant."""
@@ -4024,6 +4049,37 @@ def _load_mcp_config() -> Dict[str, dict]:
 # Server connection helper
 # ---------------------------------------------------------------------------
 
+# ``_discover_and_register_server`` owns long-lived connections, including a
+# task parked after exhausting its initial retry budget.  One-shot callers
+# such as ``probe_mcp_server_tools`` do not.  A private object key lets the
+# discovery path declare that ownership without changing the long-standing
+# two-argument ``_connect_server`` seam used by tests and integrations.  The
+# key is stripped before user configuration reaches ``MCPServerTask``.
+_RETAIN_FAILED_SERVER_TASK = object()
+_FAILED_SERVER_TASK_ATTR = "_hermes_mcp_server_task"
+
+
+async def _cleanup_failed_server(server: MCPServerTask, name: str) -> None:
+    """Best-effort cleanup that preserves the original connection error."""
+    try:
+        await server.shutdown()
+    except Exception:
+        logger.debug(
+            "Failed to clean up MCP server '%s' after startup error",
+            name,
+            exc_info=True,
+        )
+
+
+def _is_server_usable(server: Optional[MCPServerTask]) -> bool:
+    """Return whether transport setup and registry publication both finished."""
+    return bool(
+        server is not None
+        and getattr(server, "session", None) is not None
+        and getattr(server, "_registration_complete", False)
+    )
+
+
 async def _connect_server(name: str, config: dict) -> MCPServerTask:
     """Create an MCPServerTask, start it, and return when ready.
 
@@ -4035,8 +4091,29 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         ImportError: if HTTP transport is needed but not available.
         Exception: on connection or initialization failure.
     """
+    retain_failed_task = bool(config.get(_RETAIN_FAILED_SERVER_TASK, False))
+    runtime_config = config
+    if retain_failed_task:
+        runtime_config = dict(config)
+        runtime_config.pop(_RETAIN_FAILED_SERVER_TASK, None)
+
     server = MCPServerTask(name)
-    await server.start(config)
+    try:
+        await server.start(runtime_config)
+    except asyncio.CancelledError:
+        # MCPServerTask.start() owns cancellation and awaits its run task's
+        # transport finalizers before propagating the cancellation.
+        raise
+    except Exception as exc:
+        task = getattr(server, "_task", None)
+        if retain_failed_task and task is not None and not task.done():
+            try:
+                setattr(exc, _FAILED_SERVER_TASK_ATTR, server)
+            except Exception:
+                await _cleanup_failed_server(server, name)
+        else:
+            await _cleanup_failed_server(server, name)
+        raise
     return server
 
 
@@ -4935,19 +5012,6 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact MCP server that registered *tool_name*."""
-    safe_server_name = sanitize_mcp_name_component(server_name)
-    with _lock:
-        _mcp_tool_server_names[tool_name] = safe_server_name
-
-
-def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
-    with _lock:
-        _mcp_tool_server_names.pop(tool_name, None)
-
-
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
     """Select utility schemas based on config and server capabilities."""
     tools_filter = config.get("tools") or {}
@@ -5008,7 +5072,9 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
 def _existing_tool_names() -> List[str]:
     """Return tool names for all currently connected servers."""
     names: List[str] = []
-    for _sname, server in _servers.items():
+    with _lock:
+        servers = list(_servers.values())
+    for server in servers:
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
             continue
@@ -5082,7 +5148,6 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
@@ -5119,11 +5184,63 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)
 
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
+
+    return registered_names
+
+
+def _publish_server_tools(
+    name: str,
+    server: MCPServerTask,
+    config: dict,
+) -> List[str]:
+    """Transactionally register one connected server's complete tool surface."""
+    from tools.registry import registry
+
+    old_registered_names = list(server._registered_tool_names)
+    old_registration_complete = server._registration_complete
+
+    try:
+        with registry.mutation_transaction():
+            toolset_name = f"mcp-{name}"
+            registered_names = _register_server_tools(name, server, config)
+            removed_names: List[str] = []
+            for tool_name in set(old_registered_names) - set(registered_names):
+                # A colliding MCP server may have overwritten the same
+                # sanitized tool name. Remove only an entry still owned by
+                # this exact raw server/toolset; never delete its replacement.
+                if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                    continue
+                registry.deregister(tool_name)
+                removed_names.append(tool_name)
+
+            # Commit provenance and usable-state only after every registry
+            # write has succeeded. Lock order is always registry RLock -> MCP
+            # lock; no MCP path may wait on the registry while holding _lock.
+            with _lock:
+                owner = _servers.get(name)
+                if owner is not None and owner is not server:
+                    raise RuntimeError(
+                        f"MCP server '{name}' ownership changed during publication"
+                    )
+                for tool_name in removed_names:
+                    _mcp_tool_server_names.pop(tool_name, None)
+                safe_server_name = sanitize_mcp_name_component(name)
+                for tool_name in registered_names:
+                    _mcp_tool_server_names[tool_name] = safe_server_name
+                server._registered_tool_names = list(registered_names)
+                server._registration_complete = True
+                if owner is server:
+                    _server_connecting.discard(name)
+                    _server_connect_errors.pop(name, None)
+    except BaseException:
+        with _lock:
+            server._registered_tool_names = old_registered_names
+            server._registration_complete = old_registration_complete
+        raise
 
     return registered_names
 
@@ -5134,17 +5251,27 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
-    )
+    owned_config = dict(config)
+    owned_config[_RETAIN_FAILED_SERVER_TASK] = True
+    try:
+        server = await asyncio.wait_for(
+            _connect_server(name, owned_config),
+            timeout=connect_timeout,
+        )
+    except BaseException as exc:
+        parked_server = getattr(exc, _FAILED_SERVER_TASK_ATTR, None)
+        if parked_server is not None:
+            with _lock:
+                if name not in _servers:
+                    _servers[name] = parked_server
+                    parked_server = None
+            if parked_server is not None:
+                await _cleanup_failed_server(parked_server, name)
+        raise
     with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
         _servers[name] = server
 
-    registered_names = _register_server_tools(name, server, config)
-    server._registered_tool_names = list(registered_names)
+    registered_names = _publish_server_tools(name, server, config)
 
     transport_type = "HTTP" if "url" in config else "stdio"
     logger.info(
@@ -5186,7 +5313,18 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if k not in _servers
+            and k not in _server_connecting
+            and _parse_boolish(v.get("enabled", True), default=True)
+        }
+        incomplete_servers = {
+            k: (v, _servers[k])
+            for k, v in servers.items()
+            if k in _servers
+            and k not in _server_connecting
+            and getattr(_servers[k], "session", None) is not None
+            and not getattr(_servers[k], "_registration_complete", False)
+            and _parse_boolish(v.get("enabled", True), default=True)
         }
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
@@ -5199,6 +5337,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             if k in _servers and getattr(_servers[k], "session", None) is None
         ]
         _server_connecting.update(new_servers)
+        _server_connecting.update(incomplete_servers)
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
@@ -5208,43 +5347,88 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
 
+    reserved_server_names = list(new_servers) + list(incomplete_servers)
+
     for srv in stale_cached:
         _signal_reconnect(srv)
 
-    if not new_servers:
+    if not new_servers and not incomplete_servers:
         return _existing_tool_names()
-
-    # Start the background event loop for MCP connections
-    _ensure_mcp_loop()
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
         return await _discover_and_register_server(name, cfg)
 
+    async def _retry_registration(
+        name: str,
+        cfg: dict,
+        server: MCPServerTask,
+    ) -> List[str]:
+        """Retry publication for an already-owned live transport."""
+        with _lock:
+            current = _servers.get(name)
+            already_usable = current is server and _is_server_usable(server)
+            registered_names = list(
+                getattr(server, "_registered_tool_names", [])
+            )
+        if already_usable:
+            return registered_names
+        if current is not server:
+            if _is_server_usable(current):
+                return list(getattr(current, "_registered_tool_names", []))
+            raise RuntimeError(f"MCP server '{name}' ownership changed during retry")
+        if server.session is None:
+            raise ConnectionError(f"MCP server '{name}' disconnected before retry")
+        return _publish_server_tools(name, server, cfg)
+
     async def _discover_all():
-        server_names = list(new_servers.keys())
-        # Connect to all servers in PARALLEL
-        results = await asyncio.gather(
-            *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
-            return_exceptions=True,
+        server_names = list(reserved_server_names)
+        attempt_configs = dict(new_servers)
+        attempt_configs.update(
+            {name: cfg for name, (cfg, _server) in incomplete_servers.items()}
         )
-        for name, result in zip(server_names, results):
-            if isinstance(result, BaseException):
-                command = new_servers.get(name, {}).get("command")
-                message = _format_connect_error(result)
-                with _lock:
+        try:
+            # Connect to all servers in PARALLEL.
+            results = await asyncio.gather(
+                *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
+                *(
+                    _retry_registration(name, cfg, server)
+                    for name, (cfg, server) in incomplete_servers.items()
+                ),
+                return_exceptions=True,
+            )
+            for name, result in zip(server_names, results):
+                if isinstance(result, BaseException):
+                    command = attempt_configs.get(name, {}).get("command")
+                    message = _format_connect_error(result)
+                    with _lock:
+                        recovered = _is_server_usable(_servers.get(name))
+                        if recovered:
+                            _server_connect_errors.pop(name, None)
+                        else:
+                            _server_connect_errors[name] = message
+                    if recovered:
+                        logger.info(
+                            "MCP server '%s' recovered before initial discovery "
+                            "batch completed",
+                            name,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to connect to MCP server '%s'%s: %s",
+                            name,
+                            f" (command={command})" if command else "",
+                            message,
+                        )
+                else:
+                    with _lock:
+                        _server_connect_errors.pop(name, None)
+        finally:
+            # Cancellation, timeout, and loop shutdown must all release the
+            # reservation so a later explicit retry can make progress.
+            with _lock:
+                for name in server_names:
                     _server_connecting.discard(name)
-                    _server_connect_errors[name] = message
-                logger.warning(
-                    "Failed to connect to MCP server '%s'%s: %s",
-                    name,
-                    f" (command={command})" if command else "",
-                    message,
-                )
-            else:
-                with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -5252,24 +5436,37 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Temporarily clear the interrupt flag on the current thread so that MCP
     # discovery is never cancelled by a stale interrupt from a prior agent
     # session (executor threads get reused and may carry old interrupt state).
-    from tools.interrupt import is_interrupted as _is_interrupted, set_interrupt as _set_interrupt
-    _was_interrupted = _is_interrupted()
-    if _was_interrupted:
-        _set_interrupt(False)
     try:
-        _run_on_mcp_loop(_discover_all, timeout=120)
-    finally:
+        # Start the background event loop only after names are reserved.
+        _ensure_mcp_loop()
+        from tools.interrupt import is_interrupted as _is_interrupted, set_interrupt as _set_interrupt
+        _was_interrupted = _is_interrupted()
         if _was_interrupted:
-            _set_interrupt(True)
+            _set_interrupt(False)
+        try:
+            _run_on_mcp_loop(_discover_all, timeout=120)
+        finally:
+            if _was_interrupted:
+                _set_interrupt(True)
+    except BaseException:
+        with _lock:
+            for name in reserved_server_names:
+                _server_connecting.discard(name)
+        raise
 
     # Log a summary so ACP callers get visibility into what was registered.
+    attempted_server_names = reserved_server_names
     with _lock:
-        connected = [n for n in new_servers if n in _servers]
+        connected = [
+            n
+            for n in attempted_server_names
+            if _is_server_usable(_servers.get(n))
+        ]
         new_tool_count = sum(
             len(getattr(_servers[n], "_registered_tool_names", []))
             for n in connected
         )
-    failed = len(new_servers) - len(connected)
+    failed = len(attempted_server_names) - len(connected)
     if new_tool_count or failed:
         summary = f"MCP: registered {new_tool_count} tool(s) from {len(connected)} server(s)"
         if failed:
@@ -5304,7 +5501,9 @@ def discover_mcp_tools() -> List[str]:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if name not in _servers
+            and name not in _server_connecting
+            and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
     tool_names = register_mcp_servers(servers)
@@ -5312,13 +5511,23 @@ def discover_mcp_tools() -> List[str]:
         return tool_names
 
     with _lock:
-        connected_server_names = [name for name in new_server_names if name in _servers]
+        connected_server_names = [
+            name
+            for name in new_server_names
+            if _is_server_usable(_servers.get(name))
+        ]
         new_tool_count = sum(
             len(getattr(_servers[name], "_registered_tool_names", []))
             for name in connected_server_names
         )
+        failed_server_names = [
+            name
+            for name in new_server_names
+            if name in _server_connect_errors
+            and not _is_server_usable(_servers.get(name))
+        ]
 
-    failed_count = len(new_server_names) - len(connected_server_names)
+    failed_count = len(failed_server_names)
     if new_tool_count or failed_count:
         summary = f"  MCP: {new_tool_count} tool(s) from {len(connected_server_names)} server(s)"
         if failed_count:
@@ -5370,7 +5579,7 @@ def get_mcp_status() -> List[dict]:
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
         server = active_servers.get(name)
-        if server and server.session is not None:
+        if _is_server_usable(server):
             entry = {
                 "name": name,
                 "transport": transport,

@@ -1,5 +1,8 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from tools.registry import ToolRegistry
 from toolsets import (
     TOOLSETS,
@@ -291,3 +294,19 @@ class TestResolveToolsetIncludeRegistry:
 
     def test_registry_only_toolset_static_view_is_empty(self):
         assert resolve_toolset("__definitely_not_a_real_toolset__", include_registry=False) == []
+
+    def test_plugin_platform_uses_registry_snapshot_api(self):
+        """Platform inference must not iterate the registry's mutable internals."""
+        public_registry = SimpleNamespace(
+            get_tool_names_for_toolset=lambda name: (
+                ["plugin_tool"] if name == "snapshot_platform" else []
+            ),
+            get_toolset_alias_target=lambda _name: None,
+        )
+        with patch(
+            "gateway.platform_registry.platform_registry.is_registered",
+            return_value=True,
+        ), patch("tools.registry.registry", public_registry):
+            resolved = resolve_toolset("hermes-snapshot_platform")
+
+        assert "plugin_tool" in resolved
