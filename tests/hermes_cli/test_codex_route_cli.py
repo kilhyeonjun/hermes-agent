@@ -151,11 +151,12 @@ def test_codex_route_status_works_without_external_control_script(monkeypatch, t
     assert "제어 스크립트" not in output
 
 
-def test_sync_all_profiles_invokes_tracked_module_without_shell(monkeypatch, tmp_path):
+def test_auto_sync_splits_default_personal_from_global_clients(monkeypatch, tmp_path):
     from hermes_cli import codex_route
 
     homes = [("default", tmp_path / "default"), ("gameduo", tmp_path / "gameduo")]
     monkeypatch.setattr(codex_route, "profile_homes", lambda: homes)
+    monkeypatch.setattr(codex_route, "load_policy", lambda: {"mode": "auto"})
     calls = []
 
     def fake_run(argv, **kwargs):
@@ -165,15 +166,50 @@ def test_sync_all_profiles_invokes_tracked_module_without_shell(monkeypatch, tmp
     monkeypatch.setattr(codex_route.subprocess, "run", fake_run)
 
     assert codex_route.sync_all_profiles() == []
-    assert len(calls) == 2
-    by_home = {kwargs["env"]["HERMES_HOME"]: (argv, kwargs) for argv, kwargs in calls}
-    for name, home in homes:
-        argv, kwargs = by_home[str(home)]
+    assert len(calls) == 3
+    commands = sorted((tuple(argv[3:]), kwargs["env"]["HERMES_HOME"]) for argv, kwargs in calls)
+    assert commands == sorted(
+        [
+            (("--profile-account", "personal", "--skip-cliproxy"), str(homes[0][1])),
+            (("--skip-hermes",), str(homes[0][1])),
+            (("--skip-cliproxy",), str(homes[1][1])),
+        ]
+    )
+    for argv, kwargs in calls:
         assert argv[:3] == [sys.executable, "-m", "hermes_cli.codex_priority_sync"]
         assert kwargs["shell"] is False
         assert kwargs["timeout"] == codex_route.PROFILE_SYNC_TIMEOUT
         assert kwargs["env"]["HERMES_CODEX_ROUTE_LOCK_HELD"] == "1"
-        assert ("--skip-cliproxy" in argv) is (name != "default")
+
+
+def test_fixed_sync_keeps_default_and_global_clients_in_one_transaction(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import codex_route
+
+    homes = [("default", tmp_path / "default"), ("gameduo", tmp_path / "gameduo")]
+    monkeypatch.setattr(codex_route, "profile_homes", lambda: homes)
+    monkeypatch.setattr(
+        codex_route,
+        "load_policy",
+        lambda: {"mode": "fixed", "credential_id": "company-id"},
+    )
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(codex_route.subprocess, "run", fake_run)
+
+    assert codex_route.sync_all_profiles() == []
+    commands = sorted((tuple(argv[3:]), kwargs["env"]["HERMES_HOME"]) for argv, kwargs in calls)
+    assert commands == sorted(
+        [
+            ((), str(homes[0][1])),
+            (("--skip-cliproxy",), str(homes[1][1])),
+        ]
+    )
 
 
 def test_profile_sync_failure_redacts_child_output(monkeypatch, tmp_path):

@@ -61,6 +61,10 @@ ROUTE_LABEL_KINDS = {
     "personal-backup": "personal",
 }
 ROUTE_KIND_SLOTS = {"company": 1, "personal": 2}
+PROFILE_ACCOUNT_LABELS = {
+    "company": "company-plus-100",
+    "personal": "personal-backup",
+}
 
 
 class StageStatus(Enum):
@@ -778,6 +782,62 @@ def choose_route_recommendation(payload: dict[str, Any]) -> dict[str, Any]:
         "policy": "fixed",
         "error": "Fixed Codex route unavailable",
     }
+
+
+def choose_profile_account(
+    payload: dict[str, Any], wanted_kind: str
+) -> dict[str, Any]:
+    """Resolve one canonical account for a profile-local auto-mode affinity."""
+    wanted_label = PROFILE_ACCOUNT_LABELS[wanted_kind]
+    rows = [
+        row
+        for row in payload.get("accounts") or []
+        if isinstance(row, dict)
+        and row.get("ok")
+        and row.get("available", True)
+        and str(row.get("last_status") or "ok") == "ok"
+    ]
+    kind_rows = [
+        row
+        for row in rows
+        if label_kind(str(row.get("label") or "")) == wanted_kind
+    ]
+    canonical_rows = [
+        row
+        for row in kind_rows
+        if str(row.get("label") or "") == wanted_label
+    ]
+    if len(kind_rows) != 1 or len(canonical_rows) != 1:
+        return {
+            "policy": "profile-fixed",
+            "error": "Profile Codex route unavailable",
+        }
+    row = canonical_rows[0]
+    credential_id = str(row.get("credential_id") or row.get("id") or "").strip()
+    if not credential_id:
+        return {
+            "policy": "profile-fixed",
+            "error": "Profile Codex route unavailable",
+        }
+    return {
+        "label": wanted_label,
+        "credential_id": credential_id,
+        "reason": f"profile account policy: {wanted_kind}",
+        "policy": "profile-fixed",
+    }
+
+
+def choose_effective_recommendation(
+    payload: dict[str, Any], profile_account: str | None
+) -> dict[str, Any]:
+    global_recommendation = choose_route_recommendation(payload)
+    if (
+        global_recommendation.get("policy") in {"fixed", "invalid"}
+        or global_recommendation.get("error")
+        or not profile_account
+    ):
+        return global_recommendation
+    return choose_profile_account(payload, profile_account)
 
 
 def is_unstarted_weekly_candidate(row: dict[str, Any]) -> bool:
@@ -1871,23 +1931,37 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-hermes", action="store_true")
     parser.add_argument("--skip-cliproxy", action="store_true")
     parser.add_argument(
+        "--profile-account",
+        choices=("personal", "company"),
+        help="pin this profile while global codex-route mode is auto; an explicit global fixed route still wins",
+    )
+    parser.add_argument(
         "--warmup-unstarted",
         action="store_true",
         help="if an available Codex account has no 7d reset timestamp yet, promote it and make one tiny model call to start the 7d window",
     )
     args = parser.parse_args(argv)
 
+    if args.profile_account and (args.skip_hermes or not args.skip_cliproxy):
+        print("profile-account requires Hermes-only profile sync")
+        return 1
+
     payload = collect_payload()
     state = load_state()
-    policy_recommendation = choose_route_recommendation(payload)
+    policy_recommendation = choose_effective_recommendation(
+        payload, args.profile_account
+    )
     route_error = str(policy_recommendation.get("error") or "")
     if route_error:
         print(route_error)
         return 1
-    fixed_route = policy_recommendation.get("policy") == "fixed"
+    fixed_route = policy_recommendation.get("policy") in {
+        "fixed",
+        "profile-fixed",
+    }
     warmup_row = (
         choose_unstarted_weekly(payload, state)
-        if args.warmup_unstarted and not fixed_route
+        if args.warmup_unstarted and not fixed_route and not args.skip_hermes
         else None
     )
     warmup_note = ""

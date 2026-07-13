@@ -260,6 +260,136 @@ def test_fixed_route_policy_overrides_reset_aware_recommendation(monkeypatch, tm
     }
 
 
+def test_profile_account_selects_exact_canonical_personal_label(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    module = load_module()
+    monkeypatch.setattr(module, "load_route_policy", lambda: {"mode": "auto"})
+    payload = {
+        "accounts": [
+            {"credential_id": "company-id", "label": "company-plus-100", "ok": True},
+            {"credential_id": "personal-id", "label": "personal-backup", "ok": True},
+        ],
+        "recommendation": {"label": "company-plus-100", "policy": "7d-reset-aware"},
+    }
+
+    recommendation = module.choose_effective_recommendation(payload, "personal")
+
+    assert recommendation["credential_id"] == "personal-id"
+    assert recommendation["label"] == "personal-backup"
+    assert recommendation["policy"] == "profile-fixed"
+
+
+@pytest.mark.parametrize("label", ["personal-old", "openai-codex-oauth-1"])
+def test_profile_account_rejects_noncanonical_labels(monkeypatch, tmp_path, label):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    module = load_module()
+    monkeypatch.setattr(module, "load_route_policy", lambda: {"mode": "auto"})
+
+    recommendation = module.choose_effective_recommendation(
+        {"accounts": [{"credential_id": "legacy-id", "label": label, "ok": True}]},
+        "personal",
+    )
+
+    assert recommendation["policy"] == "profile-fixed"
+    assert recommendation["error"] == "Profile Codex route unavailable"
+
+
+def test_global_fixed_route_overrides_profile_account(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    module = load_module()
+    monkeypatch.setattr(
+        module,
+        "load_route_policy",
+        lambda: {
+            "mode": "fixed",
+            "credential_id": "company-id",
+            "label": "company-plus-100",
+        },
+    )
+    payload = {
+        "accounts": [
+            {"credential_id": "company-id", "label": "company-plus-100", "ok": True},
+            {"credential_id": "personal-id", "label": "personal-backup", "ok": True},
+        ]
+    }
+
+    recommendation = module.choose_effective_recommendation(payload, "personal")
+
+    assert recommendation["credential_id"] == "company-id"
+    assert recommendation["policy"] == "fixed"
+
+
+def test_skip_hermes_disables_unstarted_warmup_and_state_recording(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("HERMES_CODEX_ROUTE_LOCK_HELD", "1")
+    module = load_module()
+    monkeypatch.setattr(module, "load_route_policy", lambda: {"mode": "auto"})
+    monkeypatch.setattr(module, "load_state", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "collect_payload",
+        lambda: {
+            "accounts": [
+                {
+                    "credential_id": "company-id",
+                    "label": "company-plus-100",
+                    "ok": True,
+                    "secondary_window": {},
+                }
+            ],
+            "recommendation": {
+                "credential_id": "company-id",
+                "label": "company-plus-100",
+                "policy": "7d-reset-aware",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "run_warmup_call",
+        lambda *_args, **_kwargs: pytest.fail("skip-hermes must not call warmup"),
+    )
+    monkeypatch.setattr(
+        module,
+        "record_warmup",
+        lambda *_args, **_kwargs: pytest.fail("skip-hermes must not record warmup"),
+    )
+
+    assert module.main(
+        ["--warmup-unstarted", "--skip-hermes", "--skip-cliproxy"]
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--profile-account", "personal"],
+        [
+            "--profile-account",
+            "personal",
+            "--skip-hermes",
+            "--skip-cliproxy",
+        ],
+    ],
+)
+def test_profile_account_rejects_non_profile_only_invocations_before_collection(
+    monkeypatch, tmp_path, capsys, argv
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("HERMES_CODEX_ROUTE_LOCK_HELD", "1")
+    module = load_module()
+    monkeypatch.setattr(
+        module,
+        "collect_payload",
+        lambda: pytest.fail("invalid profile pin must fail before collection"),
+    )
+
+    assert module.main(argv) == 1
+    assert "profile-account requires Hermes-only profile sync" in capsys.readouterr().out
+
+
 def test_main_applies_fixed_route_policy(monkeypatch, tmp_path):
     profile_home = tmp_path / "profile"
     profile_home.mkdir()
