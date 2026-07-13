@@ -54,18 +54,11 @@ fi
 PYTHON="$VENV/bin/python"
 
 
-# ── Live-gateway plugin (computed before we drop env) ───────────────────────
-EXTRA_PYTHONPATH=""
-EXTRA_PYTEST_PLUGINS=""
-if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
-  EXTRA_PYTHONPATH="$HOME/.hermes"
-  EXTRA_PYTEST_PLUGINS="pytest_live_guard"
-fi
-
-
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
+# run_tests_parallel.py establishes a per-file fake HOME/HERMES_HOME
+# before collection, so safety does not depend on an optional host plugin.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
@@ -80,6 +73,4 @@ exec env -i \
   PYTHONHASHSEED=0 \
   PYTHONDONTWRITEBYTECODE=1 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
-  ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
-  ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"

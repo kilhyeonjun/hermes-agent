@@ -1257,3 +1257,83 @@ def test_device_code_login_non_429_error_unchanged(monkeypatch):
         auth_mod._codex_device_code_login()
 
     assert exc_info.value.code == "device_code_request_error"
+
+
+def test_auth_file_path_blocks_real_home_before_pytest_test_context(
+    tmp_path, monkeypatch
+):
+    """The runner guard must protect real auth before PYTEST_CURRENT_TEST exists."""
+    from hermes_cli import auth as auth_mod
+
+    real_home = tmp_path / "real-home"
+    real_hermes = real_home / ".hermes"
+    real_hermes.mkdir(parents=True)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("HERMES_TESTING", "1")
+    monkeypatch.setenv("HERMES_TEST_REAL_HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(real_hermes))
+
+    with pytest.raises(RuntimeError, match="real user auth store"):
+        auth_mod._auth_file_path()
+
+
+def test_explicit_auth_store_paths_cannot_bypass_test_live_guard(
+    tmp_path, monkeypatch
+):
+    """Explicit save/load targets and symlink aliases stay fail-closed."""
+    from hermes_cli import auth as auth_mod
+
+    real_home = tmp_path / "real-home"
+    live_auth = real_home / ".hermes" / "profiles" / "gameduo" / "auth.json"
+    live_auth.parent.mkdir(parents=True)
+    live_auth.write_text('{"version": 1, "providers": {}}\n')
+    before = live_auth.read_bytes()
+    alias = tmp_path / "auth-alias.json"
+    alias.symlink_to(live_auth)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("HERMES_TESTING", "1")
+    monkeypatch.setenv("HERMES_TEST_REAL_HOME", str(real_home))
+
+    for target in (live_auth, alias):
+        with pytest.raises(RuntimeError, match="real user auth store"):
+            auth_mod._load_auth_store(auth_file=target)
+        with pytest.raises(RuntimeError, match="real user auth store"):
+            auth_mod._save_auth_store(
+                {"version": 1, "providers": {"sentinel": {}}},
+                target_path=target,
+            )
+
+    assert live_auth.read_bytes() == before
+    assert list(live_auth.parent.glob("auth.json.tmp.*")) == []
+
+
+def test_lexical_live_auth_symlink_to_external_target_is_blocked(
+    tmp_path, monkeypatch
+):
+    """A live-root symlink stays protected even when its target is outside."""
+    from hermes_cli import auth as auth_mod
+
+    real_home = tmp_path / "real-home"
+    live_auth = real_home / ".hermes" / "auth.json"
+    live_auth.parent.mkdir(parents=True)
+    external_auth = tmp_path / "external-auth.json"
+    external_auth.write_text('{"version": 1, "providers": {}}\n')
+    before = external_auth.read_bytes()
+    live_auth.symlink_to(external_auth)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("HERMES_TESTING", "1")
+    monkeypatch.setenv("HERMES_TEST_REAL_HOME", str(real_home))
+
+    with pytest.raises(RuntimeError, match="real user auth store"):
+        auth_mod._load_auth_store(auth_file=live_auth)
+    with pytest.raises(RuntimeError, match="real user auth store"):
+        auth_mod._save_auth_store(
+            {"version": 1, "providers": {"sentinel": {}}},
+            target_path=live_auth,
+        )
+
+    assert external_auth.read_bytes() == before
+    assert not list(external_auth.parent.glob("external-auth.json.tmp.*"))

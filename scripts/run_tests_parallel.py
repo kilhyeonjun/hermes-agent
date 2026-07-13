@@ -40,10 +40,13 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -251,23 +254,72 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    real_home = (
+        os.environ.get("HERMES_TEST_REAL_HOME")
+        or os.environ.get("HOME")
+        or str(Path.home())
+    )
+    # Canonicalize macOS' /tmp -> /private/tmp alias once at the boundary.
+    # Code under test may resolve expanded paths; keeping HOME canonical avoids
+    # false mismatches between Path.home() and resolved ~/... paths.
+    temp_home = Path(tempfile.mkdtemp(prefix="hermes-test-file-")).resolve()
+    hermes_home = temp_home / ".hermes"
+    codex_home = temp_home / ".codex"
+    xdg_config = temp_home / ".config"
+    xdg_data = temp_home / ".local" / "share"
+    xdg_cache = temp_home / ".cache"
+    local_app_data = temp_home / "AppData" / "Local"
+    roaming_app_data = temp_home / "AppData" / "Roaming"
+    for path in (
+        hermes_home,
+        codex_home,
+        xdg_config,
+        xdg_data,
+        xdg_cache,
+        local_app_data,
+        roaming_app_data,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    child_env = os.environ.copy()
+    child_env.pop("PYTEST_CURRENT_TEST", None)
+    child_env.update(
+        {
+            "HOME": str(temp_home),
+            "HERMES_REAL_HOME": str(temp_home),
+            "HERMES_HOME": str(hermes_home),
+            "CODEX_HOME": str(codex_home),
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "XDG_DATA_HOME": str(xdg_data),
+            "XDG_CACHE_HOME": str(xdg_cache),
+            "USERPROFILE": str(temp_home),
+            "LOCALAPPDATA": str(local_app_data),
+            "APPDATA": str(roaming_app_data),
+            "HERMES_TESTING": "1",
+            "HERMES_TEST_REAL_HOME": real_home,
+            "HERMES_TEST_HOME_ISOLATED": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=child_env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        shutil.rmtree(temp_home, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -298,6 +350,7 @@ def _run_one_file(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        shutil.rmtree(temp_home, ignore_errors=True)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -306,14 +359,17 @@ def _run_one_file(
 
         output +=  "\n"
 
-    if rc == 5:
-        # No tests collected — every test in the file was filtered out.
-        # Treat as a pass; surface info in a slightly distinct status
-        # so the operator can spot it.
-        rc = 0
-    summary = _parse_pytest_summary(output)
-    subproc_wall = time.monotonic() - subproc_start
-    return file, rc, output, summary, subproc_wall
+    try:
+        if rc == 5:
+            # No tests collected — every test in the file was filtered out.
+            # Treat as a pass; surface info in a slightly distinct status
+            # so the operator can spot it.
+            rc = 0
+        summary = _parse_pytest_summary(output)
+        subproc_wall = time.monotonic() - subproc_start
+        return file, rc, output, summary, subproc_wall
+    finally:
+        shutil.rmtree(temp_home, ignore_errors=True)
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:
@@ -591,7 +647,7 @@ def _slice_files(
     return target
 
 
-def main() -> int:
+def _main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -956,6 +1012,216 @@ def main() -> int:
         return 1
 
     return 0
+
+
+_STATIC_LIVE_STATE_GUARD_PATHS = (
+    Path(".hermes/auth.json"),
+    Path(".hermes/config.yaml"),
+    Path(".hermes/.env"),
+    Path(".hermes/.anthropic_oauth.json"),
+    Path(".hermes/active_profile"),
+    Path(".hermes/state/codex_route_policy.json"),
+    Path(".hermes/state/cliproxy_fixed_route_state.json"),
+    Path(".hermes/state/codex_reset_aware_warmup.json"),
+    Path(".codex/auth.json"),
+)
+
+
+def _path_fingerprint(path: Path) -> tuple[str, int, int, str]:
+    """Return content and metadata evidence without retaining secret bytes."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return ("missing", 0, 0, "")
+    except OSError as exc:
+        return (f"error:{type(exc).__name__}", 0, 0, "")
+
+    if path.is_symlink():
+        try:
+            link_payload = os.readlink(path).encode(
+                "utf-8", errors="surrogateescape"
+            )
+        except OSError as exc:
+            return (
+                f"error:{type(exc).__name__}",
+                metadata.st_mode,
+                metadata.st_mtime_ns,
+                "",
+            )
+        try:
+            target = path.resolve(strict=True)
+            target_metadata = target.stat()
+        except FileNotFoundError:
+            return (
+                "symlink:missing",
+                metadata.st_mode,
+                metadata.st_mtime_ns,
+                hashlib.sha256(link_payload).hexdigest(),
+            )
+        except (OSError, RuntimeError) as exc:
+            return (
+                f"error:{type(exc).__name__}",
+                metadata.st_mode,
+                metadata.st_mtime_ns,
+                "",
+            )
+        digest = hashlib.sha256()
+        digest.update(link_payload)
+        digest.update(
+            f"\0{target_metadata.st_mode}:{target_metadata.st_mtime_ns}:"
+            f"{target_metadata.st_size}\0".encode("ascii")
+        )
+        if target.is_file():
+            try:
+                with target.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as exc:
+                return (
+                    f"error:{type(exc).__name__}",
+                    metadata.st_mode,
+                    metadata.st_mtime_ns,
+                    "",
+                )
+            kind = "symlink:file"
+        else:
+            kind = "symlink:other"
+        return (kind, metadata.st_mode, metadata.st_mtime_ns, digest.hexdigest())
+    elif path.is_file():
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            return (f"error:{type(exc).__name__}", metadata.st_mode, metadata.st_mtime_ns, "")
+        return ("file", metadata.st_mode, metadata.st_mtime_ns, digest.hexdigest())
+    else:
+        payload = b""
+        kind = "other"
+    return (
+        kind,
+        metadata.st_mode,
+        metadata.st_mtime_ns,
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _live_state_guard_paths(real_home: Path) -> tuple[Path, ...]:
+    paths = set(_STATIC_LIVE_STATE_GUARD_PATHS)
+    try:
+        profiles_root = real_home / ".hermes" / "profiles"
+        if profiles_root.exists():
+            for profile in profiles_root.iterdir():
+                if not profile.is_dir():
+                    continue
+                relative = profile.relative_to(real_home)
+                paths.update(
+                    {
+                        relative / "auth.json",
+                        relative / "config.yaml",
+                        relative / ".env",
+                        relative / ".anthropic_oauth.json",
+                        relative / "state" / "codex_route_policy.json",
+                        relative / "state" / "cliproxy_fixed_route_state.json",
+                        relative / "state" / "codex_reset_aware_warmup.json",
+                    }
+                )
+        accounts_root = real_home / ".codex" / "accounts"
+        if accounts_root.exists():
+            paths.update(
+                path.relative_to(real_home)
+                for path in accounts_root.glob("*/auth.json")
+            )
+        cliproxy_root = real_home / ".cli-proxy-api"
+        if cliproxy_root.exists():
+            paths.update(
+                path.relative_to(real_home)
+                for path in cliproxy_root.glob("codex-*.json")
+            )
+    except (OSError, RuntimeError, ValueError):
+        raise RuntimeError("cannot enumerate caller live state") from None
+    return tuple(sorted(paths, key=str))
+
+
+def _live_state_snapshot(
+    real_home: Path, paths: tuple[Path, ...]
+) -> dict[Path, tuple[str, int, int, str]]:
+    snapshot = {}
+    for relative in paths:
+        fingerprint = _path_fingerprint(real_home / relative)
+        if fingerprint[0].startswith("error:"):
+            raise RuntimeError(
+                "cannot snapshot caller live state: "
+                f"{_safe_live_state_label(relative)}"
+            )
+        snapshot[relative] = fingerprint
+    return snapshot
+
+
+def _safe_live_state_label(relative: Path) -> str:
+    """Render a protected path without profile, account, or email labels."""
+    parts = relative.parts
+    if len(parts) >= 4 and parts[:2] == (".hermes", "profiles"):
+        return "/".join((".hermes", "profiles", "<redacted>", *parts[3:]))
+    if len(parts) >= 4 and parts[:2] == (".codex", "accounts"):
+        return ".codex/accounts/<redacted>/auth.json"
+    if len(parts) >= 2 and parts[0] == ".cli-proxy-api":
+        return ".cli-proxy-api/codex-<redacted>.json"
+    return relative.as_posix()
+
+
+def main() -> int:
+    """Run tests with per-file homes and fail if caller live state drifts."""
+    real_home = Path(
+        os.environ.get("HERMES_TEST_REAL_HOME")
+        or os.environ.get("HOME")
+        or Path.home()
+    ).expanduser()
+    before_paths = _live_state_guard_paths(real_home)
+    before = _live_state_snapshot(real_home, before_paths)
+    result = 1
+    run_error: BaseException | None = None
+    run_traceback = None
+    try:
+        result = _main()
+    except BaseException as exc:
+        run_error = exc
+        run_traceback = exc.__traceback__
+
+    guard_error: BaseException | None = None
+    changed: list[Path] = []
+    try:
+        after_paths = _live_state_guard_paths(real_home)
+        all_paths = tuple(sorted(set(before_paths) | set(after_paths), key=str))
+        after = _live_state_snapshot(real_home, all_paths)
+        missing = ("missing", 0, 0, "")
+        changed = [
+            path
+            for path in all_paths
+            if before.get(path, missing) != after[path]
+        ]
+    except BaseException as exc:
+        guard_error = exc
+
+    if changed:
+        rendered = ", ".join(_safe_live_state_label(path) for path in changed)
+        print(
+            f"error: caller live state changed during test run: {rendered}",
+            file=sys.stderr,
+        )
+    if guard_error is not None:
+        print(
+            "error: caller live state post-test verification failed",
+            file=sys.stderr,
+        )
+    if run_error is not None:
+        raise run_error.with_traceback(run_traceback)
+    if guard_error is not None:
+        raise guard_error
+    if changed:
+        return 1
+    return result
 
 
 if __name__ == "__main__":

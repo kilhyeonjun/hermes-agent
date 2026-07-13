@@ -5,11 +5,10 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 1. **No credential env vars.** All provider/credential-shaped env vars
    (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
    are unset before every test. Local developer keys cannot leak in.
-2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
-   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
-   real one. (We do NOT also redirect HOME — that broke subprocesses in
-   CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
-   ``get_hermes_home()`` is a bug to fix at the callsite.)
+2. **Isolated home boundary.** The canonical runner gives every test file a
+   stable fake HOME/HERMES_HOME before collection. Direct pytest gets a
+   suite-scoped fake home here before test modules import. Per-test fixtures
+   then narrow HERMES_HOME further.
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -22,6 +21,7 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,6 +30,66 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── Direct-pytest collection boundary ─────────────────────────────────────
+# The canonical per-file runner establishes this before spawning pytest. A
+# developer can still invoke ``python -m pytest`` directly, so establish an
+# equivalent suite-scoped boundary here before test modules are collected.
+_DIRECT_TEST_HOME = None
+_DIRECT_TEST_REAL_HOME = None
+_DIRECT_LIVE_PATHS = None
+_DIRECT_LIVE_BEFORE = None
+_DIRECT_ENV_BEFORE = None
+
+if os.environ.get("HERMES_TEST_HOME_ISOLATED") != "1":
+    from scripts.run_tests_parallel import (
+        _live_state_guard_paths,
+        _live_state_snapshot,
+    )
+
+    _DIRECT_TEST_REAL_HOME = Path(
+        os.environ.get("HERMES_TEST_REAL_HOME")
+        or os.environ.get("HOME")
+        or Path.home()
+    ).expanduser()
+    _DIRECT_LIVE_PATHS = _live_state_guard_paths(_DIRECT_TEST_REAL_HOME)
+    _DIRECT_LIVE_BEFORE = _live_state_snapshot(
+        _DIRECT_TEST_REAL_HOME, _DIRECT_LIVE_PATHS
+    )
+    _DIRECT_TEST_HOME = tempfile.TemporaryDirectory(
+        prefix="hermes-direct-pytest-home-"
+    )
+    # Match the canonical path used by code that resolves expanded ~/ paths
+    # (notably macOS where /tmp is an alias for /private/tmp).
+    isolated_home = Path(_DIRECT_TEST_HOME.name).resolve()
+    isolated_paths = {
+        "HOME": isolated_home,
+        "HERMES_REAL_HOME": isolated_home,
+        "HERMES_HOME": isolated_home / ".hermes",
+        "CODEX_HOME": isolated_home / ".codex",
+        "XDG_CONFIG_HOME": isolated_home / ".config",
+        "XDG_DATA_HOME": isolated_home / ".local" / "share",
+        "XDG_CACHE_HOME": isolated_home / ".cache",
+        "USERPROFILE": isolated_home,
+        "LOCALAPPDATA": isolated_home / "AppData" / "Local",
+        "APPDATA": isolated_home / "AppData" / "Roaming",
+    }
+    for path in set(isolated_paths.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    _DIRECT_ENV_BEFORE = {
+        key: os.environ.get(key)
+        for key in (
+            *isolated_paths,
+            "HERMES_TESTING",
+            "HERMES_TEST_REAL_HOME",
+            "HERMES_TEST_HOME_ISOLATED",
+        )
+    }
+    os.environ.update({key: str(path) for key, path in isolated_paths.items()})
+    os.environ["HERMES_TESTING"] = "1"
+    os.environ["HERMES_TEST_REAL_HOME"] = str(_DIRECT_TEST_REAL_HOME)
+    os.environ["HERMES_TEST_HOME_ISOLATED"] = "1"
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -542,6 +602,58 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # suite runs natively there (POSIX keeps the more reliable signal method).
     if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
         config.option.timeout_method = "thread"
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """Fail direct pytest when caller auth/config/routing state drifted."""
+    if _DIRECT_LIVE_BEFORE is None or _DIRECT_TEST_REAL_HOME is None:
+        return
+    from scripts.run_tests_parallel import (
+        _live_state_guard_paths,
+        _live_state_snapshot,
+    )
+
+    try:
+        after_paths = _live_state_guard_paths(_DIRECT_TEST_REAL_HOME)
+        all_paths = tuple(
+            sorted(set(_DIRECT_LIVE_PATHS or ()) | set(after_paths), key=str)
+        )
+        after = _live_state_snapshot(_DIRECT_TEST_REAL_HOME, all_paths)
+    except BaseException:
+        print(
+            "error: caller live state post-test verification failed",
+            file=sys.stderr,
+        )
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        return
+    missing = ("missing", 0, 0, "")
+    changed = [
+        path
+        for path in all_paths
+        if _DIRECT_LIVE_BEFORE.get(path, missing) != after[path]
+    ]
+    if changed:
+        from scripts.run_tests_parallel import _safe_live_state_label
+
+        rendered = ", ".join(_safe_live_state_label(path) for path in changed)
+        print(
+            f"error: caller live state changed during direct pytest: {rendered}",
+            file=sys.stderr,
+        )
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_unconfigure(config):
+    """Restore process env after direct in-process pytest and clean fake HOME."""
+    if _DIRECT_ENV_BEFORE is not None:
+        for key, value in _DIRECT_ENV_BEFORE.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if _DIRECT_TEST_HOME is not None:
+        _DIRECT_TEST_HOME.cleanup()
 
 
 @pytest.fixture(autouse=True)
