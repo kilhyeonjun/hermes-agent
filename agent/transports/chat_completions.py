@@ -128,6 +128,18 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+def _sanitize_chat_completion_request_overrides(
+    overrides: Any,
+) -> dict[str, Any]:
+    """Drop overrides that the OpenAI Chat Completions SDK cannot accept."""
+    if not isinstance(overrides, dict):
+        return {}
+    # Anthropic fast mode belongs to the native Messages API.  OpenAI's
+    # chat.completions.create() rejects this kwarg before any compatible
+    # fallback provider receives the request.
+    return {key: value for key, value in overrides.items() if key != "speed"}
+
+
 class ChatCompletionsTransport(ProviderTransport):
     """Transport for api_mode='chat_completions'.
 
@@ -505,7 +517,9 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs["extra_body"] = extra_body
 
         # Request overrides last (service_tier etc.)
-        overrides = params.get("request_overrides")
+        overrides = _sanitize_chat_completion_request_overrides(
+            params.get("request_overrides")
+        )
         if overrides:
             api_kwargs.update(overrides)
 
@@ -619,7 +633,9 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body.update(additions)
 
         # Request overrides (user config)
-        overrides = params.get("request_overrides")
+        overrides = _sanitize_chat_completion_request_overrides(
+            params.get("request_overrides")
+        )
         if overrides:
             for k, v in overrides.items():
                 if k == "extra_body" and isinstance(v, dict):

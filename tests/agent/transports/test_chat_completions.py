@@ -1,5 +1,7 @@
 """Tests for the ChatCompletionsTransport."""
 
+from copy import deepcopy
+
 import pytest
 from types import SimpleNamespace
 
@@ -643,6 +645,51 @@ class TestChatCompletionsBuildKwargs:
             request_overrides={"service_tier": "priority"},
         )
         assert kw["service_tier"] == "priority"
+
+    def test_strips_anthropic_speed_override_from_legacy_chat_completions(
+        self, transport
+    ):
+        request_overrides = {
+            "speed": "fast",
+            "service_tier": "priority",
+            "extra_body": {"speed": 1.25},
+        }
+        original_overrides = deepcopy(request_overrides)
+
+        kw = transport.build_kwargs(
+            model="claude-opus-4.6",
+            messages=[{"role": "user", "content": "Hi"}],
+            request_overrides=request_overrides,
+        )
+
+        assert "speed" not in kw
+        assert kw["service_tier"] == "priority"
+        assert kw["extra_body"]["speed"] == 1.25
+        assert request_overrides == original_overrides
+
+    def test_strips_anthropic_speed_override_from_profile_chat_completions(
+        self, transport
+    ):
+        from providers import get_provider_profile
+
+        request_overrides = {
+            "speed": "fast",
+            "service_tier": "priority",
+            "extra_body": {"speed": 1.25},
+        }
+        original_overrides = deepcopy(request_overrides)
+
+        kw = transport.build_kwargs(
+            model="claude-opus-4.6",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_profile=get_provider_profile("custom"),
+            request_overrides=request_overrides,
+        )
+
+        assert "speed" not in kw
+        assert kw["service_tier"] == "priority"
+        assert kw["extra_body"]["speed"] == 1.25
+        assert request_overrides == original_overrides
 
     def test_fixed_temperature(self, transport):
         """Fixed temperature is now set via ProviderProfile.fixed_temperature."""
