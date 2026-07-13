@@ -895,25 +895,38 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+def _assert_test_path_not_live(path: Path) -> None:
+    """Fail closed when a test path resolves inside the caller's live root."""
+    test_process = bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("HERMES_TESTING") == "1"
+    )
+    if not test_process:
+        return
+    real_home = Path(
+        os.environ.get("HERMES_TEST_REAL_HOME") or Path.home()
+    ).expanduser()
+    lexical_root = Path(os.path.abspath(real_home / ".hermes"))
+    lexical_path = Path(os.path.abspath(path.expanduser()))
+    resolved_root = lexical_root.resolve(strict=False)
+    resolved_path = lexical_path.resolve(strict=False)
+    if not (
+        lexical_path.is_relative_to(lexical_root)
+        or resolved_path.is_relative_to(resolved_root)
+    ):
+        return
+    raise RuntimeError(
+        "Refusing to touch real user auth store during test run. "
+        "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+        "via scripts/run_tests.sh for hermetic CI-parity env."
+    )
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
-    # Seat belt: if pytest is running and HERMES_HOME resolves to the real
-    # user's auth store, refuse rather than silently corrupt it. This catches
-    # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
-    # hermetic conftest, or sandbox escapes via threads/subprocesses. In
-    # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if resolved == real_home_auth:
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+    # Fixtures run after collection. The canonical runner sets HERMES_TESTING
+    # before imports; PYTEST_CURRENT_TEST keeps direct pytest runs guarded.
+    _assert_test_path_not_live(path)
     return path
 
 
@@ -1112,6 +1125,7 @@ def _auth_store_lock(
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
+    _assert_test_path_not_live(auth_file)
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
@@ -1159,6 +1173,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    _assert_test_path_not_live(auth_file)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
