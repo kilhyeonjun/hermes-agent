@@ -279,6 +279,118 @@ def test_profile_account_selects_exact_canonical_personal_label(monkeypatch, tmp
     assert recommendation["policy"] == "profile-fixed"
 
 
+def test_profile_affinity_keeps_exhausted_personal_as_priority_owner(
+    monkeypatch, tmp_path
+):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    auth_path = profile_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 10,
+                            "last_status": "exhausted",
+                        },
+                        {
+                            "id": "company-id",
+                            "label": "company-plus-100",
+                            "priority": 0,
+                            "last_status": "ok",
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    module = load_module()
+    monkeypatch.setattr(module, "load_route_policy", lambda: {"mode": "auto"})
+    payload = {
+        "accounts": [
+            {
+                "credential_id": "personal-id",
+                "label": "personal-backup",
+                "ok": True,
+                "available": False,
+                "last_status": "exhausted",
+            },
+            {
+                "credential_id": "company-id",
+                "label": "company-plus-100",
+                "ok": True,
+                "available": True,
+                "last_status": "ok",
+            },
+        ],
+        "recommendation": {
+            "credential_id": "company-id",
+            "label": "company-plus-100",
+            "policy": "7d-reset-aware",
+        },
+    }
+
+    recommendation = module.choose_effective_recommendation(payload, "personal")
+    result = module.sync_hermes(
+        recommendation["label"],
+        recommended_credential_id=recommendation["credential_id"],
+        dry_run=False,
+    )
+    saved = json.loads(auth_path.read_text(encoding="utf-8"))
+    priorities = {
+        row["label"]: row["priority"]
+        for row in saved["credential_pool"]["openai-codex"]
+    }
+
+    assert recommendation["credential_id"] == "personal-id"
+    assert recommendation["policy"] == "profile-fixed"
+    assert result.ok
+    assert priorities == {"personal-backup": 0, "company-plus-100": 10}
+
+
+def test_sync_hermes_rejects_import_time_live_auth_path(
+    monkeypatch, tmp_path
+):
+    real_home = tmp_path / "real-home"
+    live_home = real_home / ".hermes"
+    live_home.mkdir(parents=True)
+    live_auth = live_home / "auth.json"
+    live_auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 0,
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = live_auth.read_bytes()
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("HERMES_TESTING", "1")
+    monkeypatch.setenv("HERMES_TEST_REAL_HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(live_home))
+    module = load_module()
+
+    result = module.sync_hermes("personal-backup", dry_run=False)
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == module.StageErrorCode.PREFLIGHT
+    assert live_auth.read_bytes() == before
+
+
 @pytest.mark.parametrize("label", ["personal-old", "openai-codex-oauth-1"])
 def test_profile_account_rejects_noncanonical_labels(monkeypatch, tmp_path, label):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
