@@ -32,6 +32,7 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
             self.name = name
             self._reconnect_event = _Event(name)
             self._registered_tool_names: list[str] = []
+            self._registration_complete = False
 
     class _Alive:
         session = object()
@@ -40,6 +41,7 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
             self.name = name
             self._reconnect_event = _Event(name)
             self._registered_tool_names = [f"{name}__tool"]
+            self._registration_complete = True
 
     monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
     stale = _Stale("parked-srv")

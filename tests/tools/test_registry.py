@@ -546,6 +546,57 @@ class TestThreadSafety:
         assert toolsets["gated"]["available"] is True
 
 
+class TestMutationTransaction:
+    def test_reader_never_observes_partial_surface_on_rollback(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha",
+            toolset="baseline",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+        )
+        baseline = reg.get_tool_to_toolset_map()
+        partial_written = threading.Event()
+        release_writer = threading.Event()
+        reader_done = threading.Event()
+        reader_result = {}
+
+        def writer():
+            try:
+                with reg.mutation_transaction():
+                    reg.register(
+                        name="beta",
+                        toolset="partial",
+                        schema=_make_schema("beta"),
+                        handler=_dummy_handler,
+                    )
+                    partial_written.set()
+                    assert release_writer.wait(timeout=2)
+                    raise RuntimeError("rollback")
+            except RuntimeError as exc:
+                assert str(exc) == "rollback"
+
+        def reader():
+            assert partial_written.wait(timeout=2)
+            reader_result["value"] = reg.get_tool_to_toolset_map()
+            reader_done.set()
+
+        writer_thread = threading.Thread(target=writer)
+        reader_thread = threading.Thread(target=reader)
+        writer_thread.start()
+        reader_thread.start()
+        assert partial_written.wait(timeout=2)
+        assert not reader_done.wait(timeout=0.1)
+        release_writer.set()
+        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=2)
+
+        assert not writer_thread.is_alive()
+        assert not reader_thread.is_alive()
+        assert reader_result["value"] == baseline
+        assert reg.get_tool_to_toolset_map() == baseline
+
+
 class TestToolsetAvailabilityAggregation:
     def test_mixed_toolset_available_when_general_tool_passes(self):
         """Desktop-only helpers must not hide general-purpose tools from doctor."""

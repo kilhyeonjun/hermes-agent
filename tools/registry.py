@@ -21,6 +21,7 @@ import logging
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -237,6 +238,30 @@ class ToolRegistry:
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
+
+    @contextmanager
+    def mutation_transaction(self):
+        """Apply a group of registry mutations atomically.
+
+        The registry lock is re-entrant, so callers may use the normal
+        ``register()``, ``deregister()``, and alias APIs inside the context.
+        Readers cannot observe a partial surface. If any mutation raises,
+        restore the exact entries, toolset checks, and aliases that existed
+        before the transaction. The generation remains monotonic so caches
+        that might have observed an intermediate generation are invalidated.
+        """
+        with self._lock:
+            tools_before = dict(self._tools)
+            checks_before = dict(self._toolset_checks)
+            aliases_before = dict(self._toolset_aliases)
+            try:
+                yield
+            except BaseException:
+                self._tools = tools_before
+                self._toolset_checks = checks_before
+                self._toolset_aliases = aliases_before
+                self._generation += 1
+                raise
 
     def _toolset_has_exposable_tools(
         self,
