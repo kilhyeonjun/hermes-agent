@@ -425,6 +425,40 @@ class TestReadCodexAccessToken:
 
         assert result == valid_jwt
 
+    @pytest.mark.parametrize(
+        "route_policy",
+        [
+            {"mode": "fixed", "credential_id": "fixed-target-id"},
+            {"mode": "invalid"},
+        ],
+        ids=["fixed-target-unavailable", "corrupt-policy"],
+    )
+    def test_fixed_or_invalid_route_never_falls_back_to_singleton(
+        self, route_policy
+    ):
+        singleton_reader = MagicMock(
+            return_value={
+                "tokens": {
+                    "access_token": "opposite-singleton-token",
+                    "refresh_token": "opposite-singleton-refresh",
+                }
+            }
+        )
+        with patch(
+            "agent.auxiliary_client._select_pool_entry",
+            return_value=(True, None),
+        ), patch(
+            "hermes_cli.auth._load_codex_runtime_route_policy",
+            return_value=route_policy,
+        ), patch(
+            "hermes_cli.auth._read_codex_tokens",
+            singleton_reader,
+        ):
+            result = _read_codex_access_token()
+
+        assert result is None
+        singleton_reader.assert_not_called()
+
     def test_missing_returns_none(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)

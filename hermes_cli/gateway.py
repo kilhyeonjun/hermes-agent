@@ -2622,7 +2622,11 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
-def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
+def _build_service_path_dirs(
+    project_root: Path | None = None,
+    *,
+    include_active_venv: bool = True,
+) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
         project_root = PROJECT_ROOT
@@ -2638,7 +2642,7 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     venv_bin = project_root / "venv" / "bin"
     if _is_dir(venv_bin):
         candidates.append(str(venv_bin))
-    elif sys.prefix != sys.base_prefix:
+    elif include_active_venv and sys.prefix != sys.base_prefix:
         candidates.append(str(Path(sys.prefix) / "bin"))
 
     node_bin = project_root / "node_modules" / ".bin"
@@ -3869,9 +3873,55 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _stable_launchd_project_root(project_root: Path | None = None) -> Path:
+    """Return the canonical checkout root when invoked from a Git worktree."""
+    root = project_root or PROJECT_ROOT
+    git_marker = root / ".git"
+    if not git_marker.is_file():
+        return root
+
+    try:
+        marker_text = git_marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return root
+    prefix = "gitdir:"
+    if not marker_text.lower().startswith(prefix):
+        return root
+
+    git_dir = Path(marker_text[len(prefix) :].strip())
+    if not git_dir.is_absolute():
+        git_dir = (root / git_dir).resolve()
+    for candidate in (git_dir, *git_dir.parents):
+        if candidate.name == ".git":
+            canonical_root = candidate.parent
+            if canonical_root.is_dir():
+                return canonical_root
+            break
+    return root
+
+
 def generate_launchd_plist() -> str:
-    python_path = get_python_path()
-    # Stable cwd anchor — never the volatile source checkout. See
+    service_project_root = _stable_launchd_project_root()
+    if service_project_root != PROJECT_ROOT:
+        plain_venv = service_project_root / "venv"
+        dot_venv = service_project_root / ".venv"
+        stable_venv = (
+            plain_venv
+            if plain_venv.is_dir() or not dot_venv.is_dir()
+            else dot_venv
+        )
+        venv_dir = str(stable_venv)
+        python_path = str(stable_venv / "bin" / "python")
+    else:
+        detected_venv = _detect_venv_dir()
+        venv_dir = (
+            str(detected_venv)
+            if detected_venv
+            else str(service_project_root / "venv")
+        )
+        python_path = get_python_path()
+
+    # Stable cwd anchor -- never the volatile source checkout. See
     # _stable_service_working_dir() for the rationale (same rot risk applies
     # to launchd's WorkingDirectory as to systemd's).
     working_dir = _stable_service_working_dir()
@@ -3880,32 +3930,34 @@ def generate_launchd_plist() -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
-    # Build a sane PATH for the launchd plist.  launchd provides only a
-    # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
-    # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
-    # the systemd unit), then capture the user's full shell PATH so every
-    # user-installed tool (node, ffmpeg, …) is reachable.
-    detected_venv = _detect_venv_dir()
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
-    # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
-    # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = _build_service_path_dirs()
-    resolved_node = shutil.which("node")
-    if resolved_node:
-        # Use the directory where ``node`` is *found on PATH*, NOT the symlink's
-        # resolved target. ``~/.local/bin/node`` is often a symlink into a
-        # specific profile's node install; calling .resolve() would chase it and
-        # bake one profile's path into every profile's service definition,
-        # breaking profile isolation and causing perpetual unit rewrites. See
-        # the matching fix in generate_systemd_unit().
-        resolved_node_dir = str(Path(resolved_node).parent)
-        if resolved_node_dir not in priority_dirs:
-            priority_dirs.append(resolved_node_dir)
-    sane_path = ":".join(
-        dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+
+    # launchd starts with a minimal environment, so provide a deterministic
+    # PATH instead of snapshotting the caller's shell. Inherited entries often
+    # contain versioned Homebrew Cellar paths or transient worktree/tool paths
+    # that become stale and make otherwise identical profile plists drift.
+    machine_home = _launchd_user_home()
+    priority_dirs = [str(Path(venv_dir) / "bin")]
+    priority_dirs.extend(
+        _build_service_path_dirs(
+            service_project_root,
+            include_active_venv=False,
         )
     )
+    priority_dirs.extend(
+        [
+            str(machine_home / ".local" / "bin"),
+            str(machine_home / ".orbstack" / "bin"),
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+    )
+    sane_path = ":".join(dict.fromkeys(priority_dirs))
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [

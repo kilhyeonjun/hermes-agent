@@ -1177,8 +1177,25 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - session-model, session-fast: Telegram session-local picker controls.
+#   - codex-route, codex-account: Mac-mini/profile-local routing controls.
+#   - version: lower-frequency info surface kept reachable through /hermes so
+#     the 50-slot cap is explicit.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits", "billing", "moa", "debug",
+    "session-model", "session-fast", "codex-route", "codex-account",
+    "version",
+})
 
+# Aliases of a curated command follow the same routing policy. Otherwise an
+# underscore alias (or /v for /version) could consume a native slot while the
+# canonical spelling is intentionally available only through /hermes.
+_SLACK_VIA_HERMES_ALIASES = frozenset(
+    alias
+    for cmd in COMMAND_REGISTRY
+    if cmd.name in _SLACK_VIA_HERMES_ONLY
+    for alias in cmd.aliases
+)
 
 def _sanitize_slack_name(raw: str) -> str:
     """Convert a command name to a valid Slack slash command name.
@@ -1227,7 +1244,10 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             return
         if slack_name in _SLACK_RESERVED_COMMANDS:
             return
-        if slack_name in _SLACK_VIA_HERMES_ONLY:
+        if (
+            slack_name in _SLACK_VIA_HERMES_ONLY
+            or slack_name in _SLACK_VIA_HERMES_ALIASES
+        ):
             # Intentionally Slack-via-/hermes only (see _SLACK_VIA_HERMES_ONLY).
             return
         if len(entries) >= _SLACK_MAX_SLASH_COMMANDS:

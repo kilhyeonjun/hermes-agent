@@ -124,11 +124,12 @@ When pointing Hermes at a self-hosted Honcho server, `hermes honcho setup` (and 
 | `dialecticMaxChars` | `600` | Max chars of dialectic result injected into system prompt |
 | `recallMode` | `'hybrid'` | `hybrid` (auto-inject + tools), `context` (inject only), `tools` (tools only) |
 | `writeFrequency` | `'async'` | When to flush messages: `async` (background thread), `turn` (sync), `session` (batch on end), or integer N |
-| `saveMessages` | `true` | Whether to persist messages to Honcho API |
+| `saveMessages` | `true` | Persist messages to Honcho API. When `false`, Honcho is fully inactive: no remote session, network calls, or Honcho tools; existing remote data is unchanged |
 | `observationMode` | `'directional'` | `directional` (all on) or `unified` (shared pool). Override with `observation` object for granular control |
 | `messageMaxChars` | `25000` | Max chars per message sent via `add_messages()`. Chunked if exceeded |
 | `dialecticMaxInputChars` | `10000` | Max chars for dialectic query input to `peer.chat()` |
 | `sessionStrategy` | `'per-directory'` | `per-directory`, `per-repo`, `per-session`, or `global` |
+| `sessionPeerPrefix` | `false` | Prefix generated session-ID/title/repo/directory keys; not gateway, manual-map, or global keys |
 | `pinUserPeer` | `false` | Gateway only. When `true`, every platform user collapses to `peerName` |
 | `userPeerAliases` | `{}` | Gateway only. Map of runtime IDs to peers (`{"7654321": "alice"}`). Many-to-one |
 | `runtimePeerPrefix` | `""` | Gateway only. Namespaces unknown runtime IDs (`telegram_7654321`) when no alias matches |
@@ -138,6 +139,17 @@ When pointing Hermes at a self-hosted Honcho server, `hermes honcho setup` (and 
 - `per-directory` — one Honcho session per working directory. Context accumulates across runs.
 - `per-repo` — one session per git repository.
 - `global` — single session across all directories.
+
+Gateway session keys have priority over all CLI resolution strategies. Named
+Hermes profiles rewrite a legacy `agent:main:*` key only at the Honcho boundary
+(`agent:gameduo:*`, for example), while the gateway's local database key stays
+unchanged. Default-like profiles preserve the legacy namespace, and an already
+namespaced gateway key is never rewritten.
+
+When Hermes loads an existing Honcho session, it imports messages only from the
+exact user and assistant peer IDs resolved for that session. Messages from
+foreign peers are skipped, and the warning contains only peer/session IDs —
+never message content.
 
 **Recall mode** controls how memory flows into conversations:
 - `hybrid` — context auto-injected into system prompt AND tools available (model decides when to query).

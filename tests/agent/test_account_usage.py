@@ -194,6 +194,195 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
     assert "ChatGPT-Account-Id" not in calls[0]["headers"]
 
 
+def test_fixed_pool_token_never_uses_opposite_singleton_account_id(
+    monkeypatch, codex_usage_payload
+):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_codex_runtime_credentials",
+        lambda **kwargs: {
+            "api_key": "fixed-pool-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "source": "credential_pool-fixed",
+        },
+    )
+    def read_tokens():
+        return {
+            "tokens": {
+                "access_token": "opposite-singleton-token",
+                "account_id": "opposite-singleton-account-id",
+            }
+        }
+
+    monkeypatch.setattr(account_usage, "_read_codex_tokens", read_tokens)
+
+    snapshot = account_usage.fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert calls[0]["headers"]["Authorization"] == "Bearer fixed-pool-token"
+    assert "ChatGPT-Account-Id" not in calls[0]["headers"]
+
+
+def test_fixed_route_ignores_stale_live_agent_usage_credentials(
+    monkeypatch, codex_usage_payload
+):
+    from hermes_cli import auth as auth_mod
+
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "fixed", "credential_id": "company-id"},
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_codex_runtime_credentials",
+        lambda **kwargs: {
+            "api_key": "fixed-company-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "source": "credential_pool-fixed",
+        },
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "_read_codex_tokens",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("opposite singleton account ID must not be read")
+        ),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://opposite.invalid/v1",
+        api_key="stale-personal-token",
+    )
+
+    assert snapshot is not None
+    assert calls[0]["url"] == "https://chatgpt.com/backend-api/wham/usage"
+    assert calls[0]["headers"]["Authorization"] == "Bearer fixed-company-token"
+    assert "ChatGPT-Account-Id" not in calls[0]["headers"]
+
+
+def test_invalid_route_policy_blocks_stale_live_agent_usage_credentials(
+    monkeypatch, codex_usage_payload
+):
+    from hermes_cli import auth as auth_mod
+
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "invalid"},
+    )
+    resolver_calls = []
+
+    def reject_invalid_policy(**kwargs):
+        resolver_calls.append(kwargs)
+        raise account_usage.AuthError(
+            "Codex route policy is invalid",
+            provider="openai-codex",
+            code="codex_route_policy_invalid",
+        )
+
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_codex_runtime_credentials",
+        reject_invalid_policy,
+    )
+    pool_calls = []
+    wrong_entry = SimpleNamespace(
+        runtime_api_key="wrong-pool-token",
+        runtime_base_url="https://opposite.invalid/v1",
+    )
+    wrong_pool = SimpleNamespace(select=lambda: wrong_entry)
+    import agent.credential_pool as credential_pool
+
+    monkeypatch.setattr(
+        credential_pool,
+        "load_pool",
+        lambda provider: pool_calls.append(provider) or wrong_pool,
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://opposite.invalid/v1",
+        api_key="stale-personal-token",
+    )
+
+    assert snapshot is None
+    assert resolver_calls == [{"refresh_if_expiring": True}]
+    assert pool_calls == []
+    assert calls == []
+
+
+def test_unavailable_fixed_route_never_falls_back_to_opposite_usage_pool(
+    monkeypatch, codex_usage_payload
+):
+    from hermes_cli import auth as auth_mod
+
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_load_codex_runtime_route_policy",
+        lambda: {"mode": "fixed", "credential_id": "company-id"},
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_codex_runtime_credentials",
+        lambda **kwargs: (_ for _ in ()).throw(
+            account_usage.AuthError(
+                "Fixed Codex route credential is unavailable",
+                provider="openai-codex",
+                code="codex_fixed_route_unavailable",
+            )
+        ),
+    )
+    pool_calls = []
+    wrong_entry = SimpleNamespace(
+        runtime_api_key="wrong-personal-token",
+        runtime_base_url="https://opposite.invalid/v1",
+    )
+    wrong_pool = SimpleNamespace(select=lambda: wrong_entry)
+    import agent.credential_pool as credential_pool
+
+    monkeypatch.setattr(
+        credential_pool,
+        "load_pool",
+        lambda provider: pool_calls.append(provider) or wrong_pool,
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://opposite.invalid/v1",
+        api_key="stale-personal-token",
+    )
+
+    assert snapshot is None
+    assert pool_calls == []
+    assert calls == []
+
+
 def test_codex_usage_treats_wham_used_percent_as_used_not_remaining(monkeypatch):
     """ChatGPT UI says "left"; /wham/usage.used_percent is already used."""
     payload = {
