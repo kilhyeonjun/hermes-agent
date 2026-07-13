@@ -212,6 +212,56 @@ def configure_cliproxy(
     return state_path
 
 
+def test_cliproxy_active_kind_uses_authoritative_management_priority(
+    monkeypatch, tmp_path
+):
+    module = load_module()
+    rows = cliproxy_rows()
+    rows[0]["priority"] = 100
+    rows[1]["priority"] = 0
+    api = FakeCLIProxyManagementAPI(rows, revision=7)
+    configure_cliproxy(monkeypatch, tmp_path, module, api)
+
+    assert module.cliproxy_active_kind() == "company"
+    assert [call["method"] for call in api.calls] == ["GET"]
+
+
+def test_cliproxy_active_kind_ignores_disabled_high_priority_row(
+    monkeypatch, tmp_path
+):
+    module = load_module()
+    rows = cliproxy_rows(company_disabled=True)
+    rows[0]["priority"] = 100
+    rows[1]["priority"] = 0
+    api = FakeCLIProxyManagementAPI(rows)
+    configure_cliproxy(monkeypatch, tmp_path, module, api)
+
+    assert module.cliproxy_active_kind() == "personal"
+
+
+def test_cliproxy_active_kind_fails_closed_on_ambiguous_priority(
+    monkeypatch, tmp_path
+):
+    module = load_module()
+    rows = cliproxy_rows()
+    rows[0]["priority"] = 100
+    rows[1]["priority"] = 100
+    api = FakeCLIProxyManagementAPI(rows)
+    configure_cliproxy(monkeypatch, tmp_path, module, api)
+
+    with pytest.raises(module.CLIProxyManagementError, match="unique active route"):
+        module.cliproxy_active_kind()
+
+
+def test_cliproxy_active_kind_requires_management_key(monkeypatch, tmp_path):
+    module = load_module()
+    api = FakeCLIProxyManagementAPI(cliproxy_rows())
+    configure_cliproxy(monkeypatch, tmp_path, module, api, key=None)
+
+    with pytest.raises(module.CLIProxyManagementError, match="management key missing"):
+        module.cliproxy_active_kind()
+
+
 def test_profile_home_controls_auth_and_state_paths(monkeypatch, tmp_path):
     profile_home = tmp_path / "profile"
     monkeypatch.setenv("HERMES_HOME", str(profile_home))

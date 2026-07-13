@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 import types
 
 import pytest
@@ -134,6 +135,359 @@ def test_canonical_row_label_never_echoes_unknown_account_metadata(
     assert secret_label not in label
 
 
+def test_current_label_distinguishes_affinity_from_active_fallback(tmp_path):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 0,
+                            "last_status": "exhausted",
+                            "last_status_at": time.time(),
+                            "last_error_code": 429,
+                        },
+                        {
+                            "id": "company-id",
+                            "label": "company-plus-100",
+                            "priority": 10,
+                            "last_status": "ok",
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert codex_route.current_label(auth) == (
+        "personal-first · fallback company eligible (personal exhausted)"
+    )
+
+
+def test_current_label_stays_compact_when_affinity_is_active(tmp_path):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "company-id",
+                            "label": "company-plus-100",
+                            "priority": 0,
+                            "last_status": "ok",
+                        },
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 10,
+                            "last_status": "ok",
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert codex_route.current_label(auth) == "company"
+
+
+def test_current_label_fixed_route_never_reports_an_auto_fallback(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 0,
+                            "last_status": "exhausted",
+                            "last_status_at": time.time(),
+                            "last_error_code": 429,
+                        },
+                        {
+                            "id": "company-id",
+                            "label": "company-plus-100",
+                            "priority": 10,
+                            "last_status": "ok",
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = {
+        "mode": "fixed",
+        "credential_id": "personal-id",
+        "label": "personal-backup",
+        "kind": "personal",
+    }
+    monkeypatch.setattr(codex_route, "profile_homes", lambda: [("default", tmp_path)])
+
+    assert codex_route.current_label(auth, policy) == (
+        "personal-fixed · no eligible route (personal exhausted)"
+    )
+    assert "fallback company" not in codex_route.render_status(policy)
+
+
+def test_current_label_treats_expired_exhaustion_as_eligible(tmp_path):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 0,
+                            "last_status": "exhausted",
+                            "last_status_at": time.time() - 7200,
+                            "last_error_code": 429,
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert codex_route.current_label(auth) == "personal"
+
+
+@pytest.mark.parametrize(
+    "health_fields",
+    [
+        {"last_error_reset_at": "2030-01-01T00:00:00+00:00"},
+        {"last_error_reset_at": 1_893_456_000_000},
+        {
+            "last_error_reset_at": "0",
+            "last_status_at": 1_800_000_000,
+            "last_error_code": 429,
+        },
+        {
+            "last_error_reset_at": "-1",
+            "last_status_at": 1_800_000_000,
+            "last_error_code": 429,
+        },
+        {
+            "last_error_reset_at": True,
+            "last_status_at": 1_800_000_000,
+            "last_error_code": 429,
+        },
+        {"last_status_at": 1_800_000_000, "last_error_code": 401},
+        {"last_status_at": "2027-01-15T08:00:00Z", "last_error_code": 429},
+        {"last_status_at": 1_800_000_000, "last_error_code": 402},
+        {},
+    ],
+)
+def test_route_status_exhaustion_window_matches_runtime_health_contract(
+    health_fields,
+):
+    from agent.credential_pool import PooledCredential, _exhausted_until
+    from hermes_cli import codex_route
+
+    row = {
+        "id": "personal-id",
+        "label": "personal-backup",
+        "priority": 0,
+        "last_status": "exhausted",
+        **health_fields,
+    }
+    runtime_entry = PooledCredential.from_dict("openai-codex", row)
+
+    assert codex_route._credential_exhausted_until(row) == _exhausted_until(
+        runtime_entry
+    )
+
+
+def test_current_label_fails_closed_without_leaking_malformed_state(tmp_path):
+    from hermes_cli import codex_route
+
+    secret_priority = "secret-priority-value"
+    secret_status = "secret-status-value"
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": secret_priority,
+                            "last_status": secret_status,
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    label = codex_route.current_label(auth)
+
+    assert label == "unknown · invalid credential state"
+    assert secret_priority not in label
+    assert secret_status not in label
+
+
+def test_current_label_never_echoes_an_unknown_health_status(tmp_path):
+    from hermes_cli import codex_route
+
+    secret_status = "secret-status-value"
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 0,
+                            "last_status": secret_status,
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    label = codex_route.current_label(auth)
+
+    assert label == "unknown · invalid credential state"
+    assert secret_status not in label
+
+
+def test_current_label_reports_no_route_when_all_rows_are_disabled(tmp_path):
+    from hermes_cli import codex_route
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "personal-id",
+                            "label": "personal-backup",
+                            "priority": 0,
+                            "last_status": "ok",
+                            "disabled": True,
+                        },
+                        {
+                            "id": "company-id",
+                            "label": "company-plus-100",
+                            "priority": 10,
+                            "last_status": "ok",
+                            "disabled": True,
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert codex_route.current_label(auth) == "unknown · invalid credential state"
+
+
+@pytest.mark.parametrize("fixed_match_count", [0, 2])
+def test_current_label_fixed_route_fails_closed_when_target_is_missing_or_duplicate(
+    tmp_path, fixed_match_count
+):
+    from hermes_cli import codex_route
+
+    rows = [
+        {
+            "id": "personal-id",
+            "label": "personal-backup",
+            "priority": index,
+            "last_status": "ok",
+        }
+        for index in range(fixed_match_count)
+    ]
+    rows.append(
+        {
+            "id": "company-id",
+            "label": "company-plus-100",
+            "priority": 10,
+            "last_status": "ok",
+        }
+    )
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps({"credential_pool": {"openai-codex": rows}}),
+        encoding="utf-8",
+    )
+    policy = {
+        "mode": "fixed",
+        "credential_id": "personal-id",
+        "label": "personal-backup",
+        "kind": "personal",
+    }
+
+    assert codex_route.current_label(auth, policy) == (
+        "personal-fixed · no eligible route (personal unavailable)"
+    )
+
+
+def test_cliproxy_current_account_delegates_to_authoritative_management_helper(
+    monkeypatch,
+):
+    from hermes_cli import codex_priority_sync, codex_route
+
+    monkeypatch.setattr(
+        codex_priority_sync,
+        "cliproxy_active_kind",
+        lambda: "company",
+        raising=False,
+    )
+
+    assert codex_route.cliproxy_current_account() == "company"
+
+
+def test_cliproxy_current_account_fails_closed_when_management_unavailable(
+    monkeypatch,
+):
+    from hermes_cli import codex_priority_sync, codex_route
+
+    def fail():
+        raise codex_priority_sync.CLIProxyManagementError("transport unavailable")
+
+    monkeypatch.setattr(
+        codex_priority_sync,
+        "cliproxy_active_kind",
+        fail,
+        raising=False,
+    )
+
+    assert (
+        codex_route.cliproxy_current_account()
+        == "unknown · management unavailable"
+    )
+
+
 def test_codex_route_status_works_without_external_control_script(monkeypatch, tmp_path, capsys):
     from hermes_cli import codex_route
 
@@ -141,7 +495,6 @@ def test_codex_route_status_works_without_external_control_script(monkeypatch, t
     monkeypatch.setattr(codex_route, "HERMES_HOME", hermes_home)
     monkeypatch.setattr(codex_route, "DEFAULT_AUTH", hermes_home / "auth.json")
     monkeypatch.setattr(codex_route, "POLICY_PATH", hermes_home / "state" / "codex_route_policy.json")
-    monkeypatch.setattr(codex_route, "CLIPROXY_AUTH_DIR", tmp_path / "missing-cliproxy")
     monkeypatch.setattr(codex_route, "NATIVE_CODEX_AUTH", tmp_path / "missing-codex" / "auth.json")
 
     result = codex_route.main(["status"])
