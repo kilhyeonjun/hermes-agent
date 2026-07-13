@@ -50,7 +50,11 @@ from hermes_cli.codex_usage import (
     load_history,
     DEFAULT_HISTORY,
 )  # noqa: E402
-from hermes_cli.codex_route_lock import atomic_write_bytes, route_lock  # noqa: E402
+from hermes_cli.codex_route_lock import (  # noqa: E402
+    assert_test_path_not_live,
+    atomic_write_bytes,
+    route_lock,
+)
 
 ROUTE_LOCK_TIMEOUT = 30
 ROUTE_LOCK_PATH = GLOBAL_HERMES_HOME / "state" / "codex_route.lock"
@@ -726,6 +730,7 @@ def collect_payload() -> dict[str, Any]:
 
 
 def load_route_policy() -> dict[str, Any]:
+    assert_test_path_not_live(ROUTE_POLICY_PATH)
     try:
         policy = json.loads(ROUTE_POLICY_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -794,8 +799,7 @@ def choose_profile_account(
         for row in payload.get("accounts") or []
         if isinstance(row, dict)
         and row.get("ok")
-        and row.get("available", True)
-        and str(row.get("last_status") or "ok") == "ok"
+        and str(row.get("last_status") or "ok") != "dead"
     ]
     kind_rows = [
         row
@@ -987,7 +991,7 @@ def _prepare_hermes(
                 )
             data = auth_store._load_auth_store(auth_file=HERMES_AUTH)
             pool, identities, priorities = _hermes_pool_state(data)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
         return _prepared_failure(
             stage,
             StageErrorCode.PREFLIGHT,
@@ -1314,6 +1318,7 @@ def _cliproxy_patch(
 
 
 def _unlink_cliproxy_sidecar() -> None:
+    assert_test_path_not_live(CLIPROXY_FIXED_ROUTE_STATE_PATH)
     try:
         CLIPROXY_FIXED_ROUTE_STATE_PATH.unlink()
     except FileNotFoundError:
@@ -1757,6 +1762,7 @@ def _activate_native(
             token=plan,
         )
     try:
+        assert_test_path_not_live(NATIVE_CODEX_ACCOUNT)
         proc = subprocess.run(
             [str(NATIVE_CODEX_ACCOUNT), "activate", target],
             text=True,
@@ -1764,7 +1770,7 @@ def _activate_native(
             timeout=30,
             shell=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         proc = None
     if proc is None or proc.returncode != 0:
         code = (
@@ -2117,7 +2123,7 @@ def main(argv: list[str] | None = None) -> int:
                     os.environ.pop("HERMES_CODEX_ROUTE_LOCK_HELD", None)
                 else:
                     os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] = prior_marker
-    except TimeoutError as exc:
+    except (TimeoutError, RuntimeError) as exc:
         print(f"Codex route sync skipped: {exc}")
         return 1
 
