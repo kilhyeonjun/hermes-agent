@@ -512,6 +512,29 @@ def _cliproxy_snapshot(
     return CLIProxySnapshot(tuple(rows), revision)
 
 
+def cliproxy_active_kind() -> str:
+    """Return the one authoritative enabled CLIProxy route kind.
+
+    CLIProxyAPI uses higher numeric priority first.  The management API is the
+    source of truth; local auth-file metadata can lag a revision-gated PATCH.
+    Ambiguous or unavailable state is an error rather than a disk fallback.
+    """
+    key = load_cliproxy_management_key()
+    if not key:
+        raise CLIProxyManagementError("management key missing")
+    snapshot = _cliproxy_snapshot(key, load_cliproxy_auth_ids())
+    enabled = [row for row in snapshot.rows if not row.state.disabled]
+    if not enabled:
+        raise CLIProxyManagementError("unique active route unavailable")
+    highest_priority = max(row.state.priority for row in enabled)
+    winners = [
+        row for row in enabled if row.state.priority == highest_priority
+    ]
+    if len(winners) != 1:
+        raise CLIProxyManagementError("unique active route unavailable")
+    return winners[0].kind
+
+
 def _snapshot_states(snapshot: CLIProxySnapshot) -> dict[str, CredentialState]:
     return {str(row.slot): row.state for row in snapshot.rows}
 

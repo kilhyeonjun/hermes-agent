@@ -19,7 +19,6 @@ HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
 DEFAULT_AUTH = HERMES_HOME / "auth.json"
 POLICY_PATH = HERMES_HOME / "state" / "codex_route_policy.json"
-CLIPROXY_AUTH_DIR = HOME / ".cli-proxy-api"
 NATIVE_CODEX_AUTH = HOME / ".codex" / "auth.json"
 PRIORITY_SYNC_MODULE = "hermes_cli.codex_priority_sync"
 PROFILE_SYNC_TIMEOUT = 180
@@ -378,44 +377,167 @@ def canonical_row_label(row: dict[str, Any]) -> str:
     return "unknown"
 
 
-def current_label(auth_path: Path) -> str:
-    rows = [row for row in credential_rows(auth_path) if (row.get("last_status") or "ok") == "ok"]
+def _credential_priority(row: dict[str, Any]) -> int | None:
+    priority = row.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        return None
+    return priority
+
+
+def _credential_row_is_valid(row: dict[str, Any]) -> bool:
+    if "disabled" in row:
+        return False
+    if _credential_priority(row) is None:
+        return False
+    status = row.get("last_status")
+    return status is None or (
+        isinstance(status, str) and status in {"ok", "dead", "exhausted"}
+    )
+
+
+def _safe_credential_status(row: dict[str, Any]) -> str:
+    raw_status = row.get("last_status")
+    if not isinstance(raw_status, str):
+        return "unavailable"
+    normalized = raw_status.strip().lower()
+    if normalized in {"exhausted", "dead", "cooldown", "error", "unavailable"}:
+        return normalized
+    return "unavailable"
+
+
+def _parse_route_timestamp(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric <= 0:
+            return None
+        return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+    else:
+        return None
+    return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+
+
+def _credential_exhausted_until(row: dict[str, Any]) -> float | None:
+    reset_at = _parse_route_timestamp(row.get("last_error_reset_at"))
+    if reset_at is not None:
+        return reset_at
+
+    last_status_at = row.get("last_status_at")
+    if isinstance(last_status_at, str):
+        last_status_at = _parse_route_timestamp(last_status_at)
+    elif isinstance(last_status_at, bool) or not isinstance(
+        last_status_at, (int, float)
+    ):
+        last_status_at = None
+    if not last_status_at:
+        return None
+
+    # Mirror agent.credential_pool: a 401 cools down for five minutes; 429
+    # and all other exhaustion reasons use one hour. Keeping this tiny local
+    # calculation avoids cold-importing the full agent runtime for status.
+    ttl_seconds = 5 * 60 if row.get("last_error_code") == 401 else 60 * 60
+    return float(last_status_at) + ttl_seconds
+
+
+def _credential_is_routable(row: dict[str, Any]) -> bool:
+    raw_status = row.get("last_status")
+    if raw_status is None or raw_status == "ok":
+        return True
+    if raw_status == "dead":
+        return False
+    if raw_status != "exhausted":
+        return False
+    exhausted_until = _credential_exhausted_until(row)
+    return exhausted_until is None or time.time() >= exhausted_until
+
+
+def current_label(
+    auth_path: Path, policy: dict[str, Any] | None = None
+) -> str:
+    rows = credential_rows(auth_path)
     if not rows:
         return "계정 없음"
-    row = min(rows, key=lambda item: int(item.get("priority") or 0))
-    return canonical_row_label(row)
 
+    if not all(_credential_row_is_valid(row) for row in rows):
+        return "unknown · invalid credential state"
+    priorities = [_credential_priority(row) for row in rows]
+    priority_by_identity = {
+        id(row): priority for row, priority in zip(rows, priorities, strict=True)
+    }
 
-def _cliproxy_kind(data: dict[str, Any]) -> str | None:
-    lower = " ".join(
-        str(data.get(key, "")) for key in ("label", "note")
-    ).lower()
-    if any(part in lower for part in ("gameduo", "company", "plus")):
-        return "company"
-    if any(part in lower for part in ("personal", "backup")):
-        return "personal"
-    return None
+    route_policy = policy or {"mode": "auto"}
+    mode = route_policy.get("mode")
+    if mode == "fixed":
+        credential_id = str(route_policy.get("credential_id") or "").strip()
+        if not credential_id:
+            return "unknown · invalid route policy"
+        matches = [
+            row for row in rows if str(row.get("id") or "").strip() == credential_id
+        ]
+        if len(matches) != 1:
+            policy_label = canonical_row_label(
+                {
+                    "id": credential_id,
+                    "label": route_policy.get("label"),
+                }
+            )
+            return (
+                f"{policy_label}-fixed · no eligible route "
+                f"({policy_label} unavailable)"
+            )
+        affinity_row = matches[0]
+        affinity = canonical_row_label(affinity_row)
+        if _credential_is_routable(affinity_row):
+            return affinity
+        return (
+            f"{affinity}-fixed · no eligible route "
+            f"({affinity} {_safe_credential_status(affinity_row)})"
+        )
+    if mode != "auto":
+        return "unknown · invalid route policy"
+
+    affinity_row = min(rows, key=lambda row: priority_by_identity[id(row)])
+    affinity = canonical_row_label(affinity_row)
+    if _credential_is_routable(affinity_row):
+        return affinity
+
+    fallback_rows = [row for row in rows if _credential_is_routable(row)]
+    if fallback_rows:
+        fallback_row = min(
+            fallback_rows, key=lambda row: priority_by_identity[id(row)]
+        )
+        fallback = canonical_row_label(fallback_row)
+        availability = f"fallback {fallback} eligible"
+    else:
+        availability = "no eligible route"
+    return (
+        f"{affinity}-first · {availability} "
+        f"({affinity} {_safe_credential_status(affinity_row)})"
+    )
 
 
 def cliproxy_current_account() -> str:
-    candidates: list[tuple[int, str]] = []
-    for path in sorted(CLIPROXY_AUTH_DIR.glob("codex-*.json")):
-        try:
-            data = load_json(path)
-        except Exception:
-            continue
-        kind = _cliproxy_kind(data)
-        if kind is None:
-            continue
-        raw_attrs = data.get("attributes")
-        attrs = raw_attrs if isinstance(raw_attrs, dict) else {}
-        raw_priority = attrs.get("priority", data.get("priority", 0))
-        try:
-            priority = int(raw_priority)
-        except (TypeError, ValueError):
-            priority = 0
-        candidates.append((priority, kind))
-    return canonical_label(max(candidates)[1]) if candidates else "계정 없음"
+    from hermes_cli.codex_priority_sync import (
+        CLIProxyManagementError,
+        cliproxy_active_kind,
+    )
+
+    try:
+        return canonical_label(cliproxy_active_kind())
+    except CLIProxyManagementError:
+        return "unknown · management unavailable"
 
 
 def native_codex_current_account() -> str:
@@ -442,7 +564,7 @@ def render_status(policy: dict[str, Any], sync_errors: list[str] | None = None) 
         mode_text = "자동 추천"
     lines = ["🎛 Codex 라우팅", f"모드: {mode_text}"]
     for name, home in profile_homes():
-        lines.append(f"• {name}: {current_label(home / 'auth.json')}")
+        lines.append(f"• {name}: {current_label(home / 'auth.json', policy)}")
     lines.append(f"• CLIProxy: {cliproxy_current_account()}")
     lines.append(f"• Native Codex CLI: {native_codex_current_account()}")
     if sync_errors:
