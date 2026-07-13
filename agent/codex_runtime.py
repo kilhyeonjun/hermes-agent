@@ -817,7 +817,13 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    cancel_event=None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -829,7 +835,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries = 1
+    # ``interruptible_api_call`` already owns retries and passes a request-local
+    # cancel Event. Do not nest a second stream attempt in that path: a retry
+    # can pass its Event check immediately before the watchdog sets Event and
+    # aborts the old socket, then open a new socket after the one-shot abort.
+    # Direct callers without a watchdog retain the historical single retry.
+    max_stream_retries = 0 if cancel_event is not None else 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
@@ -840,16 +851,26 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
 
+    def _request_cancelled() -> bool:
+        return bool(
+            agent._interrupt_requested
+            or (cancel_event is not None and cancel_event.is_set())
+        )
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
+        # Do not let an event from an aborted worker update the agent-global
+        # marker after the outer retry has already started.
+        if _request_cancelled():
+            raise InterruptedError("Codex request cancelled before stream event")
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:
-        return bool(agent._interrupt_requested)
+        return _request_cancelled()
 
     for attempt in range(max_stream_retries + 1):
-        if agent._interrupt_requested:
+        if _request_cancelled():
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         stream_kwargs = dict(api_kwargs)
@@ -858,6 +879,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            if _request_cancelled():
+                raise InterruptedError(
+                    "Codex request cancelled during stream connect"
+                ) from exc
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -868,6 +893,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise
 
         try:
+            if _request_cancelled():
+                raise InterruptedError("Codex request cancelled before stream consume")
             # Compatibility: some mocks/providers return a concrete response
             # instead of an iterable.  Pass it straight through.
             if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
@@ -884,6 +911,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_check,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if _request_cancelled():
+                    raise InterruptedError(
+                        "Codex request cancelled during stream iteration"
+                    ) from exc
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -893,6 +924,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     )
                     continue
                 raise
+
+            if _request_cancelled():
+                raise InterruptedError("Codex request cancelled after stream consume")
 
             if final.status in {"incomplete", "failed"}:
                 logger.warning(
