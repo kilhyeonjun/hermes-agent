@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -625,6 +626,166 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    def test_launchd_plist_current_ignores_xml_formatting_and_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Semantically equal plists must not look stale after plistlib rewrites."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        payload = {
+            "Label": "ai.hermes.gateway",
+            "ProgramArguments": ["/opt/hermes/python", "-m", "hermes_cli.main"],
+            "EnvironmentVariables": {
+                "PATH": "/installed/path",
+                "HERMES_HOME": "/Users/alice/.hermes",
+            },
+            "RunAtLoad": True,
+        }
+        plist_path.write_bytes(plistlib.dumps(payload, sort_keys=False))
+
+        expected_payload = {
+            **payload,
+            "EnvironmentVariables": {
+                **payload["EnvironmentVariables"],
+                "PATH": "/generated/path",
+            },
+        }
+        expected = plistlib.dumps(expected_payload, sort_keys=False).decode("utf-8")
+        expected = expected.replace("\t", "    ")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: expected)
+
+        assert gateway_cli.launchd_plist_is_current() is True
+
+    @pytest.mark.parametrize(
+        "installed_path",
+        [42, True],
+        ids=["integer", "boolean"],
+    )
+    def test_launchd_plist_current_rejects_non_string_path(
+        self, installed_path, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        installed = {
+            "Label": "ai.hermes.gateway",
+            "EnvironmentVariables": {"PATH": installed_path},
+        }
+        expected = {
+            "Label": "ai.hermes.gateway",
+            "EnvironmentVariables": {"PATH": "/generated/path"},
+        }
+        plist_path.write_bytes(plistlib.dumps(installed))
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda: plistlib.dumps(expected).decode("utf-8"),
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    @pytest.mark.parametrize(
+        "installed_run_at_load",
+        [1, 1.0],
+        ids=["integer", "real"],
+    )
+    def test_launchd_plist_current_preserves_non_path_value_types(
+        self, installed_run_at_load, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        installed = {
+            "Label": "ai.hermes.gateway",
+            "RunAtLoad": installed_run_at_load,
+            "EnvironmentVariables": {"PATH": "/installed/path"},
+        }
+        expected = {
+            **installed,
+            "RunAtLoad": True,
+            "EnvironmentVariables": {"PATH": "/generated/path"},
+        }
+        plist_path.write_bytes(plistlib.dumps(installed))
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda: plistlib.dumps(expected).decode("utf-8"),
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_launchd_plist_current_detects_semantic_change(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        payload = {
+            "Label": "ai.hermes.gateway",
+            "EnvironmentVariables": {"PATH": "/same/path"},
+        }
+        plist_path.write_bytes(plistlib.dumps(payload))
+        changed = {**payload, "Label": "ai.hermes.gateway-other"}
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda: plistlib.dumps(changed).decode("utf-8"),
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_launchd_plist_current_rejects_malformed_installed_file(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist>truncated", encoding="utf-8")
+        expected = plistlib.dumps({"Label": "ai.hermes.gateway"}).decode("utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: expected)
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_launchd_plist_current_rejects_invalid_utf8(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_bytes(b"\xff\xfe\x00not-a-plist")
+        expected = plistlib.dumps({"Label": "ai.hermes.gateway"}).decode("utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: expected)
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_launchd_plist_current_accepts_binary_plist(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        installed = {
+            "Label": "ai.hermes.gateway",
+            "EnvironmentVariables": {
+                "PATH": "/installed/path",
+                "HERMES_HOME": "/Users/alice/.hermes",
+            },
+        }
+        expected = {
+            **installed,
+            "EnvironmentVariables": {
+                **installed["EnvironmentVariables"],
+                "PATH": "/generated/path",
+            },
+        }
+        plist_path.write_bytes(plistlib.dumps(installed, fmt=plistlib.FMT_BINARY))
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda: plistlib.dumps(expected).decode("utf-8"),
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is True
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
