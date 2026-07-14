@@ -1515,7 +1515,7 @@ class GatewaySlashCommandsMixin:
         if adapter is None or not hasattr(adapter, "send_session_runtime_picker"):
             return (
                 "Telegram 세션 전용 모델 선택은 이 플랫폼에서 버튼으로 지원되지 않습니다.\n"
-                "`/model gpt-5.6-sol --session`\n`/reasoning high`"
+                "`/model gpt-5.6-sol --session`\n`/reasoning medium`"
             )
 
         picker_binding = self._picker_session_binding(source, session_key)

@@ -891,6 +891,9 @@ async def test_session_runtime_picker_sends_detailed_and_preset_buttons_in_the_s
     labels = {getattr(button, "text", "") for button in buttons}
     assert "🎛 모델 선택" in labels
     assert "🧠 추론 선택" in labels
+    assert "⚡ Luna · medium" in labels
+    assert "⚙️ Terra · medium" in labels
+    assert "🧠 Sol · medium" in labels
     assert {
         getattr(button, "callback_data", None)
         or getattr(button, "kwargs", {}).get("callback_data")
@@ -1338,7 +1341,7 @@ async def test_session_runtime_picker_callbacks_do_not_cross_chats_with_same_mes
 
     await adapter._handle_session_runtime_picker_callback(query, "sr:sol", "123")
 
-    first.assert_awaited_once_with("gpt-5.6-sol", "high")
+    first.assert_awaited_once_with("gpt-5.6-sol", "medium")
     second.assert_not_awaited()
     assert set(adapter._session_runtime_picker_state) == {("456", 780)}
 

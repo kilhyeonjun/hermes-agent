@@ -5075,9 +5075,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 InlineKeyboardButton("🎛 모델 선택", callback_data="sr:model"),
                 InlineKeyboardButton("🧠 추론 선택", callback_data="sr:effort"),
             ],
-            [InlineKeyboardButton("⚡ Luna · low", callback_data="sr:luna")],
+            [InlineKeyboardButton("⚡ Luna · medium", callback_data="sr:luna")],
             [InlineKeyboardButton("⚙️ Terra · medium", callback_data="sr:terra")],
-            [InlineKeyboardButton("🧠 Sol · high", callback_data="sr:sol")],
+            [InlineKeyboardButton("🧠 Sol · medium", callback_data="sr:sol")],
             [InlineKeyboardButton("🔬 Sol · xhigh", callback_data="sr:xhigh")],
             [InlineKeyboardButton("🚀 Sol · max", callback_data="sr:max")],
             [InlineKeyboardButton("↩︎ 프로필 기본값", callback_data="sr:reset")],
@@ -5222,9 +5222,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         preset_map = {
             "sr:model": ("", "model"),
-            "sr:luna": ("gpt-5.6-luna", "low"),
+            "sr:luna": ("gpt-5.6-luna", "medium"),
             "sr:terra": ("gpt-5.6-terra", "medium"),
-            "sr:sol": ("gpt-5.6-sol", "high"),
+            "sr:sol": ("gpt-5.6-sol", "medium"),
             "sr:xhigh": ("gpt-5.6-sol", "xhigh"),
             "sr:max": ("gpt-5.6-sol", "max"),
             "sr:reset": ("", "reset"),

@@ -67,6 +67,13 @@ async def test_session_model_picker_applies_model_and_effort_session_only(monkey
     event = _event()
     runner._handle_model_command = AsyncMock(return_value="model switched")
     runner._handle_reasoning_command = AsyncMock(return_value="effort switched")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "model": {"default": "gpt-5.6-terra"},
+            "agent": {"reasoning_effort": "medium"},
+        },
+    )
 
     sent = await runner._handle_session_model_command(event)
 
@@ -75,12 +82,12 @@ async def test_session_model_picker_applies_model_and_effort_session_only(monkey
     assert adapter.kwargs["current_model"] == "gpt-5.6-terra"
     assert adapter.kwargs["current_effort"] == "medium"
 
-    confirmation = await adapter.callback("gpt-5.6-sol", "high")
+    confirmation = await adapter.callback("gpt-5.6-sol", "medium")
 
     model_event = runner._handle_model_command.await_args.args[0]
     effort_event = runner._handle_reasoning_command.await_args.args[0]
     assert model_event.get_command_args() == "gpt-5.6-sol --session"
-    assert effort_event.get_command_args() == "high"
+    assert effort_event.get_command_args() == "medium"
     assert confirmation == "model switched\n\neffort switched"
 
 
@@ -218,7 +225,7 @@ async def test_session_preset_revalidates_between_model_and_reasoning_awaits():
     runner._handle_reasoning_command = AsyncMock(return_value="effort switched")
 
     await runner._handle_session_model_command(event)
-    confirmation = await adapter.callback("gpt-5.6-sol", "high")
+    confirmation = await adapter.callback("gpt-5.6-sol", "medium")
 
     assert isinstance(confirmation, PickerCallbackOutcome)
     assert confirmation.status == "expired"
