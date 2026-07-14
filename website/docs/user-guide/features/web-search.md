@@ -20,14 +20,14 @@ Both are configured through a single backend selection. Providers are chosen via
 |----------|---------|--------|---------|-----------|
 | **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ | 500 credits/mo |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — | ✔ Free (self-hosted) |
-| **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — | 2 000 queries/mo |
-| **DDGS (DuckDuckGo)** | — (no key) | ✔ | — | ✔ Free |
+| **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — | Monthly credit; see current pricing |
+| **DDGS metasearch** | — (no key) | ✔ | — | No direct API charge; no SLA |
 | **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
+| **Exa** | `EXA_API_KEY` | ✔ | ✔ | Free allowance; see current pricing |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | Paid |
 | **xAI (Grok)** | `XAI_API_KEY` or `hermes auth login xai-oauth` | ✔ | — | Paid (SuperGrok or per-token) |
 
-Brave Search, DDGS, and xAI are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) under the hood; if it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below).
+Brave Search, DDGS, and xAI are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) as a no-key metasearch client. It can query multiple upstream engines; it is not an official DuckDuckGo API and carries no availability or result-stability SLA. If it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below).
 
 **Per-capability split:** you can use different providers for search and extract independently — for example SearXNG (free) for search and Firecrawl for extract. See [Per-capability configuration](#per-capability-configuration) below.
 
@@ -361,6 +361,21 @@ web:
 ```
 
 When per-capability keys are empty, both fall through to `web.backend`. When `web.backend` is also empty, the backend is auto-detected from whichever API key/URL is present.
+
+### DDGS locale and engine options
+
+DDGS defaults to `us-en` and automatically chooses among upstream engines. Profiles that primarily search another locale can override those defaults:
+
+```yaml
+web:
+  search_backend: "ddgs"
+  ddgs:
+    region: "kr-kr"
+    backend: "auto"       # or a comma-separated ddgs engine list
+    timelimit: null        # d | w | m | y | null
+```
+
+Use `timelimit` only when every search in that profile should share the same freshness window. DDGS has no API key or direct per-query charge, but upstream engines can return zero results, rate-limit, or change behavior without notice. Keep it as a fallback for reliability-sensitive automation.
 
 **Priority order (per capability):**
 1. `web.search_backend` / `web.extract_backend` (explicit per-capability)
