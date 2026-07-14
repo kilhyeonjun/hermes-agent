@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import concurrent.futures as _cf
 import logging
+import threading
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
@@ -35,6 +36,9 @@ logger = logging.getLogger(__name__)
 # (#36776). Enforce a hard cap here via a worker thread.
 _SEARCH_TIMEOUT_SECS = 30
 _VALID_TIMELIMITS = {"d", "w", "m", "y"}
+# Timed-out HTTP calls cannot be cancelled. Bound orphaned workers so repeated
+# upstream hangs fail fast instead of growing threads without limit.
+_SEARCH_SLOTS = threading.BoundedSemaphore(2)
 
 
 def _load_ddgs_web_config() -> Dict[str, Any]:
@@ -104,6 +108,13 @@ def _run_ddgs_search(
     return results
 
 
+def _run_ddgs_search_guarded(query: str, safe_limit: int, **options: Any) -> list[dict[str, Any]]:
+    try:
+        return _run_ddgs_search(query, safe_limit, **options)
+    finally:
+        _SEARCH_SLOTS.release()
+
+
 class DDGSWebSearchProvider(WebSearchProvider):
     """No-key metasearch provider backed by the ``ddgs`` package.
 
@@ -166,8 +177,18 @@ class DDGSWebSearchProvider(WebSearchProvider):
         # behind that hung worker. A per-call pool isolates each search from a
         # previously-hung one.
         pool = _cf.ThreadPoolExecutor(max_workers=1)
+        if not _SEARCH_SLOTS.acquire(blocking=False):
+            pool.shutdown(wait=False, cancel_futures=True)
+            return {
+                "success": False,
+                "error": "DDGS search already in progress — upstream searches are saturated. Try again later.",
+            }
         try:
-            future = pool.submit(_run_ddgs_search, query, safe_limit, **options)
+            try:
+                future = pool.submit(_run_ddgs_search_guarded, query, safe_limit, **options)
+            except Exception:
+                _SEARCH_SLOTS.release()
+                raise
             try:
                 web_results = future.result(timeout=_SEARCH_TIMEOUT_SECS)
             except _cf.TimeoutError:

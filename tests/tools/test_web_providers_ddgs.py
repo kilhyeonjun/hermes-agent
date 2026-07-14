@@ -255,6 +255,23 @@ class TestDDGSProviderSearch:
         assert result["data"]["web"][0]["url"] == "https://e.com"
         assert result["data"]["web"][0]["title"] == "T"
 
+    def test_repeated_hangs_are_bounded_by_global_slots(self, monkeypatch):
+        import threading
+        _install_fake_ddgs(monkeypatch)
+        import plugins.web.ddgs.provider as provider
+
+        release = threading.Event()
+        monkeypatch.setattr(provider, "_SEARCH_SLOTS", threading.BoundedSemaphore(1))
+        monkeypatch.setattr(provider, "_SEARCH_TIMEOUT_SECS", 0.1)
+        monkeypatch.setattr(provider, "_run_ddgs_search", lambda *_a, **_k: release.wait(10) or [])
+        try:
+            first = provider.DDGSWebSearchProvider().search("hang-1", limit=1)
+            second = provider.DDGSWebSearchProvider().search("hang-2", limit=1)
+            assert first["success"] is False and "timed out" in first["error"].lower()
+            assert second["success"] is False and "already in progress" in second["error"].lower()
+        finally:
+            release.set()
+
 
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available / _get_backend / check_web_api_key
