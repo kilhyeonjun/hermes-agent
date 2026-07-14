@@ -31,6 +31,8 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
     fake = types.ModuleType("ddgs")
 
     class _FakeDDGS:
+        calls = []
+
         def __init__(self, **kwargs):
             # Accept timeout= (and any other constructor kwargs) — the provider
             # now passes DDGS(timeout=10).
@@ -39,7 +41,8 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
             return self
         def __exit__(self, *_a):
             return False
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
+            self.calls.append({"query": query, "max_results": max_results, **kwargs})
             if text_sleep is not None:
                 _time.sleep(text_sleep)
             if text_raises is not None:
@@ -107,6 +110,44 @@ class TestDDGSProviderSearch:
         assert len(web) == 3
         assert web[0] == {"title": "A", "url": "https://a.example.com", "description": "desc A", "position": 1}
         assert web[2]["position"] == 3
+
+    def test_passes_profile_configured_region_timelimit_and_backend(self, monkeypatch):
+        fake = _install_fake_ddgs(monkeypatch, text_results=[
+            {"title": "A", "href": "https://a.example.com", "body": "desc A"},
+        ])
+        import plugins.web.ddgs.provider as provider
+        monkeypatch.setattr(provider, "_load_ddgs_web_config", lambda: {
+            "region": "kr-kr",
+            "timelimit": "d",
+            "backend": "bing,duckduckgo",
+        })
+
+        result = provider.DDGSWebSearchProvider().search("한국 정책", limit=3)
+
+        assert result["success"] is True
+        assert fake.DDGS.calls[-1] == {
+            "query": "한국 정책",
+            "max_results": 3,
+            "region": "kr-kr",
+            "timelimit": "d",
+            "backend": "bing,duckduckgo",
+        }
+
+    def test_invalid_ddgs_config_falls_back_to_safe_defaults(self, monkeypatch):
+        fake = _install_fake_ddgs(monkeypatch, text_results=[])
+        import plugins.web.ddgs.provider as provider
+        monkeypatch.setattr(provider, "_load_ddgs_web_config", lambda: {
+            "region": "",
+            "timelimit": "century",
+            "backend": "",
+        })
+
+        result = provider.DDGSWebSearchProvider().search("q", limit=2)
+
+        assert result["success"] is True
+        assert fake.DDGS.calls[-1]["region"] == "us-en"
+        assert fake.DDGS.calls[-1]["timelimit"] is None
+        assert fake.DDGS.calls[-1]["backend"] == "auto"
 
     def test_accepts_url_key_as_fallback_for_href(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[
@@ -181,7 +222,7 @@ class TestDDGSProviderSearch:
 
         release = threading.Event()
 
-        def _blocking_search(query, safe_limit):
+        def _blocking_search(query, safe_limit, **_options):
             release.wait(timeout=10)  # bounded so the worker can never truly leak
             return []
 
