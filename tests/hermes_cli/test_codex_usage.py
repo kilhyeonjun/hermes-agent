@@ -1,15 +1,110 @@
+import io
+import json
+import urllib.error
+
 from hermes_cli.codex_usage import (
     annotate_usage_trends,
     apply_alert_policy,
+    collect,
     compute_recommendation,
     load_history,
     render_alert,
     render_compact,
     render_credential_insights,
+    render_text,
     save_history_snapshot,
     summarize_window,
     usage_bar,
 )
+
+
+def test_fetch_usage_retries_one_transient_failure(monkeypatch):
+    import hermes_cli.codex_usage as codex_usage
+
+    calls = []
+    sleeps = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"plan_type":"pro"}'
+
+    def urlopen(_request, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise urllib.error.URLError("temporary")
+        return Response()
+
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(codex_usage.time, "sleep", sleeps.append)
+
+    assert codex_usage.fetch_usage("token") == {"plan_type": "pro"}
+    assert calls == [30, 30]
+    assert sleeps == [0.5]
+
+
+def test_fetch_usage_does_not_retry_auth_failure(monkeypatch):
+    import pytest
+    import hermes_cli.codex_usage as codex_usage
+
+    calls = []
+    error = urllib.error.HTTPError(codex_usage.USAGE_URL, 401, "Unauthorized", {}, None)
+
+    def urlopen(_request, timeout):
+        calls.append(timeout)
+        raise error
+
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(urllib.error.HTTPError):
+        codex_usage.fetch_usage("token")
+    assert calls == [30]
+
+
+def test_display_label_never_echoes_unknown_account_metadata():
+    from hermes_cli.codex_usage import display_label
+
+    secret_label = "private-seat-owner@example.invalid"
+
+    assert display_label(secret_label) == "unknown"
+
+
+def test_usage_policy_missing_is_empty_but_corrupt_or_unknown_is_invalid(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    policy_path = tmp_path / "codex_route_policy.json"
+    monkeypatch.setattr(codex_usage, "ROUTE_POLICY_PATH", policy_path)
+    assert codex_usage.load_route_policy() == {}
+
+    policy_path.write_text('{"mode":', encoding="utf-8")
+    assert codex_usage.load_route_policy() == {
+        "mode": "invalid",
+        "error": "Codex route policy is invalid",
+    }
+
+    policy_path.write_text('{"mode":"surprise"}', encoding="utf-8")
+    assert codex_usage.load_route_policy() == {
+        "mode": "invalid",
+        "error": "Codex route policy is invalid",
+    }
+
+
+def test_codex_route_command_registered_with_telegram_alias():
+    from hermes_cli.commands import resolve_command
+
+    command = resolve_command("codex_route")
+
+    assert command is not None
+    assert command.name == "codex-route"
+    assert command.args_hint == "[status|auto|personal|company]"
+    assert command.gateway_only is True
 
 
 def test_risk_policy_supports_per_window_thresholds():
@@ -36,6 +131,284 @@ def test_risk_policy_supports_per_window_thresholds():
     assert [event["label"] for event in events] == ["personal-backup"]
     assert events[0]["window"] == "7d"
     assert events[0]["used"] == 86
+
+
+def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_cli.codex_usage.ROUTE_POLICY_PATH",
+        tmp_path / "missing-route-policy.json",
+    )
+
+    class Entry:
+        def __init__(self, label, priority):
+            self.id = f"id-{label}"
+            self.label = label
+            self.priority = priority
+            self.source = "manual"
+            self.last_status = None
+            self.last_error_reset_at = None
+            self.extra = {}
+            self.runtime_api_key = f"token-{label}"
+
+    entries = [Entry("personal-backup", 0), Entry("company-plus-100", 10)]
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, *, clear_expired=False, refresh=False):
+            return entries
+
+        def _routable_entries(self, values):
+            return values
+
+        def entries(self):
+            return entries
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(
+        "hermes_cli.codex_usage.fetch_usage",
+        lambda _token, account_id=None: {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 1},
+                "secondary_window": {"used_percent": 1, "reset_at": "2099-07-17T06:40:00+09:00"},
+            },
+        },
+    )
+
+    payload = collect()
+
+    assert payload["routing"] == {"strategy": "fill_first", "current_label": "personal-backup"}
+    assert [row["credential_id"] for row in payload["accounts"]] == [
+        "id-personal-backup",
+        "id-company-plus-100",
+    ]
+
+
+def test_collect_read_only_disables_pool_reconciliation_and_refresh(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    calls = {"read_only": None, "available": None}
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, *, clear_expired, refresh):
+            calls["available"] = (clear_expired, refresh)
+            return []
+
+        def _routable_entries(self, values):
+            return values
+
+        def entries(self):
+            return []
+
+    def _load_pool(_provider, *, read_only=False):
+        calls["read_only"] = read_only
+        return Pool()
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", _load_pool)
+    monkeypatch.setattr(
+        codex_usage,
+        "ROUTE_POLICY_PATH",
+        tmp_path / "missing-policy.json",
+    )
+
+    codex_usage.collect(mutate=False)
+
+    assert calls == {"read_only": True, "available": (False, False)}
+
+
+def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_path):
+    import json
+
+    import hermes_cli.codex_usage as codex_usage
+
+    class Entry:
+        id = "company-id"
+        label = "company-plus-100"
+        priority = 0
+        source = "manual"
+        last_status = None
+        last_error_reset_at = None
+        extra = {}
+        runtime_api_key = "test-token"
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, **_kwargs):
+            return [personal_entry, Entry()]
+
+        def _routable_entries(self, entries):
+            return [entry for entry in entries if entry.id == "company-id"]
+
+        def entries(self):
+            return [personal_entry, Entry()]
+
+    personal_entry = Entry()
+    personal_entry.id = "personal-id"
+    personal_entry.label = "personal-backup"
+    personal_entry.priority = -10
+
+    policy_path = tmp_path / "codex_route_policy.json"
+    policy_path.write_text(
+        json.dumps({
+            "mode": "fixed",
+            "credential_id": "company-id",
+            "label": "company-plus-100",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_usage, "ROUTE_POLICY_PATH", policy_path, raising=False)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(
+        codex_usage,
+        "fetch_usage",
+        lambda *_args, **_kwargs: {
+            "rate_limit": {
+                "primary_window": {"used_percent": 1},
+                "secondary_window": {"used_percent": 1},
+            },
+        },
+    )
+
+    payload = collect()
+
+    assert payload["routing"] == {
+        "strategy": "fill_first",
+        "current_label": "company-plus-100",
+        "mode": "fixed",
+        "fixed_credential_id": "company-id",
+        "fixed_label": "company",
+    }
+
+
+def test_collect_and_compact_redact_raw_label_and_http_error_body(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    private_label = "private-seat-owner@example.invalid"
+    private_body = '{"error":"private-owner@example.invalid token=secret"}'
+
+    class Entry:
+        id = "opaque-credential-id"
+        label = private_label
+        priority = 0
+        source = "manual"
+        last_status = None
+        last_error_reset_at = None
+        extra = {}
+        runtime_api_key = "opaque-runtime-token"
+
+    class Pool:
+        _strategy = "fill_first"
+
+        def _available_entries(self, **_kwargs):
+            return [Entry()]
+
+        def _routable_entries(self, entries):
+            return entries
+
+        def entries(self):
+            return [Entry()]
+
+    error = urllib.error.HTTPError(
+        codex_usage.USAGE_URL,
+        403,
+        "Forbidden",
+        {},
+        io.BytesIO(private_body.encode("utf-8")),
+    )
+    monkeypatch.setattr(
+        codex_usage,
+        "ROUTE_POLICY_PATH",
+        tmp_path / "missing-route-policy.json",
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(
+        codex_usage,
+        "fetch_usage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    payload = codex_usage.collect()
+    account = payload["accounts"][0]
+    compact = codex_usage.render_compact(payload)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert account["label"] == private_label
+    assert account["error"] == {"kind": "http_error", "status": 403}
+    assert private_label not in compact
+    assert private_body not in serialized + compact
+    assert "private-owner@example.invalid" not in serialized + compact
+
+
+def test_json_and_compact_output_boundaries_redact_legacy_raw_error_payload(
+    monkeypatch, capsys
+):
+    import hermes_cli.codex_usage as codex_usage
+
+    private_label = "private-seat-owner@example.invalid"
+    private_body = '{"error":"private-owner@example.invalid token=secret"}'
+    payload = {
+        "checked_at": "2026-07-13T09:00:00+09:00",
+        "provider": "openai-codex",
+        "routing": {"current_label": private_label},
+        "accounts": [
+            {
+                "credential_id": "opaque-credential-id",
+                "label": private_label,
+                "ok": False,
+                "http": 403,
+                "error": private_body,
+            }
+        ],
+        "recommendation": {"label": private_label, "reason": "safe reason"},
+    }
+
+    compact = codex_usage.render_compact(payload)
+    monkeypatch.setattr(codex_usage, "collect", lambda: payload)
+    monkeypatch.setattr(codex_usage, "load_history", lambda _path: [])
+    monkeypatch.setattr(codex_usage, "annotate_usage_trends", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_usage, "save_history_snapshot", lambda *_args, **_kwargs: None)
+
+    assert codex_usage.main(["--json"]) == 0
+    output = capsys.readouterr().out
+    public_payload = json.loads(output)
+
+    assert public_payload["accounts"][0]["label"] == "unknown"
+    assert public_payload["accounts"][0]["error"] == {
+        "kind": "http_error",
+        "status": 403,
+    }
+    assert private_label not in output + compact
+    assert private_body not in output + compact
+    assert "private-owner@example.invalid" not in output + compact
+
+
+def test_invalid_route_is_visible_and_cannot_show_an_opposite_current_account():
+    payload = {
+        "checked_at": "2026-07-10T08:30:00+09:00",
+        "routing": {
+            "strategy": "fill_first",
+            "current_label": "personal-backup",
+            "mode": "invalid",
+            "error": "Codex route policy is invalid",
+        },
+        "accounts": [],
+        "recommendation": {},
+    }
+
+    full = render_text(payload)
+    compact = render_compact(payload)
+
+    assert "Routing blocked: Codex route policy is invalid" in full
+    assert "Codex routing blocked" in compact
+    assert "personal" not in full + compact
 
 
 def test_recommendation_prefers_soonest_weekly_reset_then_usage_fallback():
@@ -84,6 +457,49 @@ def test_recommendation_prefers_unstarted_weekly_window_before_known_resets():
 
     assert rec is not None
     assert rec["label"] == "unstarted"
+
+
+def test_recommendation_treats_absent_weekly_window_as_unstarted():
+    accounts = [
+        {
+            "label": "company",
+            "ok": True,
+            "available": True,
+            "primary_window": {"used_percent": 37},
+            "secondary_window": None,
+        }
+    ]
+
+    rec = compute_recommendation(accounts)
+
+    assert rec is not None
+    assert rec["label"] == "company"
+
+
+def test_recommendation_preserves_zero_priority_as_highest_tie_break():
+    accounts = [
+        {
+            "label": "personal",
+            "ok": True,
+            "available": True,
+            "priority": 0,
+            "primary_window": {"used_percent": 37},
+            "secondary_window": None,
+        },
+        {
+            "label": "company",
+            "ok": True,
+            "available": True,
+            "priority": 10,
+            "primary_window": {"used_percent": 37},
+            "secondary_window": None,
+        },
+    ]
+
+    rec = compute_recommendation(accounts)
+
+    assert rec is not None
+    assert rec["label"] == "personal"
 
 
 def test_annotate_usage_trends_uses_recent_history_for_burn_and_eta():
@@ -332,15 +748,107 @@ def test_render_compact_includes_risk_and_recommendation():
     text = render_compact(payload)
 
     assert "🧭 Codex 사용량" in text
-    assert "✅ 추천 company-plus-100" in text
-    assert "사유:" in text
-    assert "personal-backup 7d 98%" in text
-    assert "⏱ 다음 회복: personal-backup 5h" in text
-    assert "🚦 위험 회복: personal-backup 7d" in text
-    assert "company-plus-100" in text
+    assert "✅ 추천 company" in text
+    assert "personal 7d 98% · 회복 전 보류" in text
+    assert "⏱ 다음 회복 · personal 5h" in text
+    assert "🚦 위험 회복 · personal 7d" in text
+    assert "company" in text
     assert "5h  1% 🟢" in text
     assert "7d 54% 🟢" in text
     assert "[" in text and "]" in text
+
+
+def test_render_compact_highlights_current_account_and_reduces_duplicate_detail():
+    payload = {
+        "checked_at": "2026-07-10T07:53:00+09:00",
+        "routing": {"strategy": "fill_first", "current_label": "personal-backup"},
+        "accounts": [
+            {
+                "label": "personal-backup",
+                "ok": True,
+                "plan_type": "pro",
+                "primary_window": {
+                    "used_percent": 27,
+                    "remaining": "3h 47m",
+                    "reset_at": "2026-07-10T11:40:00+09:00",
+                },
+                "secondary_window": {
+                    "used_percent": 4,
+                    "remaining": "6d 22h 47m",
+                    "reset_at": "2026-07-17T06:40:00+09:00",
+                },
+            },
+            {
+                "label": "company-plus-100",
+                "ok": True,
+                "plan_type": "prolite",
+                "primary_window": {
+                    "used_percent": 7,
+                    "remaining": "3h 53m",
+                    "reset_at": "2026-07-10T11:47:00+09:00",
+                },
+                "secondary_window": {
+                    "used_percent": 1,
+                    "remaining": "6d 22h 53m",
+                    "reset_at": "2026-07-17T06:47:00+09:00",
+                },
+            },
+        ],
+        "recommendation": {
+            "label": "personal-backup",
+            "reason": "7d reset 07/17 06:40 · 6d 22h 47m, 7d 4%, 5h 27%",
+        },
+    }
+
+    text = render_compact(payload)
+
+    assert "▶ 현재 personal · ✅ 추천과 일치" in text
+    assert "└ 7d 리셋이 가장 빠름 · 07/17 06:40 (6d 22h 47m)" in text
+    assert "⏱ 다음 회복 · personal 5h" in text
+    assert "└ 07/10 11:40 (3h 47m)" in text
+    assert "▶ personal · pro · 현재·추천" in text
+    assert "○ company · prolite" in text
+    assert "reset " not in text
+    assert text.count("7d 4%") == 0
+
+
+def test_render_compact_distinguishes_fixed_route_from_automatic_recommendation():
+    payload = {
+        "checked_at": "2026-07-10T08:30:00+09:00",
+        "routing": {
+            "strategy": "fill_first",
+            "current_label": "company-plus-100",
+            "mode": "fixed",
+            "fixed_credential_id": "company-id",
+            "fixed_label": "company-plus-100",
+        },
+        "accounts": [
+            {
+                "credential_id": "company-id",
+                "label": "company-plus-100",
+                "ok": True,
+                "plan_type": "prolite",
+                "primary_window": {"used_percent": 7, "remaining": "3h", "reset_at": "2026-07-10T11:47:00+09:00"},
+                "secondary_window": {"used_percent": 1, "remaining": "6d", "reset_at": "2026-07-17T06:47:00+09:00"},
+            },
+            {
+                "credential_id": "personal-id",
+                "label": "personal-backup",
+                "ok": True,
+                "plan_type": "pro",
+                "primary_window": {"used_percent": 50, "remaining": "3h", "reset_at": "2026-07-10T11:40:00+09:00"},
+                "secondary_window": {"used_percent": 8, "remaining": "6d", "reset_at": "2026-07-17T06:40:00+09:00"},
+            },
+        ],
+        "recommendation": {"label": "personal-backup", "policy": "7d-reset-aware"},
+    }
+
+    text = render_compact(payload)
+
+    assert "▶ 현재 company · 🔒 고정" in text
+    assert "💡 자동 추천 personal · 고정 모드라 미적용" in text
+    assert "▶ company · prolite · 현재·고정" in text
+    assert "★ personal · pro · 자동추천" in text
 
 
 def test_render_alert_uses_card_layout_with_bar_and_recommendation():
@@ -366,9 +874,35 @@ def test_render_alert_uses_card_layout_with_bar_and_recommendation():
     text = render_alert(payload, primary_threshold=95, secondary_threshold=85)
 
     assert "🚨 Codex 한도 주의" in text
-    assert "personal-backup · 7d 98%" in text
+    assert "personal · 7d 98%" in text
     assert "[██████████]" in text
-    assert "✅ 추천 company-plus-100" in text
+    assert "✅ 추천 company" in text
+    assert "personal-backup" not in text
+    assert "company-plus-100" not in text
+
+
+def test_render_text_uses_display_aliases_without_mutating_payload_labels():
+    payload = {
+        "checked_at": "2026-07-10T09:34:00+09:00",
+        "accounts": [
+            {
+                "label": "personal-backup",
+                "ok": True,
+                "plan_type": "pro",
+                "primary_window": {"used_percent": 100},
+                "secondary_window": {"used_percent": 16},
+            }
+        ],
+        "recommendation": {"label": "company-plus-100", "reason": "7d reset 우선"},
+    }
+
+    text = render_text(payload)
+
+    assert "추천: company" in text
+    assert "[personal]" in text
+    assert "personal-backup" not in text
+    assert "company-plus-100" not in text
+    assert payload["accounts"][0]["label"] == "personal-backup"
 
 
 def test_usage_bar_visualizes_percent_buckets():
@@ -401,11 +935,13 @@ def test_render_credential_insights_groups_rows_readably():
     text = render_credential_insights(rows, provider="openai-codex", days=30)
 
     assert "📊 Codex credential 사용량 · 30d" in text
-    assert "personal-backup" in text
+    assert "personal" in text
     assert "1.48M tokens · 10 calls" in text
     assert "avg 147.7k/call" in text
-    assert "company-plus-100" in text
+    assert "company" in text
     assert "200.0k tokens · 2 calls" in text
+    assert "personal-backup" not in text
+    assert "company-plus-100" not in text
 
 
 def test_render_credential_insights_shows_share_and_cache_breakdown():
