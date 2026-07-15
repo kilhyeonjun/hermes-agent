@@ -18,6 +18,54 @@ from hermes_cli.codex_usage import (
 )
 
 
+def test_fetch_usage_retries_one_transient_failure(monkeypatch):
+    import hermes_cli.codex_usage as codex_usage
+
+    calls = []
+    sleeps = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"plan_type":"pro"}'
+
+    def urlopen(_request, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise urllib.error.URLError("temporary")
+        return Response()
+
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(codex_usage.time, "sleep", sleeps.append)
+
+    assert codex_usage.fetch_usage("token") == {"plan_type": "pro"}
+    assert calls == [30, 30]
+    assert sleeps == [0.5]
+
+
+def test_fetch_usage_does_not_retry_auth_failure(monkeypatch):
+    import pytest
+    import hermes_cli.codex_usage as codex_usage
+
+    calls = []
+    error = urllib.error.HTTPError(codex_usage.USAGE_URL, 401, "Unauthorized", {}, None)
+
+    def urlopen(_request, timeout):
+        calls.append(timeout)
+        raise error
+
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(urllib.error.HTTPError):
+        codex_usage.fetch_usage("token")
+    assert calls == [30]
+
+
 def test_display_label_never_echoes_unknown_account_metadata():
     from hermes_cli.codex_usage import display_label
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections import deque
@@ -168,8 +169,18 @@ def fetch_usage(access_token: str, account_id: Optional[str] = None, timeout: in
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
     req = urllib.request.Request(USAGE_URL, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if attempt or exc.code not in {408, 425, 429, 500, 502, 503, 504}:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, UnicodeDecodeError):
+            if attempt:
+                raise
+        time.sleep(0.5)
+    raise RuntimeError("unreachable")
 
 
 def load_route_policy() -> Dict[str, Any]:
