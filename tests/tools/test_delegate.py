@@ -93,7 +93,7 @@ class TestDelegateRequirements(unittest.TestCase):
         mock_cfg.return_value = {
             "presets": {
                 "reviewer": {
-                    "description": "Deep independent review",
+                    "description": "Use gpt-secret-actual via provider-secret endpoint-secret",
                     "provider": "openai-codex",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "high",
@@ -117,7 +117,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertEqual(per_task["enum"], ["explorer", "reviewer"])
         self.assertNotIn("openai-codex", top_level["description"])
         self.assertNotIn("gpt-5.6-sol", top_level["description"])
-        self.assertIn("descriptions are operator-authored and model-facing", top_level["description"])
+        self.assertNotIn("gpt-secret-actual", top_level["description"])
+        self.assertNotIn("provider-secret", top_level["description"])
+        self.assertNotIn("endpoint-secret", top_level["description"])
+        self.assertIn("Only preset names are model-facing", top_level["description"])
         self.assertIn("Only operator-configured preset names", description)
 
     @patch("tools.delegate_tool._load_config", return_value={})
@@ -1160,6 +1163,7 @@ class TestDelegationPresetRouting(unittest.TestCase):
             "summary": "done",
             "api_calls": 1,
             "duration_seconds": 0.1,
+            "model": f"gpt-secret-actual-{task_index}",
         }
         parent = _make_mock_parent()
         parent._memory_manager = None
@@ -1175,12 +1179,75 @@ class TestDelegationPresetRouting(unittest.TestCase):
         )
 
         self.assertEqual(len(result["results"]), 2)
+        self.assertTrue(all("model" not in entry for entry in result["results"]))
         calls = mock_build.call_args_list
         self.assertEqual(calls[0].kwargs["model"], "gpt-5.6-luna")
         self.assertEqual(calls[0].kwargs["override_provider"], "openai-codex")
         self.assertEqual(calls[0].kwargs["reasoning_effort_override"], "low")
         self.assertEqual(calls[1].kwargs["model"], "gpt-5.6-sol")
         self.assertEqual(calls[1].kwargs["reasoning_effort_override"], "high")
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_async_raw_completion_redacts_preset_model(
+        self, mock_cfg, mock_resolve, mock_build, mock_run
+    ):
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "presets": {
+                "reviewer": {
+                    "provider": "openai-codex",
+                    "model": "gpt-secret-actual",
+                    "reasoning_effort": "high",
+                }
+            },
+        }
+        mock_resolve.return_value = {
+            "provider": "openai-codex",
+            "model": "gpt-secret-actual",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": None,
+        }
+        mock_build.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "gpt-secret-actual",
+        }
+        parent = _make_mock_parent()
+        parent._memory_manager = None
+        captured = {}
+
+        def capture_dispatch(**kwargs):
+            captured.update(kwargs)
+            return {"status": "dispatched", "delegation_id": "deleg-test"}
+
+        with (
+            patch("gateway.session_context.async_delivery_supported", return_value=True),
+            patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=capture_dispatch),
+        ):
+            dispatch_result = json.loads(
+                delegate_task(
+                    goal="Review",
+                    preset="reviewer",
+                    background=True,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(dispatch_result["status"], "dispatched")
+        self.assertIsNone(captured["model"])
+        raw_completion = captured["runner"]()
+        self.assertNotIn("model", raw_completion["results"][0])
+        self.assertNotIn("gpt-secret-actual", json.dumps(raw_completion))
 
     @patch("tools.delegate_tool._load_config")
     def test_unknown_preset_fails_before_child_construction(self, mock_cfg):
@@ -1198,19 +1265,31 @@ class TestDelegationPresetRouting(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     def test_invalid_effort_fails_before_child_construction(self, mock_cfg):
-        mock_cfg.return_value = {
-            "max_iterations": 50,
-            "presets": {
-                "broken": {"model": "gpt-5.6-sol", "reasoning_effort": "banana"}
-            },
-        }
         parent = _make_mock_parent()
-        with patch("tools.delegate_tool._build_child_agent") as mock_build:
-            result = json.loads(
-                delegate_task(goal="Review", preset="broken", parent_agent=parent)
-            )
-        self.assertIn("invalid reasoning_effort", result["error"])
-        mock_build.assert_not_called()
+        for invalid in ("banana", 0, [], "", None):
+            with self.subTest(invalid=invalid):
+                mock_cfg.return_value = {
+                    "max_iterations": 50,
+                    "presets": {
+                        "broken": {
+                            "model": "gpt-5.6-sol",
+                            "reasoning_effort": invalid,
+                        }
+                    },
+                }
+                with patch("tools.delegate_tool._build_child_agent") as mock_build:
+                    result = json.loads(
+                        delegate_task(goal="Review", preset="broken", parent_agent=parent)
+                    )
+                self.assertIn("invalid reasoning_effort", result["error"])
+                mock_build.assert_not_called()
+
+    def test_child_builder_preserves_existing_positional_parameter_order(self):
+        import inspect
+
+        params = list(inspect.signature(_build_child_agent).parameters)
+        self.assertLess(params.index("override_acp_command"), params.index("role"))
+        self.assertLess(params.index("role"), params.index("reasoning_effort_override"))
 
     def test_preset_provider_overrides_global_direct_endpoint(self):
         from tools.delegate_tool import _resolve_delegation_preset_config

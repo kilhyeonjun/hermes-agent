@@ -1056,7 +1056,6 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
-    reasoning_effort_override: Any = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1064,6 +1063,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    reasoning_effort_override: Any = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -2769,6 +2769,19 @@ def delegate_task(
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
+        # Preset internals are trusted operator config, not model-facing
+        # metadata. Strip the resolved model from both synchronous tool output
+        # and raw async completion payloads. Non-preset tasks retain the legacy
+        # observability field.
+        for entry in results:
+            task_index = entry.get("task_index")
+            if (
+                isinstance(task_index, int)
+                and 0 <= task_index < len(resolved_routes)
+                and resolved_routes[task_index][0] is not None
+            ):
+                entry.pop("model", None)
+
         return {
             "results": results,
             "total_duration_seconds": total_duration,
@@ -3204,23 +3217,14 @@ def _get_delegation_presets(cfg: Optional[dict] = None) -> Dict[str, dict]:
 
 def _build_preset_param_schema(presets: Dict[str, dict]) -> Dict[str, Any]:
     names = list(presets)
-    details = []
-    for name, preset in presets.items():
-        description = preset.get("description")
-        if isinstance(description, str) and description.strip():
-            compact = " ".join(description.split())[:200]
-            details.append(f"{name}: {compact}")
-        else:
-            details.append(name)
-    suffix = f" Available presets: {'; '.join(details)}."
+    suffix = f" Available presets: {', '.join(names)}."
     return {
         "type": "string",
         "enum": names,
         "description": (
             "Operator-configured execution preset. It selects trusted model "
             "and reasoning settings without exposing those settings to the model. "
-            "Preset descriptions are operator-authored and model-facing; they "
-            f"must not contain secrets.{suffix}"
+            f"Only preset names are model-facing.{suffix}"
         ),
     }
 
@@ -3247,7 +3251,7 @@ def _resolve_delegation_preset_config(cfg: dict, preset_name: Optional[str]) -> 
             f"Delegation preset '{preset_name}' has unsupported key(s): {names}."
         )
     preset_effort = preset.get("reasoning_effort")
-    if preset_effort or preset_effort is False:
+    if "reasoning_effort" in preset:
         from hermes_constants import parse_reasoning_effort
         if parse_reasoning_effort(preset_effort) is None:
             raise ValueError(
