@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import json
 import logging
@@ -1079,6 +1080,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    reasoning_effort_override: Any = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1302,7 +1304,11 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            delegation_cfg.get("reasoning_effort")
+            if reasoning_effort_override is None
+            else reasoning_effort_override
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -2431,6 +2437,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    *,
+    preset: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2503,16 +2511,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2532,7 +2530,7 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{"goal": goal, "context": context, "role": top_role, "preset": preset}]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2547,6 +2545,24 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve every unique operator preset before constructing any child.
+    route_cache: Dict[Optional[str], tuple] = {}
+    resolved_routes: List[tuple] = []
+    for task in task_list:
+        preset_name = task.get("preset") or preset
+        cache_key = str(preset_name).strip() if preset_name else None
+        try:
+            if cache_key not in route_cache:
+                task_cfg = _resolve_delegation_preset_config(cfg, cache_key)
+                route_cache[cache_key] = (
+                    task_cfg,
+                    _resolve_delegation_credentials(task_cfg, parent_agent),
+                )
+            task_cfg, task_creds = route_cache[cache_key]
+        except ValueError as exc:
+            return tool_error(str(exc))
+        resolved_routes.append((cache_key, task_cfg, task_creds))
 
     overall_start = time.monotonic()
     results = []
@@ -2586,6 +2602,7 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            preset_name, task_cfg, task_creds = resolved_routes[i]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2593,18 +2610,19 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                reasoning_effort_override=task_cfg.get("reasoning_effort"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -2999,6 +3017,18 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        _preset_names = [pn for pn, _, _ in resolved_routes]
+        _unique_presets = set(_preset_names)
+        if _unique_presets == {None}:
+            # Preserve legacy metadata when no preset is selected. Global
+            # delegation.model may still be configured and used by every child.
+            _metadata_model = resolved_routes[0][2].get("model")
+        elif len(_unique_presets) == 1:
+            # Do not overload the async `model` metadata field with a preset
+            # name, and do not reveal the resolved model back to the parent.
+            _metadata_model = None
+        else:
+            _metadata_model = "mixed"
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3006,7 +3036,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_metadata_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
@@ -3325,6 +3355,85 @@ def _load_config() -> dict:
         return {}
 
 
+def _get_delegation_presets(cfg: Optional[dict] = None) -> Dict[str, dict]:
+    """Return valid operator-configured delegation presets, sorted by name."""
+    source = cfg if isinstance(cfg, dict) else _load_config()
+    raw = source.get("presets")
+    if not isinstance(raw, dict):
+        return {}
+    presets: Dict[str, dict] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(value, dict):
+            continue
+        presets[name.strip()] = value
+    return dict(sorted(presets.items()))
+
+
+def _build_preset_param_schema(presets: Dict[str, dict]) -> Dict[str, Any]:
+    names = list(presets)
+    details = []
+    for name, preset in presets.items():
+        description = preset.get("description")
+        if isinstance(description, str) and description.strip():
+            compact = " ".join(description.split())[:200]
+            details.append(f"{name}: {compact}")
+        else:
+            details.append(name)
+    suffix = f" Available presets: {'; '.join(details)}."
+    return {
+        "type": "string",
+        "enum": names,
+        "description": (
+            "Operator-configured execution preset. It selects trusted model "
+            "and reasoning settings without exposing those settings to the model. "
+            "Preset descriptions are operator-authored and model-facing; they "
+            f"must not contain secrets.{suffix}"
+        ),
+    }
+
+
+_PRESET_OVERRIDE_KEYS = frozenset({"model", "provider", "reasoning_effort"})
+
+
+def _resolve_delegation_preset_config(cfg: dict, preset_name: Optional[str]) -> dict:
+    """Merge one trusted preset onto the global delegation config."""
+    base = {key: value for key, value in cfg.items() if key != "presets"}
+    if not preset_name:
+        return base
+    presets = _get_delegation_presets(cfg)
+    preset = presets.get(str(preset_name).strip())
+    if preset is None:
+        available = ", ".join(presets) or "none configured"
+        raise ValueError(
+            f"Unknown delegation preset '{preset_name}'. Available presets: {available}."
+        )
+    unsupported = set(preset) - _PRESET_OVERRIDE_KEYS - {"description"}
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise ValueError(
+            f"Delegation preset '{preset_name}' has unsupported key(s): {names}."
+        )
+    preset_effort = preset.get("reasoning_effort")
+    if preset_effort or preset_effort is False:
+        from hermes_constants import parse_reasoning_effort
+        if parse_reasoning_effort(preset_effort) is None:
+            raise ValueError(
+                f"Delegation preset '{preset_name}' has invalid reasoning_effort "
+                f"'{preset_effort}'."
+            )
+    for key in _PRESET_OVERRIDE_KEYS:
+        if key in preset:
+            base[key] = preset[key]
+    if "provider" in preset and str(preset.get("provider") or "").strip():
+        # A trusted preset provider is an explicit route selection. Global
+        # direct-endpoint settings otherwise take precedence inside
+        # _resolve_delegation_credentials() and would silently defeat it.
+        base["base_url"] = ""
+        base["api_key"] = ""
+        base["api_mode"] = ""
+    return base
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
@@ -3372,6 +3481,19 @@ def _build_top_level_description() -> str:
             f"(max_spawn_depth={max_depth}): every child is a leaf and "
             f"cannot delegate further. Raise delegation.max_spawn_depth in "
             f"config.yaml to enable nesting."
+        )
+
+    if _get_delegation_presets():
+        model_routing_clause = (
+            "- Raw subagent model/provider/reasoning values are NOT selectable "
+            "per call. Only operator-configured preset names may be selected; "
+            "omit preset to inherit the global delegation route and then the parent.\n"
+        )
+    else:
+        model_routing_clause = (
+            "- Subagent model is NOT selectable per call: children inherit the "
+            "parent model (plus its fallback chain) unless all subagents are "
+            "pinned via delegation.provider / delegation.model in config.yaml.\n"
         )
 
     return (
@@ -3434,7 +3556,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        f"{model_routing_clause}"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3498,15 +3620,17 @@ def _build_dynamic_schema_overrides() -> dict:
     get_definitions() pass rewrites the description fields to the user's
     actual limits.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
+    overrides_params: Dict[str, Any] = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+
+    presets = _get_delegation_presets()
+    if presets:
+        preset_schema = _build_preset_param_schema(presets)
+        overrides_params["properties"]["preset"] = preset_schema
+        overrides_params["properties"]["tasks"]["items"]["properties"]["preset"] = copy.deepcopy(
+            preset_schema
+        )
 
     return {
         "description": _build_top_level_description(),
@@ -3647,6 +3771,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        preset=args.get("preset"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

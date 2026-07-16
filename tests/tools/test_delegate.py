@@ -88,6 +88,48 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    @patch("tools.delegate_tool._load_config")
+    def test_schema_exposes_only_configured_preset_names(self, mock_cfg):
+        mock_cfg.return_value = {
+            "presets": {
+                "reviewer": {
+                    "description": "Deep independent review",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+                "explorer": {
+                    "description": "Fast source exploration",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "low",
+                },
+            }
+        }
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        params = _build_dynamic_schema_overrides()["parameters"]
+        description = _build_dynamic_schema_overrides()["description"]
+        top_level = params["properties"]["preset"]
+        per_task = params["properties"]["tasks"]["items"]["properties"]["preset"]
+
+        self.assertEqual(top_level["enum"], ["explorer", "reviewer"])
+        self.assertEqual(per_task["enum"], ["explorer", "reviewer"])
+        self.assertNotIn("openai-codex", top_level["description"])
+        self.assertNotIn("gpt-5.6-sol", top_level["description"])
+        self.assertIn("descriptions are operator-authored and model-facing", top_level["description"])
+        self.assertIn("Only operator-configured preset names", description)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_schema_omits_preset_when_unconfigured(self, _mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        params = _build_dynamic_schema_overrides()["parameters"]
+        self.assertNotIn("preset", params["properties"])
+        self.assertNotIn(
+            "preset", params["properties"]["tasks"]["items"]["properties"]
+        )
+
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
         not the framework defaults. Without this, models that read 'default 3'
@@ -1165,6 +1207,165 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
+
+
+class TestDelegationPresetRouting(unittest.TestCase):
+    """Operator presets route children without exposing raw routing values."""
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_mixed_batch_routes_model_provider_and_effort(
+        self, mock_cfg, mock_resolve, mock_build, mock_run
+    ):
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "presets": {
+                "explorer": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "low",
+                },
+                "reviewer": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            },
+        }
+
+        def resolved(cfg, _parent):
+            return {
+                "provider": cfg.get("provider"),
+                "model": cfg.get("model"),
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+                "command": None,
+                "args": None,
+            }
+
+        mock_resolve.side_effect = resolved
+        mock_build.side_effect = [MagicMock(), MagicMock()]
+        mock_run.side_effect = lambda task_index, **_: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+        }
+        parent = _make_mock_parent()
+        parent._memory_manager = None
+
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "Explore", "preset": "explorer"},
+                    {"goal": "Review", "preset": "reviewer"},
+                ],
+                parent_agent=parent,
+            )
+        )
+
+        self.assertEqual(len(result["results"]), 2)
+        calls = mock_build.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(calls[0].kwargs["override_provider"], "openai-codex")
+        self.assertEqual(calls[0].kwargs["reasoning_effort_override"], "low")
+        self.assertEqual(calls[1].kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(calls[1].kwargs["reasoning_effort_override"], "high")
+
+    @patch("tools.delegate_tool._load_config")
+    def test_unknown_preset_fails_before_child_construction(self, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "presets": {"reviewer": {"model": "gpt-5.6-sol"}},
+        }
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._build_child_agent") as mock_build:
+            result = json.loads(
+                delegate_task(goal="Review", preset="typo", parent_agent=parent)
+            )
+        self.assertIn("Unknown delegation preset", result["error"])
+        mock_build.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config")
+    def test_invalid_effort_fails_before_child_construction(self, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "presets": {
+                "broken": {"model": "gpt-5.6-sol", "reasoning_effort": "banana"}
+            },
+        }
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._build_child_agent") as mock_build:
+            result = json.loads(
+                delegate_task(goal="Review", preset="broken", parent_agent=parent)
+            )
+        self.assertIn("invalid reasoning_effort", result["error"])
+        mock_build.assert_not_called()
+
+    def test_preset_provider_overrides_global_direct_endpoint(self):
+        from tools.delegate_tool import _resolve_delegation_preset_config
+
+        cfg = {
+            "provider": "custom",
+            "model": "old-model",
+            "base_url": "http://localhost:9999/v1",
+            "api_key": "local-key",
+            "api_mode": "chat_completions",
+            "presets": {
+                "reviewer": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                }
+            },
+        }
+
+        resolved = _resolve_delegation_preset_config(cfg, "reviewer")
+
+        self.assertEqual(resolved["provider"], "openai-codex")
+        self.assertEqual(resolved["model"], "gpt-5.6-sol")
+        self.assertEqual(resolved["base_url"], "")
+        self.assertEqual(resolved["api_key"], "")
+        self.assertEqual(resolved["api_mode"], "")
+
+
+def test_preset_config_propagates_from_real_yaml(tmp_path, monkeypatch):
+    """Exercise config.yaml -> loader -> schema/resolver without config mocks."""
+    (tmp_path / "config.yaml").write_text(
+        """\
+delegation:
+  presets:
+    explorer:
+      description: Fast source exploration
+      provider: openai-codex
+      model: gpt-5.6-luna
+      reasoning_effort: low
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from hermes_cli import config as config_module
+    from tools.delegate_tool import (
+        _build_dynamic_schema_overrides,
+        _resolve_delegation_preset_config,
+    )
+
+    config_module._LOAD_CONFIG_CACHE.clear()
+    try:
+        schema = _build_dynamic_schema_overrides()["parameters"]
+        resolved = _resolve_delegation_preset_config(_load_config(), "explorer")
+    finally:
+        config_module._LOAD_CONFIG_CACHE.clear()
+
+    assert schema["properties"]["preset"]["enum"] == ["explorer"]
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["model"] == "gpt-5.6-luna"
+    assert resolved["reasoning_effort"] == "low"
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
