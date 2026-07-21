@@ -943,8 +943,16 @@ CREATE INDEX IF NOT EXISTS idx_credential_usage_time_provider
 """
 
 FTS_SQL = """
+CREATE VIEW IF NOT EXISTS message_search_content AS
+SELECT
+    id,
+    COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') AS content
+FROM messages;
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content
+    content,
+    content='message_search_content',
+    content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
@@ -955,11 +963,19 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -974,6 +990,8 @@ END;
 FTS_TRIGRAM_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
+    content='message_search_content',
+    content_rowid='id',
     tokenize='trigram'
 );
 
@@ -985,11 +1003,19 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON message
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -1219,25 +1245,11 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         if not include_trigram:
             return
-        cursor.execute("DELETE FROM messages_fts_trigram")
         cursor.execute(
-            "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
+            "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild')"
         )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
@@ -1701,6 +1713,7 @@ class SessionDB:
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
+        fts_storage_migrated = False
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
@@ -1753,7 +1766,7 @@ class SessionDB:
                         fts_migrations_complete = False
                 else:
                     fts_migrations_complete = False
-            if current_version < 11:
+            if current_version < 11 and SCHEMA_VERSION == 11:
                 # v11: re-index FTS5 tables to cover tool_name + tool_calls and
                 # switch from external-content to inline mode. Existing DBs have
                 # old-schema FTS tables and triggers that IF NOT EXISTS won't
@@ -1808,6 +1821,47 @@ class SessionDB:
                         if not base_fts_ok:
                             fts_migrations_complete = False
                         # Track trigram availability for CJK LIKE fallback.
+                        self._trigram_available = trigram_ok
+                    else:
+                        fts_migrations_complete = False
+                else:
+                    fts_migrations_complete = False
+            if current_version < 22:
+                # v22: keep canonical message/tool text only in ``messages``.
+                # External-content FTS stores the inverted indexes without a
+                # second copy of each indexed value. The computed content view
+                # keeps ranking, snippets, and rebuilds on the same concatenated
+                # content + tool_name + tool_calls text as the old inline index.
+                if fts5_available:
+                    self._drop_fts_triggers(cursor)
+                    for _tbl in ("messages_fts", "messages_fts_trigram"):
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
+                        except sqlite3.OperationalError as exc:
+                            if not self._is_fts5_unavailable_error(exc):
+                                raise
+                            if self._is_trigram_unavailable_error(exc):
+                                self._warn_trigram_unavailable(exc)
+                            else:
+                                self._warn_fts5_unavailable(exc)
+                                fts5_available = False
+                                fts_migrations_complete = False
+                            break
+
+                    if fts5_available:
+                        base_fts_ok = self._ensure_fts_schema(
+                            cursor, "messages_fts", FTS_SQL
+                        )
+                        trigram_ok = self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        )
+                        if base_fts_ok:
+                            self._rebuild_fts_indexes(
+                                cursor, include_trigram=trigram_ok
+                            )
+                            fts_storage_migrated = True
+                        else:
+                            fts_migrations_complete = False
                         self._trigram_available = trigram_ok
                     else:
                         fts_migrations_complete = False
@@ -2026,6 +2080,14 @@ class SessionDB:
                     )
 
         self._conn.commit()
+        if fts_storage_migrated:
+            # DROP releases pages for reuse but does not return them to the OS.
+            # Reclaim the removed inline text now; failure is non-fatal because
+            # the external indexes and schema-version update are already durable.
+            try:
+                self.vacuum()
+            except Exception as exc:
+                logger.warning("v22 FTS storage VACUUM skipped: %s", exc)
 
     # =========================================================================
     # Session lifecycle
@@ -5701,7 +5763,7 @@ class SessionDB:
                 m.id,
                 m.session_id,
                 m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
+                snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
                 m.content,
                 m.timestamp,
                 m.tool_name,
@@ -5773,7 +5835,7 @@ class SessionDB:
                         m.id,
                         m.session_id,
                         m.role,
-                        snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
+                        snippet(messages_fts_trigram, -1, '>>>', '<<<', '...', 40) AS snippet,
                         m.content,
                         m.timestamp,
                         m.tool_name,

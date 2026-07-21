@@ -5555,6 +5555,109 @@ class TestFTS5ToolCallMigration:
             session_db.close()
 
 
+class TestFTS5ExternalContentMigration:
+    """v22 stores only FTS indexes; canonical text stays in messages."""
+
+    @staticmethod
+    def _downgrade_to_v21_inline(db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            DROP TRIGGER IF EXISTS messages_fts_insert;
+            DROP TRIGGER IF EXISTS messages_fts_delete;
+            DROP TRIGGER IF EXISTS messages_fts_update;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS messages_fts_trigram;
+            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
+            INSERT INTO messages_fts(rowid, content)
+                SELECT id, COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '')
+                FROM messages;
+            INSERT INTO messages_fts_trigram(rowid, content)
+                SELECT id, COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '')
+                FROM messages;
+            UPDATE schema_version SET version = 21;
+        """)
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _fts_schema(conn, table):
+        return conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()[0]
+
+    def test_fresh_db_uses_messages_as_external_content(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            for table in ("messages_fts", "messages_fts_trigram"):
+                schema = self._fts_schema(db._conn, table)
+                assert "content='message_search_content'" in schema
+                shadow = db._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = ?",
+                    (f"{table}_content",),
+                ).fetchone()
+                assert shadow is None
+        finally:
+            db.close()
+
+    def test_v21_inline_migration_preserves_search_and_index_maintenance(self, tmp_path):
+        db_path = tmp_path / "legacy-inline.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.create_session("s1", "cli")
+        seeded.append_message("s1", role="user", content="before context")
+        seeded.append_message(
+            "s1", role="assistant",
+            content="alpha beta alpha beta 大别山项目",
+            tool_name="UNIQUE_TOOL_NAME",
+            tool_calls=[{"function": {"name": "web_search", "arguments": "UNIQUE_TOOL_ARG"}}],
+        )
+        seeded.append_message("s1", role="user", content="after context")
+        seeded.append_message("s1", role="assistant", content="alpha beta")
+        seeded.close()
+        self._downgrade_to_v21_inline(db_path)
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            assert migrated._conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+            assert "content='message_search_content'" in self._fts_schema(
+                migrated._conn, "messages_fts"
+            )
+            assert migrated._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+
+            english = migrated.search_messages("alpha AND beta")
+            assert [row["id"] for row in english][:2] == [4, 2]
+            rich = next(row for row in english if row["id"] == 2)
+            assert ">>>alpha<<<" in rich["snippet"]
+            assert [item["content"] for item in rich["context"]] == [
+                "before context", "alpha beta alpha beta 大别山项目", "after context",
+            ]
+
+            tool = migrated.search_messages("UNIQUE_TOOL_ARG")
+            assert len(tool) == 1
+            assert ">>>UNIQUE_TOOL_ARG<<<" in tool[0]["snippet"]
+
+            cjk = migrated.search_messages("大别山项目")
+            assert len(cjk) == 1
+            assert ">>>大别山项目<<<" in cjk[0]["snippet"]
+
+            migrated._conn.execute(
+                "UPDATE messages SET tool_name = 'RENAMED_TOOL' WHERE id = 2"
+            )
+            assert migrated.search_messages("UNIQUE_TOOL_NAME") == []
+            assert len(migrated.search_messages("RENAMED_TOOL")) == 1
+            migrated._rebuild_fts_indexes(migrated._conn.cursor())
+            assert len(migrated.search_messages("RENAMED_TOOL")) == 1
+            migrated._conn.execute("DELETE FROM messages WHERE id = 2")
+            assert migrated.search_messages("RENAMED_TOOL") == []
+            assert migrated.search_messages("大别山项目") == []
+        finally:
+            migrated.close()
+
+
 # ---------------------------------------------------------------------------
 # apply_wal_with_fallback — read-only probe tests
 # ---------------------------------------------------------------------------
