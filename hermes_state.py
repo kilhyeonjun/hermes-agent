@@ -1713,7 +1713,6 @@ class SessionDB:
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
-        fts_storage_migrated = False
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
@@ -1834,6 +1833,7 @@ class SessionDB:
                 # content + tool_name + tool_calls text as the old inline index.
                 if fts5_available:
                     self._drop_fts_triggers(cursor)
+                    fts_storage_migration_ready = True
                     for _tbl in ("messages_fts", "messages_fts_trigram"):
                         try:
                             cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
@@ -1842,13 +1842,15 @@ class SessionDB:
                                 raise
                             if self._is_trigram_unavailable_error(exc):
                                 self._warn_trigram_unavailable(exc)
+                                fts_migrations_complete = False
+                                fts_storage_migration_ready = False
                             else:
                                 self._warn_fts5_unavailable(exc)
                                 fts5_available = False
                                 fts_migrations_complete = False
                             break
 
-                    if fts5_available:
+                    if fts5_available and fts_storage_migration_ready:
                         base_fts_ok = self._ensure_fts_schema(
                             cursor, "messages_fts", FTS_SQL
                         )
@@ -1859,7 +1861,6 @@ class SessionDB:
                             self._rebuild_fts_indexes(
                                 cursor, include_trigram=trigram_ok
                             )
-                            fts_storage_migrated = True
                         else:
                             fts_migrations_complete = False
                         self._trigram_available = trigram_ok
@@ -2080,14 +2081,6 @@ class SessionDB:
                     )
 
         self._conn.commit()
-        if fts_storage_migrated:
-            # DROP releases pages for reuse but does not return them to the OS.
-            # Reclaim the removed inline text now; failure is non-fatal because
-            # the external indexes and schema-version update are already durable.
-            try:
-                self.vacuum()
-            except Exception as exc:
-                logger.warning("v22 FTS storage VACUUM skipped: %s", exc)
 
     # =========================================================================
     # Session lifecycle

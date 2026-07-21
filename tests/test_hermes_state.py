@@ -66,6 +66,23 @@ class _NoTrigramConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramCursor)
 
 
+class _NoTrigramExistingTableCursor(_NoTrigramCursor):
+    """Simulate an old trigram table that this runtime cannot open or drop."""
+
+    def execute(self, sql, parameters=()):
+        probe = sql.strip()
+        if probe == "SELECT * FROM messages_fts_trigram LIMIT 0" or probe.startswith(
+            "DROP TABLE IF EXISTS messages_fts_trigram"
+        ):
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
+
+class _NoTrigramExistingTableConnection(sqlite3.Connection):
+    def cursor(self, factory=None):
+        return super().cursor(factory or _NoTrigramExistingTableCursor)
+
+
 @pytest.fixture()
 def db(tmp_path):
     """Create a SessionDB with a temp database file."""
@@ -5604,7 +5621,7 @@ class TestFTS5ExternalContentMigration:
         finally:
             db.close()
 
-    def test_v21_inline_migration_preserves_search_and_index_maintenance(self, tmp_path):
+    def test_v21_inline_migration_preserves_search_and_index_maintenance(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-inline.db"
         seeded = SessionDB(db_path=db_path)
         seeded.create_session("s1", "cli")
@@ -5620,13 +5637,20 @@ class TestFTS5ExternalContentMigration:
         seeded.close()
         self._downgrade_to_v21_inline(db_path)
 
+        vacuum_calls = []
+
+        def track_vacuum(_self):
+            vacuum_calls.append(True)
+
+        monkeypatch.setattr(SessionDB, "vacuum", track_vacuum)
+
         migrated = SessionDB(db_path=db_path)
+        assert vacuum_calls == []
         try:
             assert migrated._conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
             assert "content='message_search_content'" in self._fts_schema(
                 migrated._conn, "messages_fts"
             )
-            assert migrated._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
 
             english = migrated.search_messages("alpha AND beta")
             assert [row["id"] for row in english][:2] == [4, 2]
@@ -5656,6 +5680,43 @@ class TestFTS5ExternalContentMigration:
             assert migrated.search_messages("大别山项目") == []
         finally:
             migrated.close()
+
+    def test_existing_inline_trigram_waits_for_tokenizer_then_recovers(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "legacy-inline-no-trigram.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.create_session("s1", "cli")
+        seeded.append_message("s1", role="user", content="기존 한글 검색")
+        seeded.close()
+        self._downgrade_to_v21_inline(db_path)
+
+        real_connect = hermes_state.sqlite3.connect
+
+        def connect_without_existing_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramExistingTableConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_state.sqlite3, "connect", connect_without_existing_trigram)
+        degraded = SessionDB(db_path=db_path)
+        try:
+            assert degraded._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 21
+            degraded.append_message("s1", role="user", content="복구 후 찾아야 할 한글")
+        finally:
+            degraded.close()
+
+        monkeypatch.setattr(hermes_state.sqlite3, "connect", real_connect)
+        recovered = SessionDB(db_path=db_path)
+        try:
+            assert recovered._conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+            assert "content='message_search_content'" in self._fts_schema(
+                recovered._conn, "messages_fts_trigram"
+            )
+            assert len(recovered.search_messages("복구 후 찾아야")) == 1
+            recovered._conn.execute(
+                "DELETE FROM messages WHERE content = ?", ("복구 후 찾아야 할 한글",)
+            )
+            assert recovered.search_messages("복구 후 찾아야") == []
+        finally:
+            recovered.close()
 
 
 # ---------------------------------------------------------------------------
