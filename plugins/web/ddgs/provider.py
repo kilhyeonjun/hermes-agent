@@ -129,7 +129,8 @@ class DDGSWebSearchProvider(WebSearchProvider):
 
     @property
     def display_name(self) -> str:
-        return "DDGS metasearch (no key)"
+        # Stable public identifier used by persisted dashboard selections.
+        return "DuckDuckGo (ddgs)"
 
     def is_available(self) -> bool:
         """Return True when the ``ddgs`` package is importable.
@@ -222,7 +223,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
-            "name": "DDGS metasearch",
+            "name": "DuckDuckGo (ddgs)",
             "badge": "free · no key · search only",
             "tag": "No-key metasearch via the ddgs package; upstream limits and no SLA (search only)",
             "env_vars": [],
