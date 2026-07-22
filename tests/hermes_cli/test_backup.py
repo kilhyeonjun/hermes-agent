@@ -1470,6 +1470,30 @@ class TestQuickSnapshot:
         assert snap_dir.is_dir()
         assert (snap_dir / "manifest.json").exists()
 
+    @pytest.mark.skipif(
+        os.name != "posix" or not Path("/dev/fd").exists(),
+        reason="requires POSIX fd accounting",
+    )
+    def test_path_match_failure_closes_snapshot_fd_and_removes_partial(
+        self, hermes_home, monkeypatch,
+    ):
+        import hermes_cli.backup as backup
+
+        before_fds = len(list(Path("/dev/fd").iterdir()))
+        monkeypatch.setattr(
+            backup,
+            "_assert_snapshot_path_matches_fd",
+            lambda _path, _fd: (_ for _ in ()).throw(
+                backup.SnapshotPermissionError("path changed")
+            ),
+        )
+
+        with pytest.raises(backup.SnapshotPermissionError, match="path changed"):
+            backup.create_quick_snapshot(hermes_home=hermes_home)
+
+        assert len(list(Path("/dev/fd").iterdir())) == before_fds
+        assert list((hermes_home / "state-snapshots").iterdir()) == []
+
     @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
     def test_snapshot_tree_is_private_under_permissive_umask(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot

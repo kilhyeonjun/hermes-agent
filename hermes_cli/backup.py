@@ -1372,8 +1372,8 @@ def create_quick_snapshot(
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
     snap_dir_fd = _open_snapshot_directory(snap_dir)
-    _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
     try:
+        _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
         for rel in _QUICK_STATE_FILES:
             src = home / rel
             if _is_unsafe_quick_snapshot_source(src):
