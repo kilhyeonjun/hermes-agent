@@ -744,7 +744,8 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
                     try:
                         from tools.registry import registry
                         plugin_tools.update(
-                            registry.get_tool_names_for_toolset(platform_name)
+                            e.name for e in registry._tools.values()
+                            if e.toolset == platform_name
                         )
                     except Exception:
                         pass

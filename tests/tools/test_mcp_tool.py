@@ -44,7 +44,6 @@ def _make_mock_server(name, session=None, tools=None):
     from tools.mcp_tool import MCPServerTask
     server = MCPServerTask(name)
     server.session = session
-    server._registration_complete = session is not None
     server._tools = tools or []
     return server
 
@@ -172,41 +171,6 @@ class TestMCPStatus:
         assert statuses["failed"]["error"] == "Connection closed"
         assert statuses["disabled"]["status"] == "disabled"
         assert statuses["disabled"]["disabled"] is True
-
-    def test_live_session_with_failed_registration_is_not_connected(self, monkeypatch):
-        """A transport alone is not usable until tool registration completes."""
-        import tools.mcp_tool as mcp_tool
-
-        class StatusServer(mcp_tool.MCPServerTask):
-            pass
-
-        server = StatusServer("broken")
-        server.session = MagicMock()
-        server._registration_complete = False
-        monkeypatch.setattr(
-            mcp_tool,
-            "_load_mcp_config",
-            lambda: {"broken": {"command": "bad-mcp"}},
-        )
-        with mcp_tool._lock:
-            saved_servers = dict(mcp_tool._servers)
-            saved_errors = dict(mcp_tool._server_connect_errors)
-            mcp_tool._servers.clear()
-            mcp_tool._server_connect_errors.clear()
-            mcp_tool._servers["broken"] = server
-            mcp_tool._server_connect_errors["broken"] = "registration failed"
-        try:
-            status = mcp_tool.get_mcp_status()[0]
-        finally:
-            with mcp_tool._lock:
-                mcp_tool._servers.clear()
-                mcp_tool._servers.update(saved_servers)
-                mcp_tool._server_connect_errors.clear()
-                mcp_tool._server_connect_errors.update(saved_errors)
-
-        assert status["connected"] is False
-        assert status["status"] == "failed"
-        assert status["error"] == "registration failed"
 
 
 class TestLifecycleConfig:
@@ -1120,321 +1084,6 @@ class TestDiscoverAndRegister:
 
         _servers.pop("srv", None)
 
-    def test_initial_failure_retains_parked_server_for_shutdown(self):
-        """A live parked task must be owned even when initial discovery fails."""
-        from tools.mcp_tool import _discover_and_register_server, _servers
-
-        created = {}
-
-        class ParkedServer:
-            def __init__(self, name):
-                self.name = name
-                self.session = None
-                self._registered_tool_names = []
-                self._stop = asyncio.Event()
-                self._task = None
-                created["server"] = self
-
-            async def start(self, _config):
-                self._task = asyncio.create_task(self._stop.wait())
-                raise ConnectionError("initial connection failed")
-
-            async def shutdown(self):
-                self._stop.set()
-                if self._task is not None:
-                    await self._task
-
-        async def scenario():
-            try:
-                with patch("tools.mcp_tool.MCPServerTask", ParkedServer):
-                    with pytest.raises(ConnectionError, match="initial connection failed"):
-                        await _discover_and_register_server(
-                            "parked", {"command": "test", "connect_timeout": 1}
-                        )
-                assert _servers.get("parked") is created["server"]
-            finally:
-                server = created.get("server")
-                if server is not None:
-                    await server.shutdown()
-                _servers.pop("parked", None)
-
-        asyncio.run(scenario())
-
-    def test_registration_failure_rolls_back_partial_registry(self):
-        """A failed publication must not expose a partially registered server."""
-        from tools.mcp_tool import MCPServerTask, _discover_and_register_server, _servers
-        from tools.registry import ToolRegistry
-
-        registry = ToolRegistry()
-        server = MCPServerTask("partial")
-        server.session = MagicMock()
-        server._tools = [_make_mcp_tool("first"), _make_mcp_tool("second")]
-        real_register = registry.register
-        register_calls = 0
-
-        def fail_second_register(*args, **kwargs):
-            nonlocal register_calls
-            register_calls += 1
-            if register_calls == 2:
-                raise RuntimeError("registry write failed")
-            return real_register(*args, **kwargs)
-
-        async def fake_connect(_name, _config):
-            return server
-
-        try:
-            with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
-                 patch("tools.registry.registry", registry), \
-                 patch.object(registry, "register", side_effect=fail_second_register):
-                with pytest.raises(RuntimeError, match="registry write failed"):
-                    asyncio.run(
-                        _discover_and_register_server(
-                            "partial", {"command": "test", "connect_timeout": 1}
-                        )
-                    )
-
-            assert registry.get_tool_names_for_toolset("mcp-partial") == []
-            assert server._registration_complete is False
-        finally:
-            _servers.pop("partial", None)
-
-    def test_registration_failure_restores_colliding_entry_and_provenance(self):
-        """A failed MCP overwrite must restore the complete prior surface."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _mcp_tool_server_names,
-            _publish_server_tools,
-            mcp_prefixed_tool_name,
-        )
-        from tools.registry import ToolRegistry
-
-        registry = ToolRegistry()
-        colliding_name = mcp_prefixed_tool_name("foo-bar", "ping")
-        assert colliding_name == mcp_prefixed_tool_name("foo_bar", "ping")
-        registry.register(
-            name=colliding_name,
-            toolset="mcp-foo-bar",
-            schema={"name": colliding_name, "description": "original"},
-            handler=lambda *_args, **_kwargs: "original",
-        )
-        registry.register_toolset_alias("foo-bar", "mcp-foo-bar")
-        original_entry = registry.get_entry(colliding_name)
-        original_aliases = registry.get_registered_toolset_aliases()
-        _mcp_tool_server_names[colliding_name] = "original_owner"
-
-        server = MCPServerTask("foo_bar")
-        server.session = MagicMock()
-        server._tools = [_make_mcp_tool("ping"), _make_mcp_tool("second")]
-        server._registered_tool_names = ["previously_published"]
-        server._registration_complete = True
-        real_register = registry.register
-        register_calls = 0
-
-        def fail_second_register(*args, **kwargs):
-            nonlocal register_calls
-            register_calls += 1
-            if register_calls == 2:
-                raise RuntimeError("registry write failed")
-            return real_register(*args, **kwargs)
-
-        try:
-            with patch("tools.registry.registry", registry), \
-                 patch.object(registry, "register", side_effect=fail_second_register):
-                with pytest.raises(RuntimeError, match="registry write failed"):
-                    _publish_server_tools("foo_bar", server, {})
-
-            assert registry.get_entry(colliding_name) is original_entry
-            assert registry.get_registered_toolset_aliases() == original_aliases
-            assert _mcp_tool_server_names[colliding_name] == "original_owner"
-            assert server._registered_tool_names == ["previously_published"]
-            assert server._registration_complete is True
-        finally:
-            _mcp_tool_server_names.pop(colliding_name, None)
-
-    def test_deregister_does_not_remove_colliding_server_entry(self):
-        """Shutdown removes only entries owned by the exact raw server."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _mcp_tool_server_names,
-            mcp_prefixed_tool_name,
-        )
-        from tools.registry import ToolRegistry
-
-        registry = ToolRegistry()
-        colliding_name = mcp_prefixed_tool_name("foo-bar", "ping")
-        registry.register(
-            name=colliding_name,
-            toolset="mcp-foo_bar",
-            schema={"name": colliding_name, "description": "replacement"},
-            handler=lambda *_args, **_kwargs: "replacement",
-        )
-        replacement_entry = registry.get_entry(colliding_name)
-        _mcp_tool_server_names[colliding_name] = "foo_bar"
-
-        stale_server = MCPServerTask("foo-bar")
-        stale_server._registered_tool_names = [colliding_name]
-        stale_server._registration_complete = True
-        try:
-            with patch("tools.registry.registry", registry):
-                stale_server._deregister_tools()
-
-            assert registry.get_entry(colliding_name) is replacement_entry
-            assert _mcp_tool_server_names[colliding_name] == "foo_bar"
-            assert stale_server._registered_tool_names == []
-            assert stale_server._registration_complete is False
-        finally:
-            _mcp_tool_server_names.pop(colliding_name, None)
-
-    def test_stale_same_name_instance_does_not_remove_current_owner_entry(self):
-        """An old instance cannot deregister a replacement with the same name."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _mcp_tool_server_names,
-            _servers,
-            mcp_prefixed_tool_name,
-        )
-        from tools.registry import ToolRegistry
-
-        registry = ToolRegistry()
-        tool_name = mcp_prefixed_tool_name("same", "ping")
-        registry.register(
-            name=tool_name,
-            toolset="mcp-same",
-            schema={"name": tool_name, "description": "replacement"},
-            handler=lambda *_args, **_kwargs: "replacement",
-        )
-        replacement_entry = registry.get_entry(tool_name)
-        stale_server = MCPServerTask("same")
-        stale_server._registered_tool_names = [tool_name]
-        stale_server._registration_complete = True
-        current_server = MCPServerTask("same")
-        current_server._registered_tool_names = [tool_name]
-        current_server._registration_complete = True
-        _servers["same"] = current_server
-        _mcp_tool_server_names[tool_name] = "same"
-        try:
-            with patch("tools.registry.registry", registry):
-                stale_server._deregister_tools()
-
-            assert registry.get_entry(tool_name) is replacement_entry
-            assert _mcp_tool_server_names[tool_name] == "same"
-            assert current_server._registered_tool_names == [tool_name]
-            assert stale_server._registered_tool_names == []
-            assert stale_server._registration_complete is False
-        finally:
-            _servers.pop("same", None)
-            _mcp_tool_server_names.pop(tool_name, None)
-
-    def test_published_parked_server_registers_tools_after_recovery(self):
-        """A recovered initial-failure server republishes tools before ready."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _server_connect_errors,
-            _servers,
-        )
-
-        server = MCPServerTask("revived")
-        server._config = {"command": "test"}
-        server._tools = [_make_mcp_tool("ping")]
-        _servers["revived"] = server
-        _server_connect_errors["revived"] = "initial connection failed"
-        try:
-            with patch(
-                "tools.mcp_tool._register_server_tools",
-                return_value=["mcp__revived__ping"],
-            ) as register:
-                server._register_discovered_tools_if_needed()
-
-            register.assert_called_once_with("revived", server, server._config)
-            assert server._registered_tool_names == ["mcp__revived__ping"]
-            assert "revived" not in _server_connect_errors
-        finally:
-            _servers.pop("revived", None)
-            _server_connect_errors.pop("revived", None)
-
-    def test_zero_tool_registration_is_not_repeated(self):
-        """Completion, not a non-empty tool list, makes publication idempotent."""
-        from tools.mcp_tool import MCPServerTask
-
-        server = MCPServerTask("empty")
-        server._config = {"command": "test"}
-        server._ready.set()
-        server._registration_complete = True
-        server._registered_tool_names = []
-
-        with patch("tools.mcp_tool._register_server_tools") as register:
-            server._register_discovered_tools_if_needed()
-
-        register.assert_not_called()
-
-    def test_initial_failure_self_probe_publishes_tools_on_recovery(self):
-        """The real parked run loop revives and publishes its first tools."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _discover_and_register_server,
-            _server_connect_errors,
-            _servers,
-        )
-
-        state = {"backend_up": False}
-        created = {}
-
-        class RecoveringServer(MCPServerTask):
-            def __init__(self, name):
-                super().__init__(name)
-                created["server"] = self
-
-            def _is_http(self):
-                return False
-
-            async def _discover_tools(self):
-                self._tools = [_make_mcp_tool("ping")]
-                self._register_discovered_tools_if_needed()
-
-            async def _run_stdio(self, _config):
-                if not state["backend_up"]:
-                    raise ConnectionError("backend unavailable")
-                self.session = object()
-                await self._discover_tools()
-                self._ready.set()
-                await self._wait_for_lifecycle_event()
-
-        async def scenario():
-            try:
-                with patch("tools.mcp_tool.MCPServerTask", RecoveringServer), \
-                     patch("tools.mcp_tool._MAX_INITIAL_CONNECT_RETRIES", 0), \
-                     patch("tools.mcp_tool._PARKED_RETRY_INTERVAL", 0.01), \
-                     patch(
-                         "tools.mcp_tool._register_server_tools",
-                         return_value=["mcp__reviving__ping"],
-                     ) as register:
-                    with pytest.raises(ConnectionError, match="backend unavailable"):
-                        await _discover_and_register_server(
-                            "reviving", {"command": "test", "connect_timeout": 1}
-                        )
-
-                    server = created["server"]
-                    assert _servers.get("reviving") is server
-                    _server_connect_errors["reviving"] = "backend unavailable"
-                    state["backend_up"] = True
-
-                    for _ in range(200):
-                        if server._registered_tool_names:
-                            break
-                        await asyncio.sleep(0.01)
-
-                    assert server._registered_tool_names == ["mcp__reviving__ping"]
-                    register.assert_called_once_with("reviving", server, server._config)
-                    assert "reviving" not in _server_connect_errors
-            finally:
-                server = created.get("server")
-                if server is not None:
-                    await server.shutdown()
-                _servers.pop("reviving", None)
-                _server_connect_errors.pop("reviving", None)
-
-        asyncio.run(scenario())
-
 
 # ---------------------------------------------------------------------------
 # MCPServerTask (run / start / shutdown)
@@ -1460,75 +1109,6 @@ class TestMCPServerTask:
             patch("tools.mcp_tool.ClientSession", return_value=mock_cs_cm),
             mock_read, mock_write,
         )
-
-    def test_start_cancellation_waits_for_run_task_cleanup(self):
-        """Cancelling startup must await the owned run task's finalizer."""
-        from tools.mcp_tool import MCPServerTask
-
-        async def scenario():
-            cleanup_started = asyncio.Event()
-            release_cleanup = asyncio.Event()
-
-            class CancelledServer(MCPServerTask):
-                async def run(self, _config):
-                    try:
-                        await asyncio.Future()
-                    except asyncio.CancelledError:
-                        cleanup_started.set()
-                        await release_cleanup.wait()
-                        raise
-
-            server = CancelledServer("cancelled")
-            start_task = asyncio.create_task(server.start({"command": "test"}))
-            await asyncio.sleep(0)
-            start_task.cancel()
-            await cleanup_started.wait()
-            await asyncio.sleep(0)
-            caller_waited_for_cleanup = not start_task.done()
-            release_cleanup.set()
-            with pytest.raises(asyncio.CancelledError):
-                await start_task
-
-            assert caller_waited_for_cleanup
-            assert server._task is not None and server._task.done()
-
-        asyncio.run(scenario())
-
-    def test_connect_server_cleans_task_after_start_failure(self):
-        """Temporary/probe connections must not leak a parked failed task."""
-        from tools.mcp_tool import _connect_server
-
-        created = {}
-
-        class FailingServer:
-            def __init__(self, name):
-                self.name = name
-                self._stop = asyncio.Event()
-                self._task = None
-                self.shutdown_called = False
-                created["server"] = self
-
-            async def start(self, _config):
-                self._task = asyncio.create_task(self._stop.wait())
-                raise ConnectionError("probe failed")
-
-            async def shutdown(self):
-                self.shutdown_called = True
-                self._stop.set()
-                if self._task is not None:
-                    await self._task
-
-        async def scenario():
-            with patch("tools.mcp_tool.MCPServerTask", FailingServer):
-                with pytest.raises(ConnectionError, match="probe failed"):
-                    await _connect_server("probe", {"command": "test"})
-            server = created["server"]
-            cleaned_by_connect = server.shutdown_called and server._task.done()
-            if not cleaned_by_connect:
-                await server.shutdown()
-            assert cleaned_by_connect
-
-        asyncio.run(scenario())
 
     def test_start_connects_and_discovers_tools(self):
         """start() creates a Task that connects, discovers tools, and waits."""
@@ -1612,36 +1192,6 @@ class TestMCPServerTask:
                 "mcp__srv__list_prompts",
                 "mcp__srv__get_prompt",
             }
-
-    def test_refresh_tools_marks_published_recovery_complete(self):
-        """A startup list_changed refresh can finish a parked recovery."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _server_connect_errors,
-            _servers,
-        )
-
-        server = MCPServerTask("refresh_recovery")
-        server._config = {"command": "test"}
-        server.session = SimpleNamespace(
-            list_tools=AsyncMock(
-                return_value=SimpleNamespace(tools=[_make_mcp_tool("ping")])
-            )
-        )
-        _servers["refresh_recovery"] = server
-        _server_connect_errors["refresh_recovery"] = "initial connection failed"
-        try:
-            with patch(
-                "tools.mcp_tool._register_server_tools",
-                return_value=["mcp__refresh_recovery__ping"],
-            ):
-                asyncio.run(server._refresh_tools())
-
-            assert server._registration_complete is True
-            assert "refresh_recovery" not in _server_connect_errors
-        finally:
-            _servers.pop("refresh_recovery", None)
-            _server_connect_errors.pop("refresh_recovery", None)
 
     def test_schedule_tools_refresh_keeps_task_until_done(self):
         """Background refresh tasks are strongly referenced and then discarded."""
@@ -2029,54 +1579,6 @@ class TestShutdown:
 
         assert len(_servers) == 0
         mock_server.shutdown.assert_called_once()
-
-    def test_initial_failure_parked_task_is_reaped_before_loop_stop(self):
-        """Discovery ownership lets global shutdown finish a parked task."""
-        import tools.mcp_tool as mcp_mod
-
-        created = {}
-
-        class ParkedServer:
-            def __init__(self, name):
-                self.name = name
-                self.session = None
-                self._registered_tool_names = []
-                self._stop = asyncio.Event()
-                self._task = None
-                created["server"] = self
-
-            async def start(self, _config):
-                self._task = asyncio.create_task(self._stop.wait())
-                raise ConnectionError("initial connection failed")
-
-            async def shutdown(self):
-                self._stop.set()
-                if self._task is not None:
-                    await self._task
-
-        mcp_mod._servers.clear()
-        mcp_mod._ensure_mcp_loop()
-        try:
-            with patch("tools.mcp_tool.MCPServerTask", ParkedServer):
-                with pytest.raises(ConnectionError, match="initial connection failed"):
-                    mcp_mod._run_on_mcp_loop(
-                        lambda: mcp_mod._discover_and_register_server(
-                            "parked", {"command": "test", "connect_timeout": 1}
-                        ),
-                        timeout=2,
-                    )
-
-            server = created["server"]
-            assert mcp_mod._servers.get("parked") is server
-            assert server._task is not None and not server._task.done()
-
-            mcp_mod.shutdown_mcp_servers()
-
-            assert server._task.done()
-            assert not mcp_mod._servers
-        finally:
-            if mcp_mod._mcp_loop is not None:
-                mcp_mod.shutdown_mcp_servers()
 
     def test_shutdown_deregisters_registered_tools(self):
         """shutdown_mcp_servers removes MCP tools and their raw alias."""
@@ -4148,45 +3650,6 @@ class TestMCPServerTaskSamplingIntegration:
 class TestDiscoveryFailedCount:
     """Verify discover_mcp_tools() correctly tracks failed server connections."""
 
-    def test_concurrent_reservation_is_not_misreported_as_failure(self):
-        """A server claimed between snapshots is omitted, not counted failed."""
-        from tools.mcp_tool import (
-            _lock,
-            _server_connect_errors,
-            _server_connecting,
-            _servers,
-            discover_mcp_tools,
-        )
-
-        def reserve_elsewhere(_servers_config):
-            with _lock:
-                _server_connecting.add("busy_gap")
-            return []
-
-        with _lock:
-            _servers.pop("busy_gap", None)
-            _server_connecting.discard("busy_gap")
-            _server_connect_errors.pop("busy_gap", None)
-        try:
-            with patch(
-                "tools.mcp_tool._load_mcp_config",
-                return_value={"busy_gap": {"command": "test"}},
-            ), patch(
-                "tools.mcp_tool.register_mcp_servers",
-                side_effect=reserve_elsewhere,
-            ), patch("tools.mcp_tool._MCP_AVAILABLE", True), patch(
-                "tools.mcp_tool.logger"
-            ) as mock_logger:
-                discover_mcp_tools()
-
-            summaries = [str(call) for call in mock_logger.info.call_args_list]
-            assert not any("failed" in call for call in summaries), summaries
-        finally:
-            with _lock:
-                _servers.pop("busy_gap", None)
-                _server_connecting.discard("busy_gap")
-                _server_connect_errors.pop("busy_gap", None)
-
     def test_failed_server_increments_failed_count(self):
         """When _discover_and_register_server raises, failed_count increments."""
         from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
@@ -4204,8 +3667,6 @@ class TestDiscoveryFailedCount:
             server = MCPServerTask(name)
             server.session = MagicMock()
             server._tools = [_make_mcp_tool("tool_a")]
-            server._registered_tool_names = [f"mcp__{name}__tool_a"]
-            server._registration_complete = True
             _servers[name] = server
             return [f"mcp__{name}__tool_a"]
 
@@ -4232,38 +3693,6 @@ class TestDiscoveryFailedCount:
 
         _servers.pop("good_server", None)
         _servers.pop("bad_server", None)
-
-    def test_parked_server_is_owned_but_counted_as_failed(self):
-        """A parked initial failure stays owned without inflating success."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _ensure_mcp_loop,
-            _servers,
-            discover_mcp_tools,
-        )
-
-        fake_config = {"parked": {"command": "test"}}
-
-        async def park_then_fail(name, _cfg):
-            server = MCPServerTask(name)
-            server.session = None
-            _servers[name] = server
-            raise ConnectionError("initial connection failed")
-
-        _servers.clear()
-        try:
-            with patch("tools.mcp_tool._load_mcp_config", return_value=fake_config), \
-                 patch("tools.mcp_tool._discover_and_register_server", side_effect=park_then_fail), \
-                 patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
-                 patch("tools.mcp_tool.logger") as mock_logger:
-                _ensure_mcp_loop()
-                discover_mcp_tools()
-
-            summaries = [str(call) for call in mock_logger.info.call_args_list]
-            assert any("0 server(s)" in call and "1 failed" in call for call in summaries), summaries
-        finally:
-            _servers.pop("parked", None)
 
     def test_all_servers_fail_still_prints_summary(self):
         """When all servers fail, a summary with failure count is still printed."""
@@ -4312,8 +3741,6 @@ class TestDiscoveryFailedCount:
             server = MCPServerTask(name)
             server.session = MagicMock()
             server._tools = [_make_mcp_tool("t")]
-            server._registered_tool_names = [f"mcp__{name}__t"]
-            server._registration_complete = True
             _servers[name] = server
             return [f"mcp__{name}__t"]
 
@@ -4869,7 +4296,7 @@ class TestRegisterMcpServers:
         fake_config = {"srv": {"command": "npx", "args": ["test"]}}
 
         async def fake_register(name, cfg):
-            server = _make_mock_server(name, session=MagicMock())
+            server = _make_mock_server(name)
             server._registered_tool_names = ["mcp__srv__t1", "mcp__srv__t2"]
             _servers[name] = server
             return ["mcp__srv__t1", "mcp__srv__t2"]
@@ -4888,260 +4315,6 @@ class TestRegisterMcpServers:
                 )
 
         _servers.pop("srv", None)
-
-    def test_registration_exception_with_live_session_counts_as_failed(self):
-        """A live transport is not a successful server when publication failed."""
-        from tools.mcp_tool import (
-            _ensure_mcp_loop,
-            _server_connect_errors,
-            _servers,
-            register_mcp_servers,
-        )
-
-        async def fail_registration(name, _cfg):
-            server = SimpleNamespace(
-                name=name,
-                session=MagicMock(),
-                _registration_complete=False,
-                _registered_tool_names=[],
-            )
-            _servers[name] = server
-            raise RuntimeError("tool publication failed")
-
-        _servers.pop("broken", None)
-        _server_connect_errors.pop("broken", None)
-        try:
-            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch(
-                     "tools.mcp_tool._discover_and_register_server",
-                     side_effect=fail_registration,
-                 ), \
-                 patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
-                 patch("tools.mcp_tool.logger") as mock_logger:
-                _ensure_mcp_loop()
-                register_mcp_servers({"broken": {"command": "test"}})
-
-            summaries = [str(call) for call in mock_logger.info.call_args_list]
-            assert any(
-                "0 server(s)" in call and "1 failed" in call
-                for call in summaries
-            ), summaries
-        finally:
-            _servers.pop("broken", None)
-            _server_connect_errors.pop("broken", None)
-
-    def test_late_initial_failure_cannot_restore_error_after_recovery(self):
-        """Gather must not overwrite a faster parked server's recovered state."""
-        from tools.mcp_tool import (
-            _ensure_mcp_loop,
-            _server_connect_errors,
-            _servers,
-            register_mcp_servers,
-        )
-
-        recovered = SimpleNamespace(
-            name="recovered",
-            session=None,
-            _registration_complete=False,
-            _registered_tool_names=[],
-        )
-
-        async def staggered_discovery(name, _cfg):
-            if name == "recovered":
-                _servers[name] = recovered
-                raise ConnectionError("initial connection failed")
-
-            await asyncio.sleep(0.01)
-            recovered.session = MagicMock()
-            recovered._registration_complete = True
-            recovered._registered_tool_names = ["mcp__recovered__ping"]
-            _server_connect_errors.pop("recovered", None)
-
-            slow = SimpleNamespace(
-                name=name,
-                session=MagicMock(),
-                _registration_complete=True,
-                _registered_tool_names=[],
-            )
-            _servers[name] = slow
-            return []
-
-        _servers.pop("recovered", None)
-        _servers.pop("slow", None)
-        _server_connect_errors.pop("recovered", None)
-        try:
-            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch(
-                     "tools.mcp_tool._discover_and_register_server",
-                     side_effect=staggered_discovery,
-                 ), \
-                 patch("tools.mcp_tool._existing_tool_names", return_value=[]):
-                _ensure_mcp_loop()
-                register_mcp_servers(
-                    {
-                        "recovered": {"command": "fast-fail"},
-                        "slow": {"command": "slow-success"},
-                    }
-                )
-
-            assert "recovered" not in _server_connect_errors
-        finally:
-            _servers.pop("recovered", None)
-            _servers.pop("slow", None)
-            _server_connect_errors.pop("recovered", None)
-
-    def test_incomplete_server_retries_publication_without_reconnect(self):
-        """A live incomplete owner retries registry publication in place."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _server_connect_errors,
-            _servers,
-            register_mcp_servers,
-        )
-
-        server = MCPServerTask("retry")
-        server.session = MagicMock()
-        server._config = {"command": "test"}
-        server._tools = [_make_mcp_tool("ping")]
-        _servers["retry"] = server
-        _server_connect_errors["retry"] = "registry write failed"
-        try:
-            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch(
-                     "tools.mcp_tool._register_server_tools",
-                     return_value=["mcp__retry__ping"],
-                 ) as register, \
-                 patch("tools.mcp_tool._connect_server") as connect:
-                result = register_mcp_servers({"retry": {"command": "test"}})
-
-            register.assert_called_once_with("retry", server, {"command": "test"})
-            connect.assert_not_called()
-            assert server._registration_complete is True
-            assert server._registered_tool_names == ["mcp__retry__ping"]
-            assert "retry" not in _server_connect_errors
-            assert result == ["mcp__retry__ping"]
-        finally:
-            _servers.pop("retry", None)
-            _server_connect_errors.pop("retry", None)
-
-    def test_concurrent_registration_does_not_start_duplicate_transport(self):
-        """The connecting set is a mutex for concurrent public registrations."""
-        from tools.mcp_tool import (
-            _server_connect_errors,
-            _server_connecting,
-            _servers,
-            register_mcp_servers,
-        )
-
-        entered = threading.Event()
-        release = threading.Event()
-        call_lock = threading.Lock()
-        run_calls = 0
-
-        def blocking_run(_factory, timeout):
-            nonlocal run_calls
-            with call_lock:
-                run_calls += 1
-                call_number = run_calls
-            if call_number == 1:
-                entered.set()
-                assert release.wait(timeout=2)
-
-        first = threading.Thread(
-            target=register_mcp_servers,
-            args=({"same": {"command": "test"}},),
-        )
-        _servers.pop("same", None)
-        _server_connecting.discard("same")
-        _server_connect_errors.pop("same", None)
-        try:
-            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch("tools.mcp_tool._ensure_mcp_loop"), \
-                 patch("tools.mcp_tool._run_on_mcp_loop", side_effect=blocking_run), \
-                 patch("tools.mcp_tool._existing_tool_names", return_value=[]):
-                first.start()
-                assert entered.wait(timeout=2)
-                register_mcp_servers({"same": {"command": "test"}})
-                release.set()
-                first.join(timeout=2)
-
-            assert not first.is_alive()
-            assert run_calls == 1
-        finally:
-            release.set()
-            first.join(timeout=2)
-            _servers.pop("same", None)
-            _server_connecting.discard("same")
-            _server_connect_errors.pop("same", None)
-
-    def test_stale_retry_noops_after_another_actor_completes_publication(self):
-        """A captured retry cannot republish after the owner becomes usable."""
-        from tools.mcp_tool import (
-            MCPServerTask,
-            _server_connect_errors,
-            _server_connecting,
-            _servers,
-            register_mcp_servers,
-        )
-
-        server = MCPServerTask("retry_race")
-        server.session = MagicMock()
-        server._config = {"command": "test"}
-        server._tools = [_make_mcp_tool("ping")]
-        _servers["retry_race"] = server
-        _server_connect_errors["retry_race"] = "earlier failure"
-
-        def complete_then_run(factory, timeout):
-            server._registered_tool_names = ["mcp__retry_race__ping"]
-            server._registration_complete = True
-            return asyncio.run(factory())
-
-        try:
-            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch("tools.mcp_tool._ensure_mcp_loop"), \
-                 patch("tools.mcp_tool._run_on_mcp_loop", side_effect=complete_then_run), \
-                 patch("tools.mcp_tool._publish_server_tools") as publish:
-                result = register_mcp_servers(
-                    {"retry_race": {"command": "test"}}
-                )
-
-            publish.assert_not_called()
-            assert result == ["mcp__retry_race__ping"]
-            assert "retry_race" not in _server_connect_errors
-        finally:
-            _servers.pop("retry_race", None)
-            _server_connecting.discard("retry_race")
-            _server_connect_errors.pop("retry_race", None)
-
-    def test_scheduling_failure_releases_server_reservation(self):
-        """A failed MCP-loop schedule must not leave a server permanently busy."""
-        from tools.mcp_tool import (
-            _server_connect_errors,
-            _server_connecting,
-            _servers,
-            register_mcp_servers,
-        )
-
-        _servers.pop("schedule_fail", None)
-        _server_connecting.discard("schedule_fail")
-        _server_connect_errors.pop("schedule_fail", None)
-        try:
-            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch("tools.mcp_tool._ensure_mcp_loop"), \
-                 patch(
-                     "tools.mcp_tool._run_on_mcp_loop",
-                     side_effect=RuntimeError("loop unavailable"),
-                 ):
-                with pytest.raises(RuntimeError, match="loop unavailable"):
-                    register_mcp_servers(
-                        {"schedule_fail": {"command": "test"}}
-                    )
-
-            assert "schedule_fail" not in _server_connecting
-        finally:
-            _servers.pop("schedule_fail", None)
-            _server_connecting.discard("schedule_fail")
-            _server_connect_errors.pop("schedule_fail", None)
 
 
 # ---------------------------------------------------------------------------
@@ -5233,14 +4406,14 @@ class TestMcpParallelToolCalls:
         from tools.registry import registry
         from tools.mcp_tool import (
             _mcp_tool_server_names, _parallel_safe_servers,
-            _publish_server_tools, is_mcp_tool_parallel_safe, _lock,
+            _register_server_tools, is_mcp_tool_parallel_safe, _lock,
         )
 
         server = _make_mock_server(
             "a_b",
             tools=[_make_mcp_tool("tool", "Ambiguous tool name")],
         )
-        registered = _publish_server_tools("a_b", server, {})
+        registered = _register_server_tools("a_b", server, {})
         try:
             assert registered == ["mcp__a_b__tool"]
             with _lock:
