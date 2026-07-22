@@ -1480,19 +1480,34 @@ class TestQuickSnapshot:
         import hermes_cli.backup as backup
 
         before_fds = len(list(Path("/dev/fd").iterdir()))
+        real_assert = backup._assert_snapshot_path_matches_fd
+        outside = hermes_home / "outside-snapshot-target"
+        outside.mkdir()
+        swapped = False
+
+        def swap_then_assert(path, fd):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                path.rename(path.with_name(f"{path.name}-orphan"))
+                path.symlink_to(outside, target_is_directory=True)
+            return real_assert(path, fd)
+
         monkeypatch.setattr(
             backup,
             "_assert_snapshot_path_matches_fd",
-            lambda _path, _fd: (_ for _ in ()).throw(
-                backup.SnapshotPermissionError("path changed")
-            ),
+            swap_then_assert,
         )
 
-        with pytest.raises(backup.SnapshotPermissionError, match="path changed"):
+        with pytest.raises(
+            backup.SnapshotPermissionError,
+            match="path changed during creation",
+        ):
             backup.create_quick_snapshot(hermes_home=hermes_home)
 
         assert len(list(Path("/dev/fd").iterdir())) == before_fds
         assert list((hermes_home / "state-snapshots").iterdir()) == []
+        assert outside.is_dir()
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
     def test_snapshot_tree_is_private_under_permissive_umask(self, hermes_home):

@@ -1120,6 +1120,45 @@ def _assert_snapshot_path_matches_fd(path: Path, fd: int) -> None:
         )
 
 
+def _remove_snapshot_tree_by_identity(
+    root_fd: int,
+    snap_dir_fd: int,
+    expected_name: str,
+) -> None:
+    """Remove the anchored snapshot even if its directory name was swapped."""
+    target = os.fstat(snap_dir_fd)
+    matched_name: Optional[str] = None
+    with os.scandir(root_fd) as entries:
+        for entry in entries:
+            try:
+                info = os.stat(entry.name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISDIR(info.st_mode)
+                and (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino)
+            ):
+                matched_name = entry.name
+                break
+
+    if matched_name is not None:
+        shutil.rmtree(matched_name, dir_fd=root_fd)
+
+    # Remove a replacement link/file at the published snapshot name without
+    # following it. Never recursively delete a replacement directory.
+    try:
+        replacement = os.stat(expected_name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(replacement.st_mode) or stat.S_ISREG(replacement.st_mode):
+        os.unlink(expected_name, dir_fd=root_fd)
+    elif stat.S_ISDIR(replacement.st_mode):
+        try:
+            os.rmdir(expected_name, dir_fd=root_fd)
+        except OSError:
+            pass
+
+
 def _copy_quick_snapshot_file(
     src: Path,
     dst: Path,
@@ -1338,40 +1377,33 @@ def create_quick_snapshot(
     base_snap_id = f"{ts}-{label}" if label else ts
     snap_id = base_snap_id
     snap_dir: Optional[Path] = None
-    for collision_index in range(10_000):
-        if collision_index:
-            snap_id = f"{base_snap_id}-{collision_index}"
-        candidate = root / snap_id
-        try:
-            candidate.mkdir(mode=0o700, exist_ok=False)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise SnapshotPermissionError(
-                f"Could not create quick snapshot directory {candidate}: {exc}"
-            ) from exc
-        snap_dir = candidate
-        break
-    if snap_dir is None:
-        raise FileExistsError(
-            f"Could not allocate a unique quick snapshot ID for {base_snap_id}"
-        )
+    snap_dir_fd: Optional[int] = None
+    root_fd = _open_snapshot_directory(root)
     try:
-        _ensure_private_snapshot_path(snap_dir, directory=True)
-    except BaseException:
-        try:
-            if not snap_dir.is_symlink():
-                shutil.rmtree(snap_dir)
-        except OSError:
-            logger.error(
-                "Failed to remove unusable private snapshot %s",
-                snap_dir,
-                exc_info=True,
+        for collision_index in range(10_000):
+            if collision_index:
+                snap_id = f"{base_snap_id}-{collision_index}"
+            candidate = root / snap_id
+            try:
+                os.mkdir(snap_id, mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise SnapshotPermissionError(
+                    f"Could not create quick snapshot directory {candidate}: {exc}"
+                ) from exc
+            snap_dir = candidate
+            snap_dir_fd = _open_snapshot_parent_fd(root_fd, (snap_id,))
+            break
+        if snap_dir is None or snap_dir_fd is None:
+            raise FileExistsError(
+                f"Could not allocate a unique quick snapshot ID for {base_snap_id}"
             )
+    except BaseException:
+        os.close(root_fd)
         raise
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
-    snap_dir_fd = _open_snapshot_directory(snap_dir)
     try:
         _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
         for rel in _QUICK_STATE_FILES:
@@ -1419,7 +1451,7 @@ def create_quick_snapshot(
                 manifest[rel] = _snapshot_entry_size(snap_dir_fd, Path(rel))
 
         if not manifest:
-            shutil.rmtree(snap_dir)
+            _remove_snapshot_tree_by_identity(root_fd, snap_dir_fd, snap_id)
             return None
 
         meta = {
@@ -1445,20 +1477,18 @@ def create_quick_snapshot(
             keep=_QUICK_DEFAULT_KEEP if keep is None else keep,
         )
     except BaseException:
-        # The root and snapshot directory are already 0700, so even cleanup
-        # failure leaves no public residue. Never publish a partial ID.
+        # Remove by the anchored directory identity, not by the possibly swapped
+        # pathname. Never publish or retain a partial snapshot.
         try:
-            if not snap_dir.is_symlink() and snap_dir.exists():
-                shutil.rmtree(snap_dir)
-        except OSError:
-            logger.error(
-                "Failed to remove incomplete private snapshot %s",
-                snap_dir,
-                exc_info=True,
-            )
+            _remove_snapshot_tree_by_identity(root_fd, snap_dir_fd, snap_id)
+        except BaseException as cleanup_exc:
+            raise SnapshotPermissionError(
+                f"Failed to remove incomplete private snapshot {snap_id}: {cleanup_exc}"
+            ) from cleanup_exc
         raise
     finally:
         os.close(snap_dir_fd)
+        os.close(root_fd)
 
     logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
     return snap_id
