@@ -4455,9 +4455,12 @@ class GatewaySlashCommandsMixin:
             script_stat = native_account_script.lstat()
         except FileNotFoundError:
             return "❌ Native Codex 계정 제어 스크립트를 찾지 못했습니다."
+        get_effective_uid = getattr(os, "geteuid", None)
+        if not callable(get_effective_uid):
+            return "❌ 이 플랫폼은 Native Codex 스크립트의 POSIX 소유권 검사를 지원하지 않습니다."
         if (
             not stat.S_ISREG(script_stat.st_mode)
-            or script_stat.st_uid != os.geteuid()
+            or script_stat.st_uid != get_effective_uid()
             or script_stat.st_mode & 0o022
             or script_stat.st_nlink != 1
         ):

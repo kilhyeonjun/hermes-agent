@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -278,3 +279,20 @@ async def test_codex_account_rejects_untrusted_control_script(
 
     run.assert_not_called()
     assert "신뢰할 수 없습니다" in result
+
+
+@pytest.mark.asyncio
+async def test_codex_account_fails_closed_without_posix_owner_check(
+    _isolated_native_account_script, monkeypatch,
+):
+    monkeypatch.delattr(os, "geteuid")
+    runner = _runner()
+    event = MagicMock()
+    event.get_command_args.return_value = "company"
+
+    with patch("subprocess.run") as run:
+        result = await runner._handle_codex_account_command(event)
+
+    run.assert_not_called()
+    assert result is not None
+    assert "POSIX 소유권 검사를 지원하지 않습니다" in result
