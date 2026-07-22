@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -147,10 +148,29 @@ class RouteApplyError(RuntimeError):
 def profile_homes() -> list[tuple[str, Path]]:
     homes = [("default", HERMES_HOME)]
     profiles_root = HERMES_HOME / "profiles"
-    if profiles_root.exists():
-        for path in sorted(profiles_root.iterdir()):
-            if path.is_dir() and (path / "auth.json").exists():
-                homes.append((path.name, path))
+    try:
+        root_info = profiles_root.lstat()
+        if not stat.S_ISDIR(root_info.st_mode):
+            return homes
+        resolved_root = profiles_root.resolve(strict=True)
+        candidates = sorted(profiles_root.iterdir())
+    except OSError:
+        return homes
+
+    for path in candidates:
+        try:
+            path_info = path.lstat()
+            if not stat.S_ISDIR(path_info.st_mode):
+                continue
+            resolved_path = path.resolve(strict=True)
+            if not resolved_path.is_relative_to(resolved_root):
+                continue
+            auth_info = (path / "auth.json").lstat()
+            if not stat.S_ISREG(auth_info.st_mode):
+                continue
+        except OSError:
+            continue
+        homes.append((path.name, path))
     return homes
 
 

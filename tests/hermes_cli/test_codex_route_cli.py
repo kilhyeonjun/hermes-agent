@@ -8,6 +8,32 @@ import types
 import pytest
 
 
+def test_profile_homes_rejects_symlinked_profile_directories(monkeypatch, tmp_path):
+    from hermes_cli import codex_route
+
+    hermes_home = tmp_path / ".hermes"
+    profiles_root = hermes_home / "profiles"
+    real_profile = profiles_root / "real"
+    real_profile.mkdir(parents=True)
+    (real_profile / "auth.json").write_text("{}", encoding="utf-8")
+
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    (outside / "auth.json").write_text("{}", encoding="utf-8")
+    try:
+        (profiles_root / "inside-link").symlink_to(real_profile, target_is_directory=True)
+        (profiles_root / "outside-link").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    monkeypatch.setattr(codex_route, "HERMES_HOME", hermes_home)
+
+    assert codex_route.profile_homes() == [
+        ("default", hermes_home),
+        ("real", real_profile),
+    ]
+
+
 def test_resolve_policy_records_exact_canonical_kind(tmp_path):
     from hermes_cli import codex_route
 
