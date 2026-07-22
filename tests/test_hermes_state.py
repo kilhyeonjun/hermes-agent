@@ -5573,7 +5573,7 @@ class TestFTS5ToolCallMigration:
 
 
 class TestFTS5ExternalContentMigration:
-    """v22 stores only FTS indexes; canonical text stays in messages."""
+    """v23 stores only FTS indexes; canonical text stays in messages."""
 
     @staticmethod
     def _downgrade_to_v21_inline(db_path):
@@ -5607,6 +5607,13 @@ class TestFTS5ExternalContentMigration:
             (table,),
         ).fetchone()[0]
 
+    @staticmethod
+    def _set_schema_version(db_path, version):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE schema_version SET version = ?", (version,))
+        conn.commit()
+        conn.close()
+
     def test_fresh_db_uses_messages_as_external_content(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
         try:
@@ -5620,6 +5627,47 @@ class TestFTS5ExternalContentMigration:
                 assert shadow is None
         finally:
             db.close()
+
+    def test_upstream_v22_inline_shape_migrates_to_v23(self, tmp_path):
+        db_path = tmp_path / "upstream-v22-inline.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.create_session("s1", "cli")
+        seeded.append_message("s1", role="user", content="upstream inline marker")
+        seeded.close()
+        self._downgrade_to_v21_inline(db_path)
+        self._set_schema_version(db_path, 22)
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            assert migrated._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == 23
+            assert "content='message_search_content'" in self._fts_schema(
+                migrated._conn, "messages_fts"
+            )
+            assert len(migrated.search_messages("upstream AND inline")) == 1
+        finally:
+            migrated.close()
+
+    def test_local_v22_external_shape_is_reconciled_to_v23(self, tmp_path):
+        db_path = tmp_path / "local-v22-external.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.create_session("s1", "cli")
+        seeded.append_message("s1", role="user", content="local external marker")
+        seeded.close()
+        self._set_schema_version(db_path, 22)
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            assert migrated._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == 23
+            assert "content='message_search_content'" in self._fts_schema(
+                migrated._conn, "messages_fts"
+            )
+            assert len(migrated.search_messages("local AND external")) == 1
+        finally:
+            migrated.close()
 
     def test_v21_inline_migration_preserves_search_and_index_maintenance(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-inline.db"

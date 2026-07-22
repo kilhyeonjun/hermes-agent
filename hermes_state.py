@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -1825,8 +1825,8 @@ class SessionDB:
                         fts_migrations_complete = False
                 else:
                     fts_migrations_complete = False
-            if current_version < 22:
-                # v22: keep canonical message/tool text only in ``messages``.
+            if current_version < 23:
+                # v23: keep canonical message/tool text only in ``messages``.
                 # External-content FTS stores the inverted indexes without a
                 # second copy of each indexed value. The computed content view
                 # keeps ranking, snippets, and rebuilds on the same concatenated
