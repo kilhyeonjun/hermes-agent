@@ -1995,15 +1995,24 @@ class MCPServerTask:
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
             }
-            for tool_name in stale_tool_names:
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+            old_mcp_tools = self._tools
+            try:
+                with registry.mutation_transaction():
+                    for tool_name in stale_tool_names:
+                        registry.deregister(tool_name)
+                        _forget_mcp_tool_server(tool_name)
 
-            # 3. Re-register with fresh tool list
-            self._tools = new_mcp_tools
-            self._registered_tool_names = _register_server_tools(
-                self.name, self, self._config
-            )
+                    # 3. Re-register with fresh tool list
+                    self._tools = new_mcp_tools
+                    self._registered_tool_names = _register_server_tools(
+                        self.name, self, self._config
+                    )
+            except BaseException:
+                self._tools = old_mcp_tools
+                self._registered_tool_names = list(old_tool_names)
+                for tool_name in old_tool_names:
+                    _track_mcp_tool_server(tool_name, self.name)
+                raise
 
             # 5. Log what changed (user-visible notification)
             new_tool_names = set(self._registered_tool_names)
@@ -3138,10 +3147,11 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
-        self._registered_tool_names = []
+        with registry.mutation_transaction():
+            for tool_name in list(getattr(self, "_registered_tool_names", [])):
+                registry.deregister(tool_name)
+                _forget_mcp_tool_server(tool_name)
+            self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
         """Wait while an intentionally recycled stdio server is dormant."""
@@ -5018,7 +5028,7 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
-def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+def _register_server_tools_unlocked(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering and utility tools. Toolset resolution
@@ -5126,6 +5136,27 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         registry.register_toolset_alias(name, toolset_name)
 
     return registered_names
+
+
+def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+    """Publish one server's complete tool surface atomically."""
+    from tools.registry import registry
+
+    owned_before = {
+        tool_name
+        for tool_name, owner in _mcp_tool_server_names.items()
+        if owner == name
+    }
+    try:
+        with registry.mutation_transaction():
+            return _register_server_tools_unlocked(name, server, config)
+    except BaseException:
+        for tool_name, owner in list(_mcp_tool_server_names.items()):
+            if owner == name and tool_name not in owned_before:
+                _forget_mcp_tool_server(tool_name)
+        for tool_name in owned_before:
+            _track_mcp_tool_server(tool_name, name)
+        raise
 
 
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
