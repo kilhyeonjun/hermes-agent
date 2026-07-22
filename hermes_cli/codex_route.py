@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ PRIORITY_SYNC_MODULE = "hermes_cli.codex_priority_sync"
 PROFILE_SYNC_TIMEOUT = 180
 ROUTE_COMMAND_TIMEOUT = 2 * PROFILE_SYNC_TIMEOUT + 30
 ROUTE_LOCK_TIMEOUT = 30
+COLLECTED_PAYLOAD_MAX_AGE_SECONDS = 15.0
+INTERNAL_PAYLOAD_VERSION = 1
+INTERNAL_PAYLOAD_MAX_BYTES = 1024 * 1024
 
 AUTO_ALIASES = {"auto", "recommended", "recommend", "추천", "자동"}
 PERSONAL_ALIASES = {"personal", "personal-backup", "개인", "개인계정"}
@@ -151,13 +155,130 @@ def profile_homes() -> list[tuple[str, Path]]:
     return homes
 
 
+def _profile_home_key(home: Path) -> str:
+    return str(home.expanduser().resolve(strict=False))
+
+
+def _profile_inventory(homes: list[tuple[str, Path]]) -> tuple[tuple[str, str], ...]:
+    inventory = tuple((name, _profile_home_key(home)) for name, home in homes)
+    if len({home for _name, home in inventory}) != len(inventory):
+        raise ValueError("Codex profile inventory contains duplicate homes")
+    return inventory
+
+
+def _normalize_precollected_payload(raw: str) -> str:
+    if len(raw.encode("utf-8")) > INTERNAL_PAYLOAD_MAX_BYTES:
+        raise ValueError("Codex usage payload exceeds internal transport limit")
+    envelope = json.loads(raw)
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"version", "payload"}
+        or envelope.get("version") != INTERNAL_PAYLOAD_VERSION
+    ):
+        raise ValueError("Codex usage payload envelope is invalid")
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("Codex usage payload is invalid")
+    accounts = payload.get("accounts")
+    routing = payload.get("routing")
+    recommendation = payload.get("recommendation")
+    if (
+        not isinstance(accounts, list)
+        or any(not isinstance(row, dict) for row in accounts)
+        or not isinstance(routing, dict)
+        or not isinstance(recommendation, dict)
+    ):
+        raise ValueError("Codex usage payload shape is invalid")
+    normalized = json.dumps(
+        envelope,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(normalized.encode("utf-8")) > INTERNAL_PAYLOAD_MAX_BYTES:
+        raise ValueError("Codex usage payload exceeds internal transport limit")
+    return normalized
+
+
+def _child_failure_detail(proc: subprocess.CompletedProcess[str]) -> str:
+    detail = (proc.stderr or proc.stdout or "실행 실패").strip().splitlines()[:2]
+    return redact_sensitive_text(" | ".join(detail), force=True)
+
+
+def _collect_profile_payload(
+    name: str, home: Path
+) -> tuple[str | None, str | None]:
+    argv = [
+        sys.executable,
+        "-m",
+        PRIORITY_SYNC_MODULE,
+        "--internal-collect-payload",
+    ]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env.pop("HERMES_CODEX_ROUTE_LOCK_HELD", None)
+    try:
+        proc = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=PROFILE_SYNC_TIMEOUT,
+            shell=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, (
+            f"{name}: payload collection timed out after "
+            f"{PROFILE_SYNC_TIMEOUT}s"
+        )
+    except OSError as exc:
+        safe_exc = redact_sensitive_text(str(exc), force=True)
+        return None, f"{name}: payload collection launch failed: {safe_exc}"
+    if proc.returncode != 0:
+        return None, f"{name}: payload collection failed: {_child_failure_detail(proc)}"
+    try:
+        return _normalize_precollected_payload(proc.stdout), None
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None, f"{name}: payload collection returned invalid data"
+
+
+def collect_profile_payloads(
+    homes: list[tuple[str, Path]],
+) -> tuple[dict[str, str], list[str]]:
+    """Collect once per unique profile home before acquiring the route lock."""
+    unique: dict[str, tuple[str, Path]] = {}
+    for name, home in homes:
+        unique.setdefault(_profile_home_key(home), (name, home))
+
+    payloads: dict[str, str] = {}
+    errors: list[str] = []
+    if not unique:
+        return payloads, errors
+    with ThreadPoolExecutor(max_workers=min(len(unique), 4)) as executor:
+        futures = {
+            executor.submit(_collect_profile_payload, name, home): key
+            for key, (name, home) in unique.items()
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            payload, error = future.result()
+            if error:
+                errors.append(error)
+            elif payload is not None:
+                payloads[key] = payload
+    return payloads, sorted(errors)
+
+
 def _sync_profile(
-    name: str, home: Path, extra_args: tuple[str, ...] = ()
+    name: str,
+    home: Path,
+    payload_json: str,
+    extra_args: tuple[str, ...] = (),
 ) -> str | None:
     argv = [
         sys.executable,
         "-m",
         PRIORITY_SYNC_MODULE,
+        "--internal-payload-stdin",
         *extra_args,
     ]
     env = os.environ.copy()
@@ -166,6 +287,7 @@ def _sync_profile(
     try:
         proc = subprocess.run(
             argv,
+            input=payload_json,
             text=True,
             capture_output=True,
             timeout=PROFILE_SYNC_TIMEOUT,
@@ -179,14 +301,16 @@ def _sync_profile(
         return f"{name}: sync launch failed: {safe_exc}"
     if proc.returncode == 0:
         return None
-    detail = (proc.stderr or proc.stdout or "실행 실패").strip().splitlines()[:2]
-    safe_detail = redact_sensitive_text(" | ".join(detail), force=True)
-    return f"{name}: {safe_detail}"
+    return f"{name}: {_child_failure_detail(proc)}"
 
 
-def sync_all_profiles() -> list[str]:
-    """Run tracked priority sync for every profile within one bounded round."""
-    homes = profile_homes()
+def sync_all_profiles(
+    payloads: dict[str, str],
+    *,
+    homes: list[tuple[str, Path]] | None = None,
+) -> list[str]:
+    """Apply precollected payloads for every profile within one bounded round."""
+    homes = list(homes if homes is not None else profile_homes())
     if not homes:
         return []
     default = next(
@@ -195,31 +319,41 @@ def sync_all_profiles() -> list[str]:
     if default is None:
         return ["default: profile home missing"]
     policy = load_policy()
-    jobs: list[tuple[str, Path, tuple[str, ...]]] = []
+    jobs: list[tuple[str, Path, str, tuple[str, ...]]] = []
+    errors: list[str] = []
+
+    def add_job(name: str, home: Path, extra_args: tuple[str, ...]) -> None:
+        payload = payloads.get(_profile_home_key(home))
+        if payload is None:
+            errors.append(f"{name}: precollected payload missing")
+            return
+        jobs.append((name, home, payload, extra_args))
+
     if policy.get("mode") == "auto":
         default_home = default[1]
-        jobs.extend(
-            [
-                (
-                    "default",
-                    default_home,
-                    ("--profile-account", "personal", "--skip-cliproxy"),
-                ),
-                ("global-clients", default_home, ("--skip-hermes",)),
-            ]
+        add_job(
+            "default",
+            default_home,
+            ("--profile-account", "personal", "--skip-cliproxy"),
         )
+        add_job("global-clients", default_home, ("--skip-hermes",))
     else:
-        jobs.append(("default", default[1], ()))
-    jobs.extend(
-        (name, home, ("--skip-cliproxy",))
-        for name, home in homes
-        if name != "default"
-    )
-    errors: list[str] = []
+        add_job("default", default[1], ())
+    for name, home in homes:
+        if name != "default":
+            add_job(name, home, ("--skip-cliproxy",))
+    if not jobs:
+        return sorted(errors)
     with ThreadPoolExecutor(max_workers=min(len(jobs), 4)) as executor:
         futures = {
-            executor.submit(_sync_profile, name, home, extra_args): name
-            for name, home, extra_args in jobs
+            executor.submit(
+                _sync_profile,
+                name,
+                home,
+                payload_json,
+                extra_args,
+            ): name
+            for name, home, payload_json, extra_args in jobs
         }
         for future in as_completed(futures):
             error = future.result()
@@ -323,12 +457,17 @@ def render_status(policy: dict[str, Any], sync_errors: list[str] | None = None) 
     return "\n".join(lines)
 
 
-def _apply_mode_locked(mode: str) -> str:
+def _apply_mode_locked(
+    mode: str,
+    *,
+    homes: list[tuple[str, Path]],
+    payloads: dict[str, str],
+) -> str:
     policy = resolve_policy(mode, DEFAULT_AUTH)
     prior = snapshot_policy()
     save_policy(policy)
     try:
-        errors = sync_all_profiles()
+        errors = sync_all_profiles(payloads, homes=homes)
     except Exception as exc:
         errors = [f"profile sync raised {type(exc).__name__}"]
     if not errors:
@@ -336,7 +475,7 @@ def _apply_mode_locked(mode: str) -> str:
 
     restore_policy(prior)
     try:
-        rollback_errors = sync_all_profiles()
+        rollback_errors = sync_all_profiles(payloads, homes=homes)
     except Exception as exc:
         rollback_errors = [f"rollback sync raised {type(exc).__name__}"]
     lines = [
@@ -351,11 +490,40 @@ def _apply_mode_locked(mode: str) -> str:
 
 
 def apply_mode(mode: str) -> str:
-    with route_lock(
-        path=POLICY_PATH.parent / "codex_route.lock",
-        timeout=ROUTE_LOCK_TIMEOUT,
-    ):
-        return _apply_mode_locked(mode)
+    for attempt in range(2):
+        homes = profile_homes()
+        inventory = _profile_inventory(homes)
+        collection_started_at = time.monotonic()
+        payloads, collection_errors = collect_profile_payloads(homes)
+        if collection_errors:
+            raise RouteApplyError(
+                "❌ Codex usage collection failed: "
+                + "; ".join(collection_errors)
+            )
+        retry = False
+        with route_lock(
+            path=POLICY_PATH.parent / "codex_route.lock",
+            timeout=ROUTE_LOCK_TIMEOUT,
+        ):
+            current_homes = profile_homes()
+            if (
+                _profile_inventory(current_homes) != inventory
+                or time.monotonic() - collection_started_at
+                > COLLECTED_PAYLOAD_MAX_AGE_SECONDS
+            ):
+                retry = True
+            else:
+                return _apply_mode_locked(
+                    mode,
+                    homes=current_homes,
+                    payloads=payloads,
+                )
+        if retry and attempt == 0:
+            continue
+        break
+    raise RouteApplyError(
+        "❌ Codex routing skipped: profile inventory or usage payload changed"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

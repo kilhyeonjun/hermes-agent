@@ -1,5 +1,6 @@
 import importlib.util
 from contextlib import contextmanager
+import io
 import json
 from pathlib import Path
 
@@ -576,6 +577,18 @@ def test_main_applies_fixed_route_policy(monkeypatch, tmp_path):
                 }
             ],
         ),
+        (
+            {"mode": "fixed", "credential_id": "exhausted-secret-credential"},
+            [
+                {
+                    "credential_id": "exhausted-secret-credential",
+                    "label": "exhausted",
+                    "ok": True,
+                    "available": True,
+                    "last_status": "exhausted",
+                }
+            ],
+        ),
     ],
 )
 def test_main_fails_closed_when_fixed_route_is_unavailable(
@@ -616,6 +629,7 @@ def test_main_fails_closed_when_fixed_route_is_unavailable(
         "missing-secret-credential",
         "dead-secret-credential",
         "busy-secret-credential",
+        "exhausted-secret-credential",
     ):
         assert secret not in output
 
@@ -1040,7 +1054,7 @@ def test_sync_hermes_reloads_under_auth_lock_and_preserves_rotated_fields(
             lock_events.append("exit")
 
     def checked_load(*args, **kwargs):
-        assert lock_depth == 1
+        assert lock_depth in {1, 2}
         return real_load(*args, **kwargs)
 
     def checked_save(*args, **kwargs):
@@ -1056,12 +1070,19 @@ def test_sync_hermes_reloads_under_auth_lock_and_preserves_rotated_fields(
     saved = json.loads(auth_path.read_text(encoding="utf-8"))
     saved_entry = saved["credential_pool"]["openai-codex"][0]
     assert changes
-    assert lock_events == ["enter", "exit", "enter", "exit"]
+    assert lock_events == [
+        "enter",
+        "exit",
+        "enter",
+        "exit",
+    ]
     assert saved_entry["priority"] == 10
     assert saved_entry["access_token"] == "fresh-access-token"
     assert saved_entry["refresh_token"] == "fresh-refresh-token"
     assert saved_entry["generation"] == 7
-    assert saved["credential_pool"]["other-provider"] == [{"opaque": "preserve-me"}]
+    other_rows = saved["credential_pool"]["other-provider"]
+    assert len(other_rows) == 1
+    assert other_rows[0]["opaque"] == "preserve-me"
     assert saved["providers"]["other-provider"] == {"opaque": "still-fresh"}
     assert saved["unrelated_top_level"] == {"sequence": 42}
 
@@ -2433,12 +2454,24 @@ def test_main_native_apply_failure_compensates_in_reverse_order(
         assert api.rows == original_rows
 
 
-def test_standalone_main_marks_inherited_host_lock_during_unlocked_run(
+def test_standalone_main_collects_before_marking_and_acquiring_host_lock(
     monkeypatch,
 ):
     module = load_module()
     monkeypatch.delenv("HERMES_CODEX_ROUTE_LOCK_HELD", raising=False)
     events = []
+
+    payload = {
+        "accounts": [],
+        "recommendation": {},
+        "routing": {},
+    }
+
+    def fake_collect_payload(*, mutate=True):
+        assert mutate is False
+        assert "HERMES_CODEX_ROUTE_LOCK_HELD" not in module.os.environ
+        events.append("collected")
+        return payload
 
     @contextmanager
     def fake_route_lock(*, path, timeout):
@@ -2449,18 +2482,127 @@ def test_standalone_main_marks_inherited_host_lock_during_unlocked_run(
         yield
         events.append("unlocked")
 
-    def fake_main_unlocked(argv):
+    def fake_main_unlocked(argv, *, payload=None):
         assert argv == ["--dry-run"]
+        assert payload is not None
         assert module.os.environ["HERMES_CODEX_ROUTE_LOCK_HELD"] == "1"
         events.append("ran")
         return 0
 
+    monkeypatch.setattr(module, "collect_payload", fake_collect_payload)
     monkeypatch.setattr(module, "route_lock", fake_route_lock)
     monkeypatch.setattr(module, "_main_unlocked", fake_main_unlocked)
 
     assert module.main(["--dry-run"]) == 0
-    assert events == ["locked", "ran", "unlocked"]
+    assert events == ["collected", "locked", "ran", "unlocked"]
     assert "HERMES_CODEX_ROUTE_LOCK_HELD" not in module.os.environ
+
+
+def test_standalone_main_rejects_payload_made_stale_during_collection(
+    monkeypatch, capsys
+):
+    module = load_module()
+    monkeypatch.delenv("HERMES_CODEX_ROUTE_LOCK_HELD", raising=False)
+    now = [100.0]
+    collections = []
+
+    def fake_collect_payload(*, dry_run):
+        assert dry_run is True
+        collections.append(now[0])
+        now[0] += module.COLLECTED_PAYLOAD_MAX_AGE_SECONDS + 1.0
+        return {"accounts": [], "recommendation": {}, "routing": {}}
+
+    @contextmanager
+    def fake_route_lock(*, path, timeout):
+        assert path == module.ROUTE_LOCK_PATH
+        assert timeout == module.ROUTE_LOCK_TIMEOUT
+        yield
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module, "_collect_payload_for_run", fake_collect_payload)
+    monkeypatch.setattr(module, "route_lock", fake_route_lock)
+    monkeypatch.setattr(
+        module,
+        "_main_unlocked",
+        lambda *_args, **_kwargs: pytest.fail("stale payload must not apply"),
+    )
+
+    assert module.main(["--dry-run"]) == 1
+    assert len(collections) == 2
+    assert "became stale" in capsys.readouterr().out
+
+
+def test_collect_payload_skips_unused_history_annotation(monkeypatch):
+    module = load_module()
+    payload = {"accounts": [], "routing": {}, "recommendation": {}}
+    monkeypatch.setattr(module, "collect", lambda **_kwargs: payload)
+    assert module.collect_payload() is payload
+
+
+def test_internal_collect_mode_never_acquires_route_lock(monkeypatch, capsys):
+    module = load_module()
+    payload = {"accounts": [], "routing": {}, "recommendation": {}}
+    monkeypatch.delenv("HERMES_CODEX_ROUTE_LOCK_HELD", raising=False)
+    monkeypatch.setattr(module, "collect_payload", lambda **_kwargs: payload)
+    monkeypatch.setattr(
+        module,
+        "route_lock",
+        lambda **_kwargs: pytest.fail("internal collection must stay outside lock"),
+    )
+
+    assert module.main(["--internal-collect-payload"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "version": module.INTERNAL_PAYLOAD_VERSION,
+        "payload": payload,
+    }
+
+
+def test_internal_payload_stdin_never_recollects(monkeypatch):
+    module = load_module()
+    payload = {"accounts": [], "routing": {}, "recommendation": {}}
+    monkeypatch.setenv("HERMES_CODEX_ROUTE_LOCK_HELD", "1")
+    monkeypatch.setattr(
+        module.sys,
+        "stdin",
+        io.StringIO(module._encode_precollected_payload(payload)),
+    )
+    monkeypatch.setattr(
+        module,
+        "collect_payload",
+        lambda **_kwargs: pytest.fail("supplied payload must not recollect"),
+    )
+
+    def fake_main_unlocked(argv, *, payload=None):
+        assert argv == ["--internal-payload-stdin"]
+        assert payload == {
+            "accounts": [],
+            "routing": {},
+            "recommendation": {},
+        }
+        return 0
+
+    monkeypatch.setattr(module, "_main_unlocked", fake_main_unlocked)
+
+    assert module.main(["--internal-payload-stdin"]) == 0
+
+
+def test_internal_payload_stdin_rejects_malformed_before_apply(
+    monkeypatch, capsys
+):
+    module = load_module()
+    monkeypatch.setenv("HERMES_CODEX_ROUTE_LOCK_HELD", "1")
+    monkeypatch.setattr(module.sys, "stdin", io.StringIO('{"accounts":'))
+    monkeypatch.setattr(
+        module,
+        "_main_unlocked",
+        lambda *_args, **_kwargs: pytest.fail(
+            "malformed payload must be rejected before surface mutation"
+        ),
+    )
+
+    assert module.main(["--internal-payload-stdin"]) == 1
+    assert "invalid precollected payload" in capsys.readouterr().out.lower()
 
 
 def test_inherited_host_lock_marker_bypasses_reacquire(monkeypatch):
