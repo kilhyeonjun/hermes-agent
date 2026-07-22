@@ -964,8 +964,170 @@ def _ensure_private_snapshot_parents(parent: Path, snap_dir: Path) -> None:
         _ensure_private_snapshot_path(current, directory=True)
 
 
-def _copy_quick_snapshot_file(src: Path, dst: Path, snap_dir: Path) -> bool:
-    """Best-effort content copy with fail-closed destination permissions."""
+def _snapshot_directory_flags() -> int:
+    """Flags for opening an anchored snapshot directory without links."""
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise SnapshotPermissionError(
+            "Secure quick snapshots require directory-fd and no-follow support"
+        )
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _open_snapshot_directory(path: Path) -> int:
+    try:
+        fd = os.open(path, _snapshot_directory_flags())
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Could not securely open snapshot directory {path}: {exc}"
+        ) from exc
+    try:
+        if not _is_native_windows():
+            os.fchmod(fd, 0o700)
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or (
+            not _is_native_windows() and stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise SnapshotPermissionError(f"Snapshot directory is not private: {path}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_snapshot_parent_fd(root_fd: int, components: tuple[str, ...]) -> int:
+    """Create/open descendants relative to an anchored root, never links."""
+    current_fd = os.dup(root_fd)
+    try:
+        for component in components:
+            if component in {"", ".", ".."} or "/" in component or "\\" in component:
+                raise SnapshotPermissionError(
+                    f"Unsafe snapshot path component: {component!r}"
+                )
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(
+                component,
+                _snapshot_directory_flags(),
+                dir_fd=current_fd,
+            )
+            if not _is_native_windows():
+                os.fchmod(next_fd, 0o700)
+            info = os.fstat(next_fd)
+            if not stat.S_ISDIR(info.st_mode) or (
+                not _is_native_windows() and stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                os.close(next_fd)
+                raise SnapshotPermissionError(
+                    f"Snapshot directory component is not private: {component}"
+                )
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _snapshot_relative_path(path: Path, snap_dir: Path) -> Path:
+    try:
+        relative = path.relative_to(snap_dir)
+    except ValueError as exc:
+        raise SnapshotPermissionError(
+            f"Snapshot destination escapes its root: {path}"
+        ) from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise SnapshotPermissionError(f"Unsafe snapshot destination: {path}")
+    return relative
+
+
+def _secure_copy_to_snapshot(source: Path, parent_fd: int, name: str) -> bool:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        with source.open("rb") as input_stream, os.fdopen(fd, "wb") as output_stream:
+            fd = -1
+            shutil.copyfileobj(input_stream, output_stream)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+            if not _is_native_windows():
+                try:
+                    os.fchmod(output_stream.fileno(), 0o600)
+                except OSError as exc:
+                    raise SnapshotPermissionError(
+                        f"Could not secure snapshot file {name}: {exc}"
+                    ) from exc
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or (
+            not _is_native_windows() and stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise SnapshotPermissionError(f"Snapshot file is not private: {name}")
+        return True
+    except SnapshotPermissionError:
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+    except OSError as exc:
+        logger.warning("Could not securely create snapshot file %s: %s", name, exc)
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _remove_snapshot_entry(parent_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Could not remove partial snapshot entry {name}: {exc}"
+        ) from exc
+
+
+def _snapshot_entry_size(root_fd: int, relative: Path) -> int:
+    parent_fd = _open_snapshot_parent_fd(root_fd, relative.parts[:-1])
+    try:
+        info = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            raise SnapshotPermissionError(
+                f"Snapshot entry is not a regular file: {relative}"
+            )
+        return int(info.st_size)
+    finally:
+        os.close(parent_fd)
+
+
+def _assert_snapshot_path_matches_fd(path: Path, fd: int) -> None:
+    try:
+        path_info = path.lstat()
+    except OSError as exc:
+        raise SnapshotPermissionError(
+            f"Snapshot directory path changed during creation: {path}"
+        ) from exc
+    fd_info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(path_info.st_mode)
+        or (path_info.st_dev, path_info.st_ino) != (fd_info.st_dev, fd_info.st_ino)
+    ):
+        raise SnapshotPermissionError(
+            f"Snapshot directory path changed during creation: {path}"
+        )
+
+
+def _copy_quick_snapshot_file(
+    src: Path,
+    dst: Path,
+    snap_dir: Path,
+    *,
+    snap_dir_fd: Optional[int] = None,
+) -> bool:
+    """Copy into an anchored snapshot tree without following destination links."""
     if _is_unsafe_quick_snapshot_source(src):
         logger.warning("Skipping linked source in quick snapshot: %s", src)
         return False
@@ -976,63 +1138,109 @@ def _copy_quick_snapshot_file(src: Path, dst: Path, snap_dir: Path) -> bool:
         logger.warning("Could not snapshot %s: %s", src, exc)
         return False
 
+    relative = _snapshot_relative_path(dst, snap_dir)
+    # Keep the path hardening for defense in depth; all actual writes below are
+    # relative to an already-open directory fd, so a post-check swap cannot
+    # redirect them.
     _ensure_private_snapshot_parents(dst.parent, snap_dir)
+    root_fd = (
+        _open_snapshot_directory(snap_dir)
+        if snap_dir_fd is None
+        else os.dup(snap_dir_fd)
+    )
+    parent_fd = -1
+    temp_db_path: Optional[Path] = None
     try:
+        try:
+            parent_fd = _open_snapshot_parent_fd(root_fd, relative.parts[:-1])
+        except (OSError, SnapshotPermissionError) as exc:
+            logger.warning("Could not securely open snapshot parent for %s: %s", dst, exc)
+            return False
+
+        copy_source = src
         if src.suffix == ".db":
-            copied = _safe_copy_db(src, dst)
-        else:
-            shutil.copyfile(src, dst, follow_symlinks=False)
-            copied = True
-    except (OSError, PermissionError) as exc:
-        logger.warning("Could not snapshot %s: %s", src, exc)
-        copied = False
+            temp_fd, temp_name = tempfile.mkstemp(prefix="hermes-snapshot-", suffix=".db")
+            os.close(temp_fd)
+            temp_db_path = Path(temp_name)
+            if not _is_native_windows():
+                os.chmod(temp_db_path, 0o600)
+            if not _safe_copy_db(src, temp_db_path):
+                return False
+            copy_source = temp_db_path
 
-    if not copied:
-        _remove_partial_snapshot_file(dst)
-        return False
+        copied = _secure_copy_to_snapshot(copy_source, parent_fd, relative.name)
+        if not copied:
+            _remove_snapshot_entry(parent_fd, relative.name)
+            return False
 
-    try:
-        if _quick_snapshot_source_identity(src) != source_identity:
+        try:
+            if _quick_snapshot_source_identity(src) != source_identity:
+                raise SnapshotPermissionError(
+                    f"Quick snapshot source changed during copy: {src}"
+                )
+        except SnapshotPermissionError as exc:
+            _remove_snapshot_entry(parent_fd, relative.name)
+            if "source changed during copy" in str(exc):
+                raise
             raise SnapshotPermissionError(
                 f"Quick snapshot source changed during copy: {src}"
+            ) from exc
+
+        info = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or (
+            not _is_native_windows() and stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            _remove_snapshot_entry(parent_fd, relative.name)
+            raise SnapshotPermissionError(
+                f"Snapshot destination is not a private regular file: {dst}"
             )
-    except SnapshotPermissionError as exc:
-        _remove_partial_snapshot_file(dst)
-        if "source changed during copy" in str(exc):
-            raise
-        raise SnapshotPermissionError(
-            f"Quick snapshot source changed during copy: {src}"
-        ) from exc
+        return True
+    finally:
+        if temp_db_path is not None:
+            temp_db_path.unlink(missing_ok=True)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(root_fd)
 
+
+def _write_private_snapshot_manifest(
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    snap_dir_fd: Optional[int] = None,
+) -> None:
+    """Create a manifest relative to an anchored snapshot directory."""
+    root_fd = (
+        _open_snapshot_directory(path.parent)
+        if snap_dir_fd is None
+        else os.dup(snap_dir_fd)
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    fd = -1
     try:
-        _ensure_private_snapshot_path(dst, directory=False)
-    except SnapshotPermissionError:
-        _remove_partial_snapshot_file(dst)
-        raise
-    return True
-
-
-def _write_private_snapshot_manifest(path: Path, payload: Dict[str, Any]) -> None:
-    """Create a new manifest without following links and verify mode 0600."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
+        fd = os.open(path.name, flags, 0o600, dir_fd=root_fd)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             fd = -1
             json.dump(payload, stream, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
-        _ensure_private_snapshot_path(path, directory=False)
+            if not _is_native_windows():
+                os.fchmod(stream.fileno(), 0o600)
+        info = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or (
+            not _is_native_windows() and stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise SnapshotPermissionError(f"Snapshot manifest is not private: {path}")
     except BaseException:
         if fd >= 0:
             os.close(fd)
         try:
-            path.unlink(missing_ok=True)
+            os.unlink(path.name, dir_fd=root_fd)
         except OSError:
             pass
         raise
+    finally:
+        os.close(root_fd)
 
 
 def _verify_private_snapshot_tree(snap_dir: Path) -> None:
@@ -1163,6 +1371,8 @@ def create_quick_snapshot(
         raise
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
+    snap_dir_fd = _open_snapshot_directory(snap_dir)
+    _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
     try:
         for rel in _QUICK_STATE_FILES:
             src = home / rel
@@ -1189,8 +1399,12 @@ def create_quick_snapshot(
                     if _too_large(sub, sub_rel):
                         continue
                     dst = snap_dir / sub_rel
-                    if _copy_quick_snapshot_file(sub, dst, snap_dir):
-                        manifest[sub_rel] = dst.stat().st_size
+                    if _copy_quick_snapshot_file(
+                        sub, dst, snap_dir, snap_dir_fd=snap_dir_fd
+                    ):
+                        manifest[sub_rel] = _snapshot_entry_size(
+                            snap_dir_fd, Path(sub_rel)
+                        )
                 continue
 
             if not src.is_file():
@@ -1199,8 +1413,10 @@ def create_quick_snapshot(
                 continue
 
             dst = snap_dir / rel
-            if _copy_quick_snapshot_file(src, dst, snap_dir):
-                manifest[rel] = dst.stat().st_size
+            if _copy_quick_snapshot_file(
+                src, dst, snap_dir, snap_dir_fd=snap_dir_fd
+            ):
+                manifest[rel] = _snapshot_entry_size(snap_dir_fd, Path(rel))
 
         if not manifest:
             shutil.rmtree(snap_dir)
@@ -1214,8 +1430,13 @@ def create_quick_snapshot(
             "total_size": sum(manifest.values()),
             "files": manifest,
         }
-        _write_private_snapshot_manifest(snap_dir / "manifest.json", meta)
+        _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
+        _write_private_snapshot_manifest(
+            snap_dir / "manifest.json", meta, snap_dir_fd=snap_dir_fd
+        )
+        _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
         _verify_private_snapshot_tree(snap_dir)
+        _assert_snapshot_path_matches_fd(snap_dir, snap_dir_fd)
 
         # Auto-prune. Defaults preserve historical manual /snapshot behavior;
         # known high-churn callers can pass a smaller keep value.
@@ -1236,6 +1457,8 @@ def create_quick_snapshot(
                 exc_info=True,
             )
         raise
+    finally:
+        os.close(snap_dir_fd)
 
     logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
     return snap_id

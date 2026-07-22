@@ -1499,6 +1499,59 @@ class TestQuickSnapshot:
                 assert path.is_file() and not path.is_symlink(), path
                 assert mode == 0o600, path
 
+    @pytest.mark.skipif(os.name != "posix", reason="dir-fd hardening is POSIX-only")
+    def test_snapshot_copy_rejects_parent_swapped_to_symlink(self, tmp_path, monkeypatch):
+        import hermes_cli.backup as backup
+
+        src = tmp_path / "source.txt"
+        src.write_text("sensitive", encoding="utf-8")
+        snap_dir = tmp_path / "snapshot"
+        snap_dir.mkdir(mode=0o700)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dst = snap_dir / "nested" / "source.txt"
+        original_ensure = backup._ensure_private_snapshot_parents
+
+        def swap_parent(parent, root):
+            original_ensure(parent, root)
+            parent.rmdir()
+            parent.symlink_to(outside, target_is_directory=True)
+
+        snap_fd = os.open(snap_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            monkeypatch.setattr(backup, "_ensure_private_snapshot_parents", swap_parent)
+            assert backup._copy_quick_snapshot_file(
+                src, dst, snap_dir, snap_dir_fd=snap_fd
+            ) is False
+        finally:
+            os.close(snap_fd)
+
+        assert not (outside / "source.txt").exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="dir-fd hardening is POSIX-only")
+    def test_manifest_write_stays_anchored_after_snapshot_path_swap(self, tmp_path):
+        import hermes_cli.backup as backup
+
+        snap_dir = tmp_path / "snapshot"
+        snap_dir.mkdir(mode=0o700)
+        original_dir = tmp_path / "snapshot-original"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        snap_fd = os.open(snap_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            snap_dir.rename(original_dir)
+            snap_dir.symlink_to(outside, target_is_directory=True)
+            backup._write_private_snapshot_manifest(
+                snap_dir / "manifest.json",
+                {"id": "safe"},
+                snap_dir_fd=snap_fd,
+            )
+        finally:
+            os.close(snap_fd)
+
+        assert (original_dir / "manifest.json").is_file()
+        assert not (outside / "manifest.json").exists()
+
     @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
     def test_empty_snapshot_leaves_private_root_only(self, tmp_path):
         from hermes_cli.backup import create_quick_snapshot
@@ -1571,18 +1624,14 @@ class TestQuickSnapshot:
     def test_permission_failure_aborts_and_removes_partial_snapshot(self, hermes_home):
         import hermes_cli.backup as backup
 
-        real_harden = backup._ensure_private_snapshot_path
+        real_fchmod = backup.os.fchmod
 
-        def fail_env(path, *, directory):
-            if Path(path).name == ".env":
-                raise backup.SnapshotPermissionError("chmod failed")
-            return real_harden(path, directory=directory)
+        def fail_private_file(fd, mode):
+            if mode == 0o600:
+                raise OSError("chmod failed")
+            return real_fchmod(fd, mode)
 
-        with patch.object(
-            backup,
-            "_ensure_private_snapshot_path",
-            side_effect=fail_env,
-        ):
+        with patch.object(backup.os, "fchmod", side_effect=fail_private_file):
             with pytest.raises(backup.SnapshotPermissionError, match="chmod failed"):
                 backup.create_quick_snapshot(hermes_home=hermes_home)
 
@@ -1593,27 +1642,43 @@ class TestQuickSnapshot:
     def test_failed_copy_with_unremovable_partial_aborts_snapshot(self, hermes_home):
         import hermes_cli.backup as backup
 
-        real_unlink = Path.unlink
+        real_secure_copy = backup._secure_copy_to_snapshot
+        real_unlink = backup.os.unlink
 
-        def leave_partial(src, dst):
-            dst.write_bytes(b"partial")
-            dst.chmod(0o600)
+        def leave_partial(source, parent_fd, name):
+            if name != "state.db":
+                return real_secure_copy(source, parent_fd, name)
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(fd, b"partial")
+            finally:
+                os.close(fd)
             return False
 
+        blocked_once = False
+
         def block_partial_unlink(path, *args, **kwargs):
-            if path.name == "state.db" and "state-snapshots" in path.parts:
+            nonlocal blocked_once
+            if (
+                path == "state.db"
+                and kwargs.get("dir_fd") is not None
+                and not blocked_once
+            ):
+                blocked_once = True
                 raise PermissionError("cannot remove partial")
             return real_unlink(path, *args, **kwargs)
 
-        with patch.object(backup, "_safe_copy_db", side_effect=leave_partial), patch.object(
-            Path,
-            "unlink",
-            side_effect=block_partial_unlink,
-            autospec=True,
-        ):
+        with patch.object(
+            backup, "_secure_copy_to_snapshot", side_effect=leave_partial
+        ), patch.object(backup.os, "unlink", side_effect=block_partial_unlink):
             with pytest.raises(
                 backup.SnapshotPermissionError,
-                match="partial snapshot file",
+                match="partial snapshot entry",
             ):
                 backup.create_quick_snapshot(hermes_home=hermes_home)
 
@@ -1643,30 +1708,29 @@ class TestQuickSnapshot:
         assert list((hermes_home / "state-snapshots").iterdir()) == []
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
-    def test_silent_chmod_noop_is_detected_and_aborted(self, hermes_home):
+    def test_secure_open_mode_stays_private_when_file_fchmod_is_noop(self, hermes_home):
         import hermes_cli.backup as backup
 
-        real_chmod = backup.os.chmod
+        real_fchmod = backup.os.fchmod
 
-        def ignore_env(path, mode):
-            if Path(path).name == ".env":
+        def ignore_private_file(fd, mode):
+            if mode == 0o600:
                 return None
-            return real_chmod(path, mode)
+            return real_fchmod(fd, mode)
 
         old_umask = os.umask(0)
         try:
-            with patch.object(backup.os, "chmod", side_effect=ignore_env):
-                with pytest.raises(
-                    backup.SnapshotPermissionError,
-                    match="has mode.*expected 0600",
-                ):
-                    backup.create_quick_snapshot(hermes_home=hermes_home)
+            with patch.object(backup.os, "fchmod", side_effect=ignore_private_file):
+                snap_id = backup.create_quick_snapshot(hermes_home=hermes_home)
         finally:
             os.umask(old_umask)
 
         root = hermes_home / "state-snapshots"
         assert stat.S_IMODE(root.stat().st_mode) == 0o700
-        assert list(root.iterdir()) == []
+        snap_dir = root / snap_id
+        for path in snap_dir.rglob("*"):
+            if path.is_file():
+                assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
     def test_native_windows_uses_acl_boundary_without_posix_modes(self, hermes_home):
         import hermes_cli.backup as backup
