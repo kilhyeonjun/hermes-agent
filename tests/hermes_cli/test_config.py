@@ -2418,5 +2418,3 @@ class TestNamedProfileV31Migration:
             "_config_version": 33,
             "model": {"default": "default-sentinel"},
         }
-
-
