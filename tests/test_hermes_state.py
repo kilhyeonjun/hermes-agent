@@ -5649,6 +5649,31 @@ class TestFTS5ExternalContentMigration:
         finally:
             migrated.close()
 
+    def test_v23_version_with_inline_shape_is_reconciled_by_layout(self, tmp_path):
+        db_path = tmp_path / "mislabeled-v23-inline.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.create_session("s1", "cli")
+        seeded.append_message("s1", role="user", content="mislabeled inline marker")
+        seeded.close()
+        self._downgrade_to_v21_inline(db_path)
+        self._set_schema_version(db_path, 23)
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            assert "content='message_search_content'" in self._fts_schema(
+                migrated._conn, "messages_fts"
+            )
+            migrated._conn.execute(
+                "UPDATE messages SET content = ? WHERE session_id = ?",
+                ("reconciled external marker", "s1"),
+            )
+            assert migrated.search_messages("mislabeled") == []
+            assert len(migrated.search_messages("reconciled AND external")) == 1
+            migrated._conn.execute("DELETE FROM messages WHERE session_id = ?", ("s1",))
+            assert migrated.search_messages("reconciled") == []
+        finally:
+            migrated.close()
+
     def test_local_v22_external_shape_is_reconciled_to_v23(self, tmp_path):
         db_path = tmp_path / "local-v22-external.db"
         seeded = SessionDB(db_path=db_path)
@@ -5766,7 +5791,45 @@ class TestFTS5ExternalContentMigration:
         finally:
             recovered.close()
 
+    def test_missing_trigram_preflight_does_not_repeatedly_drop_base(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "legacy-inline-no-trigram-repeat.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.create_session("s1", "cli")
+        seeded.append_message("s1", role="user", content="stable base index")
+        seeded.close()
+        self._downgrade_to_v21_inline(db_path)
 
+        statements = []
+
+        class TrackingCursor(_NoTrigramExistingTableCursor):
+            def execute(self, sql, parameters=()):
+                statements.append(sql.strip())
+                return super().execute(sql, parameters)
+
+        class TrackingConnection(sqlite3.Connection):
+            def cursor(self, factory=None):
+                return super().cursor(factory or TrackingCursor)
+
+        real_connect = hermes_state.sqlite3.connect
+
+        def connect_without_existing_trigram(*args, **kwargs):
+            kwargs["factory"] = TrackingConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_state.sqlite3, "connect", connect_without_existing_trigram)
+        for _ in range(2):
+            degraded = SessionDB(db_path=db_path)
+            try:
+                degraded.append_message("s1", role="user", content="write remains safe")
+            finally:
+                degraded.close()
+
+        base_drops = [
+            sql for sql in statements
+            if sql.startswith("DROP TABLE IF EXISTS messages_fts")
+            and "trigram" not in sql
+        ]
+        assert base_drops == []
 # ---------------------------------------------------------------------------
 # apply_wal_with_fallback — read-only probe tests
 # ---------------------------------------------------------------------------

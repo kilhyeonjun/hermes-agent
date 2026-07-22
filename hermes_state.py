@@ -1269,6 +1269,27 @@ class SessionDB:
                 return False
             raise
 
+    @staticmethod
+    def _fts_uses_external_content(
+        cursor: sqlite3.Cursor,
+        table_name: str,
+    ) -> Optional[bool]:
+        """Inspect physical FTS layout without opening the virtual table.
+
+        Reading ``sqlite_master`` still works when the current SQLite runtime
+        cannot load an existing optional tokenizer, which makes this safe for
+        migration preflight. ``None`` means the table does not exist.
+        """
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        sql = str(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+        normalized = "".join(sql.lower().split())
+        return "content='message_search_content'" in normalized
+
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
@@ -1825,32 +1846,43 @@ class SessionDB:
                         fts_migrations_complete = False
                 else:
                     fts_migrations_complete = False
-            if current_version < 23:
+            # Reconcile by physical layout as well as version. A database can
+            # be stamped v23 after an interrupted/partial migration, and version
+            # alone must never install external-content triggers on inline FTS.
+            base_external = self._fts_uses_external_content(cursor, "messages_fts")
+            trigram_external = self._fts_uses_external_content(
+                cursor, "messages_fts_trigram"
+            )
+            fts_storage_migration_needed = (
+                current_version < 22
+                or base_external is not True
+                or trigram_external is False
+            )
+            if fts_storage_migration_needed:
                 # v23: keep canonical message/tool text only in ``messages``.
                 # External-content FTS stores the inverted indexes without a
                 # second copy of each indexed value. The computed content view
                 # keeps ranking, snippets, and rebuilds on the same concatenated
                 # content + tool_name + tool_calls text as the old inline index.
                 if fts5_available:
-                    self._drop_fts_triggers(cursor)
-                    fts_storage_migration_ready = True
+                    # Preflight every existing virtual table before dropping
+                    # either one. A runtime that lacks the old trigram tokenizer
+                    # cannot open or drop that table; deferring intact avoids a
+                    # destructive base-index rebuild on every startup.
+                    storage_preflight_ready = True
                     for _tbl in ("messages_fts", "messages_fts_trigram"):
-                        try:
+                        if self._fts_uses_external_content(cursor, _tbl) is None:
+                            continue
+                        if self._fts_table_probe(cursor, _tbl) is None:
+                            storage_preflight_ready = False
+                    if not storage_preflight_ready:
+                        self._drop_fts_triggers(cursor)
+                        fts_migrations_complete = False
+                    else:
+                        self._drop_fts_triggers(cursor)
+                        for _tbl in ("messages_fts", "messages_fts_trigram"):
                             cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
-                        except sqlite3.OperationalError as exc:
-                            if not self._is_fts5_unavailable_error(exc):
-                                raise
-                            if self._is_trigram_unavailable_error(exc):
-                                self._warn_trigram_unavailable(exc)
-                                fts_migrations_complete = False
-                                fts_storage_migration_ready = False
-                            else:
-                                self._warn_fts5_unavailable(exc)
-                                fts5_available = False
-                                fts_migrations_complete = False
-                            break
 
-                    if fts5_available and fts_storage_migration_ready:
                         base_fts_ok = self._ensure_fts_schema(
                             cursor, "messages_fts", FTS_SQL
                         )
@@ -1864,8 +1896,6 @@ class SessionDB:
                         else:
                             fts_migrations_complete = False
                         self._trigram_available = trigram_ok
-                    else:
-                        fts_migrations_complete = False
                 else:
                     fts_migrations_complete = False
             if current_version < 16:
@@ -2059,7 +2089,14 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Index already exists
 
-        if fts5_available:
+        base_external = self._fts_uses_external_content(cursor, "messages_fts")
+        trigram_external = self._fts_uses_external_content(
+            cursor, "messages_fts_trigram"
+        )
+        fts_layout_compatible = (
+            base_external is not False and trigram_external is not False
+        )
+        if fts5_available and fts_layout_compatible:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
