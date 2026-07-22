@@ -672,7 +672,12 @@ class MCPOAuthManager:
                 return True
             return False
 
-    def reset_initialized(self, server_name: str) -> bool:
+    def reset_initialized(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> bool:
         """Force the cached provider to re-run ``_initialize`` on its next flow.
 
         Returns True if a cached provider existed and its ``_initialized`` flag
@@ -693,7 +698,7 @@ class MCPOAuthManager:
         forces a fresh disk read + expiry re-seed so the SDK refreshes on the
         reconnect handshake, with no mtime dependency.
         """
-        entry = self._entries.get(server_name)
+        entry = self._entries.get(self._key(server_name, hermes_home))
         if entry is None or entry.provider is None:
             return False
         if not hasattr(entry.provider, "_initialized"):
