@@ -895,6 +895,14 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+# Capture the caller home before pytest fixtures can monkeypatch ``Path.home``.
+# An explicit HERMES_TEST_REAL_HOME still wins so subprocess runners can bind
+# the guard to the real caller while redirecting HOME.
+_AUTH_GUARD_IMPORT_HOME = Path(
+    os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home()
+).expanduser()
+
+
 def _assert_test_path_not_live(path: Path) -> None:
     """Fail closed when a test path resolves inside the caller's live root."""
     test_process = bool(
@@ -904,7 +912,7 @@ def _assert_test_path_not_live(path: Path) -> None:
     if not test_process:
         return
     real_home = Path(
-        os.environ.get("HERMES_TEST_REAL_HOME") or Path.home()
+        os.environ.get("HERMES_TEST_REAL_HOME") or _AUTH_GUARD_IMPORT_HOME
     ).expanduser()
     lexical_root = Path(os.path.abspath(real_home / ".hermes"))
     lexical_path = Path(os.path.abspath(path.expanduser()))
