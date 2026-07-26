@@ -61,10 +61,10 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
-def test_shared_testing_contract_is_stable_for_default_and_named_profiles(monkeypatch, tmp_path):
+def test_shared_performance_contract_is_stable_for_default_and_named_profiles(monkeypatch, tmp_path):
     """Removing the root-level contract must remove it from every prompt mode."""
-    contract = "# TEST_PERFORMANCE_CONTRACT_V1\nRun focused tests first.\n"
-    contract_path = tmp_path / "runtime-contracts" / "testing-performance.md"
+    contract = "# PERFORMANCE_OBSERVATION_CONTRACT_V1\nObserve slow operations.\n"
+    contract_path = tmp_path / "runtime-contracts" / "performance-observation.md"
     contract_path.parent.mkdir()
     contract_path.write_text(contract, encoding="utf-8")
 
@@ -75,18 +75,18 @@ def test_shared_testing_contract_is_stable_for_default_and_named_profiles(monkey
         home.mkdir(parents=True, exist_ok=True)
         monkeypatch.setenv("HERMES_HOME", str(home))
         stable = _stable_prompt(_make_agent(skip_context_files=skip_context_files))
-        assert stable.count("TEST_PERFORMANCE_CONTRACT_V1") == 1
+        assert stable.count("PERFORMANCE_OBSERVATION_CONTRACT_V1") == 1
 
 
-def test_missing_shared_testing_contract_fails_open_with_debug_log(monkeypatch, tmp_path, caplog):
+def test_missing_shared_performance_contract_fails_open_with_debug_log(monkeypatch, tmp_path, caplog):
     """A deployment without the optional contract must still build a prompt."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     caplog.set_level(logging.DEBUG, logger="agent.prompt_builder")
 
     stable = _stable_prompt(_make_agent(skip_context_files=True))
 
-    assert "TEST_PERFORMANCE_CONTRACT_V1" not in stable
-    assert "Could not read testing-performance contract" in caplog.text
+    assert "PERFORMANCE_OBSERVATION_CONTRACT_V1" not in stable
+    assert "Could not read performance-observation contract" in caplog.text
 
 
 def _stable_prompt(agent):

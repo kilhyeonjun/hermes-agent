@@ -1903,20 +1903,20 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         return None
 
 
-def load_testing_performance_contract(context_length: Optional[int] = None) -> str:
-    """Load the root-scoped testing contract without blocking prompt assembly."""
-    contract_path = get_default_hermes_root() / "runtime-contracts" / "testing-performance.md"
+def load_performance_observation_contract(context_length: Optional[int] = None) -> str:
+    """Load the root-scoped performance contract without blocking prompt assembly."""
+    contract_path = get_default_hermes_root() / "runtime-contracts" / "performance-observation.md"
     try:
         content = contract_path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as exc:
-        logger.debug("Could not read testing-performance contract from %s: %s", contract_path, exc)
+        logger.debug("Could not read performance-observation contract from %s: %s", contract_path, exc)
         return ""
     if not content:
         return ""
-    content = _scan_context_content(content, "runtime-contracts/testing-performance.md")
+    content = _scan_context_content(content, "runtime-contracts/performance-observation.md")
     return _truncate_content(
         content,
-        "runtime-contracts/testing-performance.md",
+        "runtime-contracts/performance-observation.md",
         context_length=context_length,
         read_path=str(contract_path),
     )
