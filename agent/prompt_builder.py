@@ -1922,6 +1922,25 @@ def load_performance_observation_contract(context_length: Optional[int] = None) 
     )
 
 
+def load_outcome_control_contract(context_length: Optional[int] = None) -> str:
+    """Load the root-scoped outcome-control contract without blocking prompt assembly."""
+    contract_path = get_default_hermes_root() / "runtime-contracts" / "outcome-control.md"
+    try:
+        content = contract_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.debug("Could not read outcome-control contract from %s: %s", contract_path, exc)
+        return ""
+    if not content:
+        return ""
+    content = _scan_context_content(content, "runtime-contracts/outcome-control.md")
+    return _truncate_content(
+        content,
+        "runtime-contracts/outcome-control.md",
+        context_length=context_length,
+        read_path=str(contract_path),
+    )
+
+
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)

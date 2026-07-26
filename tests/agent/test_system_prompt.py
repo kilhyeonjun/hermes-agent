@@ -89,6 +89,34 @@ def test_missing_shared_performance_contract_fails_open_with_debug_log(monkeypat
     assert "Could not read performance-observation contract" in caplog.text
 
 
+def test_outcome_control_contract_is_stable_for_default_and_named_profiles(monkeypatch, tmp_path):
+    """Every profile receives the root outcome-control contract exactly once."""
+    contract = "# OUTCOME_CONTROL_V1\nKeep work focused on the current outcome.\n"
+    contract_path = tmp_path / "runtime-contracts" / "outcome-control.md"
+    contract_path.parent.mkdir()
+    contract_path.write_text(contract, encoding="utf-8")
+
+    for home, skip_context_files in (
+        (tmp_path, False),
+        (tmp_path / "profiles" / "coder", True),
+    ):
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        stable = _stable_prompt(_make_agent(skip_context_files=skip_context_files))
+        assert stable.count("OUTCOME_CONTROL_V1") == 1
+
+
+def test_missing_outcome_control_contract_fails_open_with_debug_log(monkeypatch, tmp_path, caplog):
+    """A missing optional outcome-control contract cannot block prompt assembly."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    caplog.set_level(logging.DEBUG, logger="agent.prompt_builder")
+
+    stable = _stable_prompt(_make_agent(skip_context_files=True))
+
+    assert "OUTCOME_CONTROL_V1" not in stable
+    assert "Could not read outcome-control contract" in caplog.text
+
+
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),

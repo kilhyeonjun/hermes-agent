@@ -44,6 +44,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    load_outcome_control_contract,
     load_performance_observation_contract,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -199,6 +200,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     performance_observation_contract = load_performance_observation_contract(_ctx_len)
     if performance_observation_contract:
         stable_parts.append(performance_observation_contract)
+
+    outcome_control_contract = load_outcome_control_contract(_ctx_len)
+    if outcome_control_contract:
+        stable_parts.append(outcome_control_contract)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
