@@ -260,7 +260,7 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = [
 ]
 
 _CHATGPT_ACCOUNT_MODEL_REJECTION = re.compile(
-    r'^\s*this\s+model\s+is\s+only\s+available\s+to\s+chatgpt\s+accounts\s*:\s*[\'\"][^\s\'\"]+[\'\"]\s*$',
+    r"^\s*the\s+['\"][^\s'\"]+['\"]\s+model\s+is\s+not\s+supported\s+when\s+using\s+codex\s+with\s+a\s+chatgpt\s+account\.\s*$",
     re.IGNORECASE,
 )
 
