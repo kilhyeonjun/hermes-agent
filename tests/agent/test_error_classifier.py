@@ -1,5 +1,7 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
+import httpx
+import openai
 import pytest
 from agent.error_classifier import (
     ClassifiedError,
@@ -239,6 +241,33 @@ class TestClassifyApiError:
     ])
     def test_400_exact_chatgpt_account_model_rejection_is_entitlement(self, message):
         result = classify_api_error(MockAPIError(message, status_code=400))
+        assert result.reason == FailoverReason.entitlement
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_400_openai_sdk_flat_detail_model_rejection_is_entitlement(self):
+        detail = (
+            "The 'gpt-5.6-sol' model is not supported when using Codex "
+            "with a ChatGPT account."
+        )
+        response = httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://chatgpt.com/backend-api/codex/responses"
+            ),
+        )
+        error = openai.BadRequestError(
+            f"Error code: 400 - {{'detail': {detail!r}}}",
+            response=response,
+            body={"detail": detail},
+        )
+
+        result = classify_api_error(
+            error,
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+        )
+
         assert result.reason == FailoverReason.entitlement
         assert result.retryable is False
         assert result.should_fallback is True
