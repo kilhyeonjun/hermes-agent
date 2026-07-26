@@ -1828,8 +1828,11 @@ class CredentialPool:
         if self.provider != "openai-codex" or not isinstance(model, str) or not model.strip():
             return None
         with self._lock:
+            identity_supplied = bool(credential_id or api_key_hint)
             entry = next((e for e in self._entries if credential_id and e.id == credential_id), None)
             entry = entry or next((e for e in self._entries if api_key_hint and e.runtime_api_key == api_key_hint), None)
+            if entry is None and identity_supplied:
+                return None
             entry = entry or self._current_unlocked()
             if entry is None:
                 return None
@@ -1942,28 +1945,32 @@ class CredentialPool:
         return refreshed
 
     def reset_statuses(self) -> int:
-        count = 0
-        new_entries = []
-        for entry in self._entries:
-            if entry.last_status or entry.last_status_at or entry.last_error_code:
-                new_entries.append(
-                    replace(
-                        entry,
-                        last_status=None,
-                        last_status_at=None,
-                        last_error_code=None,
-                        last_error_reason=None,
-                        last_error_message=None,
-                        last_error_reset_at=None,
+        with self._lock:
+            count = 0
+            new_entries = []
+            for entry in self._entries:
+                has_model_marker = bool(entry.extra.get("unavailable_models"))
+                if entry.last_status or entry.last_status_at or entry.last_error_code or has_model_marker:
+                    extra = {key: value for key, value in entry.extra.items() if key != "unavailable_models"}
+                    new_entries.append(
+                        replace(
+                            entry,
+                            last_status=None,
+                            last_status_at=None,
+                            last_error_code=None,
+                            last_error_reason=None,
+                            last_error_message=None,
+                            last_error_reset_at=None,
+                            extra=extra,
+                        )
                     )
-                )
-                count += 1
-            else:
-                new_entries.append(entry)
-        if count:
-            self._entries = new_entries
-            self._persist()
-        return count
+                    count += 1
+                else:
+                    new_entries.append(entry)
+            if count:
+                self._entries = new_entries
+                self._persist()
+            return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         if index < 1 or index > len(self._entries):
