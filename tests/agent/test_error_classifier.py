@@ -234,8 +234,8 @@ class TestClassifyApiError:
     # ── Auth errors ──
 
     @pytest.mark.parametrize("message", [
-        "This model is only available to ChatGPT accounts: 'gpt-5.6-sol'",
-        "  THIS MODEL  IS ONLY AVAILABLE TO CHATGPT ACCOUNTS:  \"gpt-5.6-sol\"  ",
+        "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        "  THE  'gpt-5.6-sol'  MODEL IS NOT SUPPORTED WHEN USING CODEX WITH A CHATGPT ACCOUNT.  ",
     ])
     def test_400_exact_chatgpt_account_model_rejection_is_entitlement(self, message):
         result = classify_api_error(MockAPIError(message, status_code=400))
@@ -245,8 +245,8 @@ class TestClassifyApiError:
 
     @pytest.mark.parametrize("message", [
         "Bad request",
-        "prefix This model is only available to ChatGPT accounts: 'gpt-5.6-sol'",
-        "This model is only available to ChatGPT accounts: 'gpt-5.6-sol' suffix",
+        "prefix The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account. suffix",
     ])
     def test_400_nonexact_chatgpt_account_text_remains_format_error(self, message):
         result = classify_api_error(MockAPIError(message, status_code=400))
@@ -254,7 +254,7 @@ class TestClassifyApiError:
 
     def test_400_structured_replay_code_beats_chatgpt_account_text(self):
         result = classify_api_error(MockAPIError(
-            "This model is only available to ChatGPT accounts: 'gpt-5.6-sol'",
+            "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
             status_code=400,
             body={"error": {"code": "invalid_encrypted_content"}},
         ))
