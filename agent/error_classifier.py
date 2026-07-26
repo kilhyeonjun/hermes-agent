@@ -1249,7 +1249,20 @@ def _classify_400(
             should_fallback=False,
         )
 
-    if _CHATGPT_ACCOUNT_MODEL_REJECTION.fullmatch(error_msg):
+    entitlement_messages = [error_msg]
+    if isinstance(body, dict):
+        flat_detail = body.get("detail")
+        if isinstance(flat_detail, str):
+            entitlement_messages.append(flat_detail.lower())
+        nested_error = body.get("error")
+        if isinstance(nested_error, dict):
+            nested_message = nested_error.get("message")
+            if isinstance(nested_message, str):
+                entitlement_messages.append(nested_message.lower())
+    if any(
+        _CHATGPT_ACCOUNT_MODEL_REJECTION.fullmatch(message)
+        for message in entitlement_messages
+    ):
         return result_fn(
             FailoverReason.entitlement,
             retryable=False,
