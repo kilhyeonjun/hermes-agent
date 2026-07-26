@@ -922,6 +922,22 @@ def recover_with_credential_pool(
             )
             return False, has_retried_429
 
+    _api_key_hint = getattr(agent, "api_key", None) or None
+    _raw_credential_id = getattr(agent, "_credential_pool_entry_id", None)
+    _credential_id = (
+        _raw_credential_id
+        if isinstance(_raw_credential_id, str) and _raw_credential_id
+        else None
+    )
+    if not _api_key_hint:
+        current_entry = pool.current()
+        if current_entry:
+            _api_key_hint = getattr(current_entry, "runtime_api_key", None)
+            if not _credential_id:
+                current_id = getattr(current_entry, "id", None)
+                if isinstance(current_id, str) and current_id:
+                    _credential_id = current_id
+
     effective_reason = classified_reason
     if effective_reason is None:
         if status_code == 402:
@@ -949,6 +965,19 @@ def recover_with_credential_pool(
                 "credential rotation, deferring to fallback chain"
             )
         return False, has_retried_429
+
+    if effective_reason == FailoverReason.entitlement:
+        if pool_provider != "openai-codex":
+            return False, has_retried_429
+        next_entry = pool.mark_entitlement_unavailable_and_rotate(
+            model=str(getattr(agent, "model", "") or ""),
+            api_key_hint=_api_key_hint,
+            credential_id=_credential_id,
+        )
+        if next_entry is None:
+            return False, has_retried_429
+        agent._swap_credential(next_entry)
+        return True, False
 
     if effective_reason == FailoverReason.billing:
         rotate_status = status_code if status_code is not None else 402

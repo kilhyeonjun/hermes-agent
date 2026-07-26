@@ -1815,6 +1815,36 @@ class CredentialPool:
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
 
+    def mark_entitlement_unavailable_and_rotate(
+        self, *, model: str, api_key_hint: Optional[str] = None,
+        credential_id: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        """Exclude one Codex credential for one model without exhausting it.
+
+        The marker is persisted in ``extra`` using the pool's existing atomic
+        write path. It deliberately leaves the credential otherwise healthy so
+        a different model remains selectable.
+        """
+        if self.provider != "openai-codex" or not isinstance(model, str) or not model.strip():
+            return None
+        with self._lock:
+            entry = next((e for e in self._entries if credential_id and e.id == credential_id), None)
+            entry = entry or next((e for e in self._entries if api_key_hint and e.runtime_api_key == api_key_hint), None)
+            entry = entry or self._current_unlocked()
+            if entry is None:
+                return None
+            blocked = set(entry.extra.get("unavailable_models", []))
+            blocked.add(model)
+            updated = replace(entry, extra={**entry.extra, "unavailable_models": sorted(blocked)})
+            self._replace_entry(entry, updated)
+            self._persist()
+            candidates = [
+                candidate for candidate in self._available_entries()
+                if model not in set(candidate.extra.get("unavailable_models", []))
+            ]
+            self._current_id = candidates[0].id if candidates else None
+            return candidates[0] if candidates else None
+
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
 
