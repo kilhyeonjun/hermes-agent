@@ -79,6 +79,20 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
 
 
 
+def test_codex_entitlement_rotates_only_for_failed_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openai-codex": [
+        {"id": "a", "label": "a", "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": "a"},
+        {"id": "b", "label": "b", "auth_type": "api_key", "priority": 1, "source": "manual", "access_token": "b"},
+    ]}})
+    from agent.credential_pool import load_pool
+    pool = load_pool("openai-codex")
+    assert pool.select().id == "a"
+    assert pool.mark_entitlement_unavailable_and_rotate(model="model-a", credential_id="a").id == "b"
+    assert pool.mark_entitlement_unavailable_and_rotate(model="model-a", credential_id="b") is None
+    assert next(entry for entry in pool.entries() if entry.id == "a").extra["unavailable_models"] == ["model-a"]
+
+
 def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):
     """A 402 must exhaust every pool entry backed by the same API key.
 

@@ -1067,6 +1067,19 @@ def recover_with_credential_pool(
             )
         return False, has_retried_429
 
+    if effective_reason == FailoverReason.entitlement:
+        if pool_provider != "openai-codex":
+            return False, has_retried_429
+        next_entry = pool.mark_entitlement_unavailable_and_rotate(
+            model=str(getattr(agent, "model", "") or ""),
+            api_key_hint=_api_key_hint,
+            credential_id=_credential_id,
+        )
+        if next_entry is None:
+            return False, has_retried_429
+        agent._swap_credential(next_entry)
+        return True, False
+
     if effective_reason == FailoverReason.billing:
         rotate_status = status_code if status_code is not None else 402
         # Runtime credentials can be resolved by a separate pool instance,
