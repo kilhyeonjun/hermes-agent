@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -56,6 +57,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
+    entitlement = "entitlement"          # Account does not hold the named model entitlement — fail over
 
     # Request format
     format_error = "format_error"        # 400 bad request — abort or strip + retry
@@ -256,6 +258,11 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = [
     # Alibaba/DashScope variant
     "tool_call.content must be string",
 ]
+
+_CHATGPT_ACCOUNT_MODEL_REJECTION = re.compile(
+    r'^\s*this\s+model\s+is\s+only\s+available\s+to\s+chatgpt\s+accounts\s*:\s*[\'\"][^\s\'\"]+[\'\"]\s*$',
+    re.IGNORECASE,
+)
 
 # Context overflow patterns
 _CONTEXT_OVERFLOW_PATTERNS = [
@@ -1240,6 +1247,13 @@ def _classify_400(
             FailoverReason.invalid_encrypted_content,
             retryable=True,
             should_fallback=False,
+        )
+
+    if _CHATGPT_ACCOUNT_MODEL_REJECTION.fullmatch(error_msg):
+        return result_fn(
+            FailoverReason.entitlement,
+            retryable=False,
+            should_fallback=True,
         )
 
     # Request-validation errors (unsupported / unknown parameter) MUST be
