@@ -1829,8 +1829,11 @@ class CredentialPool:
             return None
         with self._lock:
             identity_supplied = bool(credential_id or api_key_hint)
-            entry = next((e for e in self._entries if credential_id and e.id == credential_id), None)
-            entry = entry or next((e for e in self._entries if api_key_hint and e.runtime_api_key == api_key_hint), None)
+            id_entry = next((e for e in self._entries if credential_id and e.id == credential_id), None)
+            key_entry = next((e for e in self._entries if api_key_hint and e.runtime_api_key == api_key_hint), None)
+            if credential_id and api_key_hint and (id_entry is None or key_entry is None or id_entry.id != key_entry.id):
+                return None
+            entry = id_entry or key_entry
             if entry is None and identity_supplied:
                 return None
             entry = entry or self._current_unlocked()

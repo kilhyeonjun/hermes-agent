@@ -407,6 +407,19 @@ def test_codex_entitlement_unmatched_identity_fails_closed_and_reset_clears_mark
     assert load_pool("openai-codex").entries()[0].extra.get("unavailable_models") is None
 
 
+def test_codex_entitlement_requires_consistent_id_and_key_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openai-codex": [
+        {"id": "a", "label": "a", "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": "a"},
+        {"id": "b", "label": "b", "auth_type": "api_key", "priority": 1, "source": "manual", "access_token": "b"},
+    ]}})
+    from agent.credential_pool import load_pool
+    pool = load_pool("openai-codex")
+    assert pool.mark_entitlement_unavailable_and_rotate(model="m", credential_id="a", api_key_hint="b") is None
+    assert all(not entry.extra.get("unavailable_models") for entry in pool.entries())
+    assert pool.mark_entitlement_unavailable_and_rotate(model="m", credential_id="a", api_key_hint="a").id == "b"
+
+
 def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     """OpenAI Codex token_invalidated must mark the credential DEAD, not exhausted.
 
