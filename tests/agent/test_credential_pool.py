@@ -379,6 +379,47 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     assert persisted["last_error_code"] == 402
 
 
+def test_codex_entitlement_rotates_only_for_failed_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openai-codex": [
+        {"id": "a", "label": "a", "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": "a"},
+        {"id": "b", "label": "b", "auth_type": "api_key", "priority": 1, "source": "manual", "access_token": "b"},
+    ]}})
+    from agent.credential_pool import load_pool
+    pool = load_pool("openai-codex")
+    assert pool.select().id == "a"
+    assert pool.mark_entitlement_unavailable_and_rotate(model="model-a", credential_id="a").id == "b"
+    assert pool.mark_entitlement_unavailable_and_rotate(model="model-a", credential_id="b") is None
+    assert next(entry for entry in pool.entries() if entry.id == "a").extra["unavailable_models"] == ["model-a"]
+
+
+def test_codex_entitlement_unmatched_identity_fails_closed_and_reset_clears_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openai-codex": [
+        {"id": "a", "label": "a", "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": "a"},
+    ]}})
+    from agent.credential_pool import load_pool
+    pool = load_pool("openai-codex")
+    assert pool.mark_entitlement_unavailable_and_rotate(model="model-a", credential_id="missing") is None
+    assert pool.entries()[0].extra.get("unavailable_models") is None
+    pool.mark_entitlement_unavailable_and_rotate(model="model-a", credential_id="a")
+    assert pool.reset_statuses() == 1
+    assert load_pool("openai-codex").entries()[0].extra.get("unavailable_models") is None
+
+
+def test_codex_entitlement_requires_consistent_id_and_key_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openai-codex": [
+        {"id": "a", "label": "a", "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": "a"},
+        {"id": "b", "label": "b", "auth_type": "api_key", "priority": 1, "source": "manual", "access_token": "b"},
+    ]}})
+    from agent.credential_pool import load_pool
+    pool = load_pool("openai-codex")
+    assert pool.mark_entitlement_unavailable_and_rotate(model="m", credential_id="a", api_key_hint="b") is None
+    assert all(not entry.extra.get("unavailable_models") for entry in pool.entries())
+    assert pool.mark_entitlement_unavailable_and_rotate(model="m", credential_id="a", api_key_hint="a").id == "b"
+
+
 def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     """OpenAI Codex token_invalidated must mark the credential DEAD, not exhausted.
 

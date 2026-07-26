@@ -79,6 +79,24 @@ def test_normal_retry_when_credential_not_exhausted():
     pool.mark_exhausted_and_rotate.assert_not_called()
 
 
+def test_codex_entitlement_rotates_once_then_allows_provider_fallback():
+    entries = [_make_entry(0), _make_entry(1)]
+    pool = _make_pool(entries)
+    pool.provider = "openai-codex"
+    pool.mark_entitlement_unavailable_and_rotate.return_value = entries[1]
+    from run_agent import AIAgent
+    agent = MagicMock(spec=AIAgent)
+    agent._credential_pool = pool
+    agent.provider = "openai-codex"
+    agent.model = "model-a"
+    agent.api_key = "key-0"
+    agent._credential_pool_entry_id = "cred-0"
+    agent._swap_credential = MagicMock()
+    recovered, _ = AIAgent._recover_with_credential_pool(agent, status_code=400, has_retried_429=False, classified_reason=FailoverReason.entitlement)
+    assert recovered is True
+    pool.mark_entitlement_unavailable_and_rotate.assert_called_once()
+
+
 def test_rotate_on_second_429_when_not_exhausted():
     """When credential is active and this is the second 429, rotate (existing behavior)."""
     entries = [_make_entry(0, last_status=None), _make_entry(1)]
