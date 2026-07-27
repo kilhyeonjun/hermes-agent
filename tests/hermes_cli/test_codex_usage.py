@@ -190,7 +190,7 @@ def test_collect_read_only_disables_pool_reconciliation_and_refresh(
 ):
     import hermes_cli.codex_usage as codex_usage
 
-    calls = {"read_only": None, "available": None}
+    calls = {"available": None}
 
     class Pool:
         _strategy = "fill_first"
@@ -205,8 +205,7 @@ def test_collect_read_only_disables_pool_reconciliation_and_refresh(
         def entries(self):
             return []
 
-    def _load_pool(_provider, *, read_only=False):
-        calls["read_only"] = read_only
+    def _load_pool(_provider):
         return Pool()
 
     monkeypatch.setattr("agent.credential_pool.load_pool", _load_pool)
@@ -218,7 +217,7 @@ def test_collect_read_only_disables_pool_reconciliation_and_refresh(
 
     codex_usage.collect(mutate=False)
 
-    assert calls == {"read_only": True, "available": (False, False)}
+    assert calls == {"available": (False, False)}
 
 
 def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_path):

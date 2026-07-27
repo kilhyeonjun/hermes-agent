@@ -22,5 +22,5 @@ def test_recurring_shell_wrappers_use_package_and_never_auto_warmup():
     assert "-m hermes_cli.codex_priority_sync" in shared
     assert "--warmup-unstarted" not in shared
     assert "--warmup-unstarted" not in default
-    assert "--profile-account personal" in default
+    assert "--profile-account" not in default
     assert "--skip-cliproxy" in default
