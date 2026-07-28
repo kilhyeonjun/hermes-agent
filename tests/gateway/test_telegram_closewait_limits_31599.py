@@ -74,18 +74,18 @@ def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
 
 
-def _drive_connect(monkeypatch, *, proxy_url):
+def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
     """Run connect() far enough to build the HTTPXRequests, then abort.
 
     Returns the list of recorded _RecordingHTTPXRequest instances.
     """
     _RecordingHTTPXRequest.instances = []
+    fallback_ips = list(fallback_ips or [])
 
-    # No DoH auto-discovery → exercise the proxy / plain branches, not fallback.
-    async def _no_fallback():
-        return []
+    async def _discover_fallback():
+        return fallback_ips
 
-    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", _no_fallback)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", _discover_fallback)
     monkeypatch.setattr(
         tg_adapter, "resolve_proxy_url", lambda *a, **k: proxy_url
     )
@@ -95,8 +95,7 @@ def _drive_connect(monkeypatch, *, proxy_url):
     adapter = _make_adapter()
     # Skip the cross-process token lock.
     monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
-    # Ensure the adapter reports no statically-configured fallback IPs.
-    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: fallback_ips)
 
     # builder.request(...).get_updates_request(...).build() must be harmless;
     # make build() raise our sentinel so connect() stops right after the
@@ -165,6 +164,22 @@ def test_plain_branch_general_pool_has_tight_keepalive(monkeypatch):
     instances = _drive_connect(monkeypatch, proxy_url=None)
     assert len(instances) >= 2
     _assert_keepalive_tight(instances)
+
+
+def test_fallback_branch_caps_each_inner_pool(monkeypatch):
+    """The real adapter path must not override the fallback transport's FD cap."""
+    instances = _drive_connect(
+        monkeypatch,
+        proxy_url=None,
+        fallback_ips=["149.154.167.220"],
+    )
+    assert len(instances) >= 2
+    for inst in instances:
+        transport = inst.kwargs["httpx_kwargs"]["transport"]
+        limits = transport._transport_kwargs["limits"]
+        assert limits.max_connections <= 8
+        assert limits.max_keepalive_connections <= 4
+        assert limits.keepalive_expiry < 5.0
 
 
 def test_limits_keepalive_below_ptb_default_is_the_contract():

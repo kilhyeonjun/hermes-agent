@@ -2438,11 +2438,20 @@ class TelegramAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
 
             def _strict_error_callback(error: Exception) -> None:
+                nonlocal strict_gate_open
                 # PTB registers this callback for the whole polling
                 # generation. After the readiness gate closes (success),
                 # delegate to the real callback so ongoing polling errors
                 # keep flowing into background recovery.
                 if not strict_gate_open:
+                    if error_callback is not None:
+                        error_callback(error)
+                    return
+                # Progress is the linearization point: an error observed after
+                # the first successful getUpdates belongs to normal recovery,
+                # even if the strict waiter has not resumed yet.
+                if self._polling_progress_event.is_set():
+                    strict_gate_open = False
                     if error_callback is not None:
                         error_callback(error)
                     return
@@ -2494,7 +2503,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await asyncio.gather(
                         progress_wait, error_wait, return_exceptions=True
                     )
-                if strict_error and not progress.is_set():
+                if strict_error:
                     raise OSError(
                         "Telegram polling errored before first getUpdates "
                         "success during initial connect: "
@@ -3692,8 +3701,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     max_keepalive_connections=_base_limits.max_keepalive_connections,
                     keepalive_expiry=_base_limits.keepalive_expiry,
                 )
+                _fallback_cap = TelegramFallbackTransport._POOL_LIMITS
+                _fallback_limits = _httpx.Limits(
+                    max_connections=min(
+                        request_kwargs["connection_pool_size"],
+                        _fallback_cap.max_connections or 8,
+                    ),
+                    max_keepalive_connections=min(
+                        _base_limits.max_keepalive_connections or 4,
+                        _fallback_cap.max_keepalive_connections or 4,
+                    ),
+                    keepalive_expiry=_base_limits.keepalive_expiry,
+                )
             else:  # pragma: no cover — httpx always present alongside PTB
                 _pool_limits = None
+                _fallback_limits = None
 
             def _with_limits(httpx_kwargs: Optional[dict] = None) -> dict:
                 """Merge tuned keepalive limits into httpx client kwargs.
@@ -3738,8 +3760,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # AsyncHTTPTransport instances honour keepalive_expiry — do not
                 # route this through `_with_limits`, httpx would discard it.
                 _transport_kwargs: dict = {}
-                if _pool_limits is not None:
-                    _transport_kwargs["limits"] = _pool_limits
+                if _fallback_limits is not None:
+                    _transport_kwargs["limits"] = _fallback_limits
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={

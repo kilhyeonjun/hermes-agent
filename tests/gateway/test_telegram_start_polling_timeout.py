@@ -253,6 +253,58 @@ async def test_initial_connect_polling_error_fails_fast_not_background(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_initial_connect_error_before_progress_still_fails(monkeypatch):
+    """An error observed before first progress wins even if progress follows
+    before the strict waiter resumes."""
+    monkeypatch.setattr(tg_adapter, "_INITIAL_POLLING_PROGRESS_TIMEOUT", 5.0)
+    a = _bare_adapter()
+    app = MagicMock()
+    app.updater = AsyncMock()
+    delegated = []
+
+    async def start_polling_error_then_progress(**kwargs):
+        kwargs["error_callback"](OSError("first poll failed"))
+        a._record_polling_progress(a._polling_generation)
+
+    app.updater.start_polling = AsyncMock(side_effect=start_polling_error_then_progress)
+    a._app = app
+
+    with pytest.raises(OSError, match="errored before first getUpdates"):
+        await a._start_polling_resilient(
+            drop_pending_updates=True,
+            error_callback=delegated.append,
+            require_progress=True,
+        )
+    assert delegated == []
+
+
+@pytest.mark.asyncio
+async def test_initial_connect_progress_before_error_delegates(monkeypatch):
+    """An error observed after first progress belongs to normal recovery even
+    if the strict waiter has not resumed yet."""
+    monkeypatch.setattr(tg_adapter, "_INITIAL_POLLING_PROGRESS_TIMEOUT", 5.0)
+    a = _bare_adapter()
+    app = MagicMock()
+    app.updater = AsyncMock()
+    delegated = []
+    error = OSError("poll failed after readiness")
+
+    async def start_polling_progress_then_error(**kwargs):
+        a._record_polling_progress(a._polling_generation)
+        kwargs["error_callback"](error)
+
+    app.updater.start_polling = AsyncMock(side_effect=start_polling_progress_then_error)
+    a._app = app
+
+    assert await a._start_polling_resilient(
+        drop_pending_updates=True,
+        error_callback=delegated.append,
+        require_progress=True,
+    ) is True
+    assert delegated == [error]
+
+
+@pytest.mark.asyncio
 async def test_initial_connect_ignores_stale_generation_progress(monkeypatch):
     """Progress recorded for a stale generation must not satisfy readiness."""
     monkeypatch.setattr(tg_adapter, "_INITIAL_POLLING_PROGRESS_TIMEOUT", 0.1)
