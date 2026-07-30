@@ -5076,29 +5076,67 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     except Exception as _be:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)
 
+    # Terminate through the same hard-exit backstop as gateway/run.py::main().
+    #
+    # ``start_gateway`` completes the full graceful teardown (adapters
+    # disconnected, sessions flushed, SQLite closed, cron/MCP stopped) before it
+    # returns OR raises SystemExit, so nothing is left that needs a clean
+    # interpreter shutdown. Letting SystemExit propagate from here is exactly
+    # the #53107 hang: it triggers ``Py_FinalizeEx`` →
+    # ``wait_for_thread_shutdown``, which joins every non-daemon thread — so a
+    # single wedged ThreadPoolExecutor worker (e.g. a streaming LLM call to an
+    # endpoint with no listener) strands the process half-shut-down with the
+    # supervisor unable to revive it.
+    #
+    # ``main()`` in gateway/run.py already routed every exit path through
+    # ``_exit_after_graceful_shutdown``, but THIS entry point — the one
+    # launchd/systemd actually exec (``hermes_cli.main gateway run``) — did not.
+    # Observed: SystemExit(75) raised and logged at T+0, PID still alive 190s
+    # later until an external SIGTERM broke the join. Sibling call path of the
+    # same bug class, same fix.
+    from gateway.run import _exit_after_graceful_shutdown
+
     success = False
     try:
         success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),
-        # but keep the handler for console runs.
+        # but keep the handler for console runs. The SIGINT handler inside
+        # start_gateway has already driven teardown, so hard-exit 0 rather than
+        # returning into interpreter finalization (same join hang).
         _exit_diag(
             "asyncio.run.KeyboardInterrupt",
             traceback=_traceback.format_exc(),
         )
         print("\nGateway stopped.")
+        _exit_after_graceful_shutdown(0)
         return
     except SystemExit as e:
+        # Planned-restart (75), clean-fatal-config, and service-restart paths
+        # all complete teardown first, then raise. Convert to a hard exit
+        # instead of re-raising so the supervisor sees the process actually die.
+        # Code may be None (→ 0), an int, or a str (→ 1, like CPython).
+        _code = getattr(e, "code", None)
         _exit_diag(
             "asyncio.run.SystemExit",
-            code=getattr(e, "code", None),
+            code=_code,
             traceback=_traceback.format_exc(),
         )
+        if _code is None:
+            _exit_code = 0
+        elif isinstance(_code, int):
+            _exit_code = _code
+        else:
+            _exit_code = 1
+        _exit_after_graceful_shutdown(_exit_code)
         raise
     except BaseException as e:
         # Absolutely everything else: Exception, asyncio.CancelledError,
         # even exotic BaseException subclasses. We want the cause logged.
+        # Deliberately re-raised rather than hard-exited: teardown state is
+        # unknown on an unexpected crash, and propagating keeps the traceback
+        # on stderr/gateway.error.log where it is needed to diagnose it.
         _exit_diag(
             "asyncio.run.exception",
             exc_type=type(e).__name__,
@@ -5108,8 +5146,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         raise
     if not success:
         _exit_diag("gateway.exit_nonzero")
+        _exit_after_graceful_shutdown(1)
         sys.exit(1)
     _exit_diag("gateway.exit_clean")
+    _exit_after_graceful_shutdown(0)
 
 
 # =============================================================================
