@@ -274,6 +274,91 @@ def test_cli_run_gateway_propagates_unexpected_exception(
         cli_gateway.run_gateway(replace=False)
 
 
+def test_final_exit_sequence_is_watchdogged(monkeypatch):
+    """The final exit sequence must arm its own leash.
+
+    The stop() watchdog disarms once teardown completes, leaving the final exit
+    sequence (stdio flush -> PID/lock release -> log drain -> os._exit)
+    uncovered. That is precisely where a 2026-07-30 restart lost 190s with no
+    ceiling until a human sent SIGTERM. Assert the arm call happens, carries the
+    intended exit code (so a service-restart 75 still exits 75), and reports the
+    non-daemon threads that a join wedge would be blocked on.
+    """
+    from gateway import shutdown_watchdog
+
+    armed = Mock()
+    monkeypatch.setattr(shutdown_watchdog, "arm_shutdown_watchdog", armed)
+    # The production guard skips arming under pytest (a fired watchdog would
+    # call the real os._exit and kill the worker). Clear the marker so the
+    # arming path itself is exercised; the Mock keeps it inert.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
+    monkeypatch.setattr(gateway_run.sys, "stdout", SimpleNamespace(flush=Mock()))
+    monkeypatch.setattr(gateway_run.sys, "stderr", SimpleNamespace(flush=Mock()))
+
+    with pytest.raises(_ExitCalled) as exc_info:
+        gateway_run._exit_after_graceful_shutdown(75)
+
+    assert exc_info.value.code == 75, "intended exit code must still reach os._exit"
+    armed.assert_called_once()
+
+    delay = armed.call_args.args[0]
+    assert delay > 0, "a non-positive delay would make arm_shutdown_watchdog a no-op"
+
+    kwargs = armed.call_args.kwargs
+    assert kwargs["exit_code"] == 75, "watchdog must preserve the service-restart code"
+    # The fire path must not repeat the wedge-prone steps it exists to escape
+    # (stdio flush / PID-lock release / log drain), or it hangs in the same spot.
+    assert kwargs["minimal_exit"] is True
+
+    snapshot = kwargs["snapshot_fn"]()
+    assert snapshot["phase"] == "final_exit_sequence"
+    assert snapshot["intended_exit_code"] == 75
+    # Non-daemon threads are the ones Py_FinalizeEx joins — the wedge candidates.
+    assert isinstance(snapshot["non_daemon_threads"], list)
+
+
+def test_final_exit_watchdog_not_armed_under_pytest(monkeypatch):
+    """Arming must be suppressed under pytest.
+
+    The watchdog calls the REAL os._exit on fire (tests patch os._exit on
+    gateway.run, not on shutdown_watchdog), so arming it inside a test worker
+    risks killing the whole pytest process after the delay elapses.
+    """
+    from gateway import shutdown_watchdog
+
+    armed = Mock()
+    monkeypatch.setattr(shutdown_watchdog, "arm_shutdown_watchdog", armed)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_sentinel")
+    monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
+    monkeypatch.setattr(gateway_run.sys, "stdout", SimpleNamespace(flush=Mock()))
+    monkeypatch.setattr(gateway_run.sys, "stderr", SimpleNamespace(flush=Mock()))
+
+    with pytest.raises(_ExitCalled):
+        gateway_run._exit_after_graceful_shutdown(0)
+
+    armed.assert_not_called()
+
+
+def test_final_exit_watchdog_failure_does_not_block_exit(monkeypatch):
+    """A broken watchdog must never block the exit it is protecting."""
+    from gateway import shutdown_watchdog
+
+    def _boom(*a, **k):
+        raise RuntimeError("watchdog arming exploded")
+
+    monkeypatch.setattr(shutdown_watchdog, "arm_shutdown_watchdog", _boom)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
+    monkeypatch.setattr(gateway_run.sys, "stdout", SimpleNamespace(flush=Mock()))
+    monkeypatch.setattr(gateway_run.sys, "stderr", SimpleNamespace(flush=Mock()))
+
+    with pytest.raises(_ExitCalled) as exc_info:
+        gateway_run._exit_after_graceful_shutdown(75)
+
+    assert exc_info.value.code == 75
+
+
 def test_exit_backstop_releases_pid_file_and_runtime_lock(monkeypatch):
     """os._exit bypasses atexit, and the early SystemExit exit paths never run
     _stop_impl — so the force-exit backstop itself must release the PID file and

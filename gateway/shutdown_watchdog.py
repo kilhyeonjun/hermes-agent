@@ -115,6 +115,7 @@ def _write_watchdog_dump(
     *,
     delay_s: float,
     snapshot: Optional[Dict[str, Any]],
+    stderr_mirror: bool = True,
 ) -> None:
     """Best-effort faulthandler + metadata dump before hard-exit."""
     try:
@@ -145,6 +146,13 @@ def _write_watchdog_dump(
 
     # Also dump to stderr so journald/launchd capture it even if the file
     # write failed (wedged disk was one of the #66892 hypotheses).
+    #
+    # Skipped when ``stderr_mirror=False``: a watchdog covering the final exit
+    # sequence may be firing *because* stdio is wedged, and writing/flushing
+    # stderr there would hang the watchdog in the very spot it exists to escape.
+    # The file dump above already carries the stacks.
+    if not stderr_mirror:
+        return
     try:
         sys.stderr.write(
             f"Gateway shutdown watchdog fired after {delay_s:.0f}s "
@@ -164,6 +172,7 @@ def arm_shutdown_watchdog(
     exit_code: int = 1,
     dump_path: Optional[Path] = None,
     name: str = "gateway-shutdown-watchdog",
+    minimal_exit: bool = False,
 ) -> threading.Event:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path.
 
@@ -202,7 +211,23 @@ def arm_shutdown_watchdog(
                 snapshot = {"snapshot_error": repr(exc)}
 
         target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
-        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
+        _write_watchdog_dump(
+            target,
+            delay_s=delay,
+            snapshot=snapshot,
+            stderr_mirror=not minimal_exit,
+        )
+
+        if minimal_exit:
+            # Covering the FINAL exit sequence: stdio flush, PID/lock release and
+            # the log drain are the very steps that can be wedged (that is why
+            # this fired). Repeating them here would hang the watchdog in the
+            # same spot and defeat its purpose — it would look protective while
+            # never reaching os._exit. The stack dump above is already on disk,
+            # and the caller (_exit_after_graceful_shutdown) has released the PID
+            # file and runtime lock before the wedge-prone steps, so go straight
+            # to the kernel.
+            os._exit(exit_code)
 
         try:
             logger.critical(

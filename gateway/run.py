@@ -22453,6 +22453,16 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 # hop back through run_one_job's bookkeeping.
 _CRON_SHUTDOWN_DRAIN_TIMEOUT = 65.0
 
+# Wall-clock leash for the final exit sequence in
+# ``_exit_after_graceful_shutdown``: stdio flush, PID/lock release, bounded log
+# drain, ``os._exit``. That sequence normally completes in milliseconds (the log
+# drain is itself capped at 1s), so 15s is ~10x headroom and will not fire
+# spuriously on a slow disk. Its purpose is to make the window BOUNDED: it was
+# previously uncovered by the stop() watchdog, which disarms once teardown
+# finishes, and a 2026-07-30 restart sat there 190s with no ceiling until a
+# human sent SIGTERM.
+_FINAL_EXIT_WATCHDOG_DELAY_S = 15.0
+
 # Upper bound for cooperatively draining the housekeeping ticker on shutdown.
 # Housekeeping periodically refreshes the channel directory via
 # ``safe_schedule_threadsafe(build_channel_directory(...), loop)`` and blocks on
@@ -23145,22 +23155,68 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     never runs on this path — we drain explicitly (bounded, via
     ``drain_log_queue``) or lose the last log lines (including the shutdown
     reason on the early-exit paths). Stdio is flushed too.
+
+    Finally, this function is itself watchdogged. The ``stop()`` watchdog is
+    disarmed once teardown completes, which left the *final exit sequence*
+    uncovered — the window where a 2026-07-30 restart lost 190s with no ceiling
+    and needed a manual SIGTERM. The steps below are ordinarily sub-second, but
+    a stdio flush or PID/lock release on a wedged disk has no bound of its own,
+    and reaching ``os._exit`` is what makes every earlier bound meaningful. Arm
+    a short in-process leash so that window can never again be unbounded: on
+    fire it dumps every thread's stack via ``faulthandler`` (the data a
+    thread-join wedge actually needs — ``ps``/``pstree`` cannot show it) and
+    hard-exits with the SAME code, so a service-restart 75 is still seen as 75.
+
+    Normal shutdowns disarm it implicitly by reaching ``os._exit`` below in
+    milliseconds, so this adds no output on a healthy path.
     """
-    for stream in (sys.stdout, sys.stderr):
+    # Never arm under pytest: this spawns a real daemon thread that calls the
+    # real os._exit() on fire. Tests monkeypatch os._exit on THIS module, not on
+    # shutdown_watchdog, so a fired watchdog would kill the pytest worker.
+    # Mirrors the guard on the stop() watchdog.
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
         try:
-            stream.flush()
+            from gateway.shutdown_watchdog import arm_shutdown_watchdog
+
+            arm_shutdown_watchdog(
+                _FINAL_EXIT_WATCHDOG_DELAY_S,
+                snapshot_fn=lambda: {
+                    "phase": "final_exit_sequence",
+                    "intended_exit_code": exit_code,
+                    "non_daemon_threads": [
+                        t.name for t in threading.enumerate() if not t.daemon
+                    ],
+                },
+                exit_code=exit_code,
+                name="gateway-final-exit-watchdog",
+                # This watchdog fires *because* a step of the exit sequence is
+                # wedged. Its own fire path must not repeat those steps (stdio
+                # flush, PID/lock release, log drain) or it hangs in the same
+                # spot — protective in appearance only. Dump stacks to file,
+                # then straight to os._exit.
+                minimal_exit=True,
+            )
         except Exception:
+            # Diagnostics must never block the exit they are protecting.
             pass
-    # Release PID + runtime lock BEFORE the log drain: the drain is bounded but
-    # could still take up to its timeout on a wedged disk, and these locks must
-    # never be stranded. os._exit skips atexit, and the early SystemExit exit
-    # paths never run _stop_impl, so release here (idempotent).
+
+    # Release PID + runtime lock FIRST: these locks must never be stranded, and
+    # every step after this point can block on a wedged disk or pipe — the stdio
+    # flush below included, which is why the final-exit watchdog armed above can
+    # hard-exit mid-sequence. Releasing before any blocking step is what makes
+    # that hard exit safe. os._exit skips atexit, and the early SystemExit paths
+    # never run _stop_impl, so release here (both calls idempotent).
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
     except Exception:
         pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
     # Drain the async log queue: os._exit bypasses atexit, so the listener's
     # atexit drain won't fire. Use drain_log_queue() (bounded, no restart), NOT
     # flush_log_queue(): if the listener is wedged on the rotation lock — the
