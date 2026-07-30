@@ -774,6 +774,41 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
     return target, None
 
 
+class _SkillPathOutsideRoots(Exception):
+    """A skill write resolved outside every configured skills root."""
+
+
+def _assert_within_skills_roots(path: Path) -> None:
+    """Reject a skill WRITE whose real path escapes the configured skills roots.
+
+    Why: a skills-tree entry can be a symlink into a vendored source checkout
+    (``~/.hermes/skills/orchestration`` -> an Orca clone). Writing through it
+    records Hermes skills inside someone else's repo. Reads stay unrestricted —
+    only writes are gated, and every configured root (local + declared
+    ``skills.external_dirs``) is allowed so external skills remain editable.
+    """
+    from agent.skill_utils import get_all_skills_dirs
+    from tools.path_security import validate_within_dir
+
+    roots = get_all_skills_dirs()
+    if any(validate_within_dir(path, root) is None for root in roots):
+        return
+
+    try:
+        real = path.resolve()
+    except OSError:
+        real = path.absolute()
+    vendor_note = (
+        " That path is a vendored skill source tree."
+        if "agent-skill-sources" in str(real) else ""
+    )
+    raise _SkillPathOutsideRoots(
+        f"Refusing skill write to '{path}': it resolves to {real}, outside the "
+        f"configured skills roots ({', '.join(str(r) for r in roots)})."
+        f"{vendor_note} Use a Hermes-owned real-directory location instead."
+    )
+
+
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
@@ -786,7 +821,11 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         file_path: Target file path
         content: Content to write
         encoding: Text encoding (default: utf-8)
+
+    Raises:
+        _SkillPathOutsideRoots: target escapes the configured skills roots.
     """
+    _assert_within_skills_roots(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         dir=str(file_path.parent),
@@ -840,6 +879,14 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
+
+    # Checked here too (not just in _atomic_write_text) so a poisoned category
+    # symlink can't leave an empty directory behind in the escaped tree.
+    try:
+        _assert_within_skills_roots(skill_dir)
+    except _SkillPathOutsideRoots as exc:
+        return {"success": False, "error": f"Category '{category}': {exc}"}
+
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write SKILL.md atomically
@@ -1371,40 +1418,46 @@ def skill_manage(
     if gate_result is not None:
         return gate_result
 
-    if action == "create":
-        if not content:
-            return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+    # Single containment boundary: every write path funnels through
+    # _atomic_write_text, which raises when the target escapes the skills roots
+    # (e.g. a category or located skill dir that symlinks into a vendor repo).
+    try:
+        if action == "create":
+            if not content:
+                return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+            result = _create_skill(name, content, category)
 
-    elif action == "edit":
-        if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        elif action == "edit":
+            if not content:
+                return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            result = _edit_skill(name, content)
 
-    elif action == "patch":
-        if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
-        if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        elif action == "patch":
+            if not old_string:
+                return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
+            if new_string is None:
+                return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
-    elif action == "delete":
-        result = _delete_skill(name, absorbed_into=absorbed_into)
+        elif action == "delete":
+            result = _delete_skill(name, absorbed_into=absorbed_into)
 
-    elif action == "write_file":
-        if not file_path:
-            return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
-        if file_content is None:
-            return tool_error("file_content is required for 'write_file'.", success=False)
-        result = _write_file(name, file_path, file_content)
+        elif action == "write_file":
+            if not file_path:
+                return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
+            if file_content is None:
+                return tool_error("file_content is required for 'write_file'.", success=False)
+            result = _write_file(name, file_path, file_content)
 
-    elif action == "remove_file":
-        if not file_path:
-            return tool_error("file_path is required for 'remove_file'.", success=False)
-        result = _remove_file(name, file_path)
+        elif action == "remove_file":
+            if not file_path:
+                return tool_error("file_path is required for 'remove_file'.", success=False)
+            result = _remove_file(name, file_path)
 
-    else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        else:
+            result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+    except _SkillPathOutsideRoots as exc:
+        result = {"success": False, "error": str(exc)}
 
     if result.get("success"):
         try:
