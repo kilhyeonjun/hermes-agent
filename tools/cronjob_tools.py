@@ -567,6 +567,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "model": job.get("model"),
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
+        "reasoning_effort": job.get("reasoning_effort"),
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
@@ -1043,6 +1044,7 @@ def cronjob(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
@@ -1132,6 +1134,7 @@ def cronjob(
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
+                    reasoning_effort=_normalize_optional_job_value(reasoning_effort),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
@@ -1320,6 +1323,8 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            if reasoning_effort is not None:
+                updates["reasoning_effort"] = _normalize_optional_job_value(reasoning_effort)
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
@@ -1495,6 +1500,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+                "description": "Optional per-job reasoning effort. Empty on update restores profile inheritance."
             },
             "script": {
                 "type": "string",

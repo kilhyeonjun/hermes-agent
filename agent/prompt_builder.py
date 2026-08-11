@@ -13,7 +13,7 @@ import contextvars
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import get_default_hermes_root, get_hermes_home, get_skills_dir, is_wsl
 from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
@@ -2108,6 +2108,29 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
         return None
+
+
+def _load_runtime_contract(filename: str, context_length: Optional[int] = None) -> str:
+    override = get_default_hermes_root() / "runtime-contracts" / filename
+    packaged = Path(__file__).resolve().parent / "runtime_contracts" / filename
+    path = override if override.is_file() else packaged
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.debug("Could not read runtime contract from %s: %s", path, exc)
+        return ""
+    if not content:
+        return ""
+    label = f"runtime-contracts/{filename}"
+    return _truncate_content(_scan_context_content(content, label), label, context_length=context_length, read_path=str(path))
+
+
+def load_performance_observation_contract(context_length: Optional[int] = None) -> str:
+    return _load_runtime_contract("performance-observation.md", context_length)
+
+
+def load_outcome_control_contract(context_length: Optional[int] = None) -> str:
+    return _load_runtime_contract("outcome-control.md", context_length)
 
 
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:

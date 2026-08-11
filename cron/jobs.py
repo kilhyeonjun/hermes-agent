@@ -1481,6 +1481,20 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_job_reasoning_effort(value: Any) -> Optional[str]:
+    """Normalize an optional per-job reasoning override."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Cron job reasoning effort must be a string or null")
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    normalized = value.strip().lower()
+    if normalized not in {"none", *VALID_REASONING_EFFORTS}:
+        raise ValueError(f"Invalid cron job reasoning effort {value!r}")
+    return normalized
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1578,6 +1592,7 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -1668,6 +1683,7 @@ def create_job(
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
+    normalized_reasoning_effort = _normalize_job_reasoning_effort(reasoning_effort)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
@@ -1748,6 +1764,7 @@ def create_job(
         "provider_snapshot": provider_snapshot,
         "model_snapshot": model_snapshot,
         "base_url": normalized_base_url,
+        "reasoning_effort": normalized_reasoning_effort,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
         "monitor_script": normalized_monitor_script,
@@ -1880,6 +1897,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "reasoning_effort" in updates:
+                updates["reasoning_effort"] = _normalize_job_reasoning_effort(
+                    updates["reasoning_effort"]
+                )
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).

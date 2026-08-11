@@ -47,6 +47,8 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    load_outcome_control_contract,
+    load_performance_observation_contract,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
@@ -199,6 +201,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    for contract in (
+        load_performance_observation_contract(_ctx_len),
+        load_outcome_control_contract(_ctx_len),
+    ):
+        if contract:
+            stable_parts.append(contract)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)

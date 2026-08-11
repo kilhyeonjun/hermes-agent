@@ -3165,6 +3165,18 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+def _resolve_cron_reasoning_config(job: dict, config: Any, model: str = ""):
+    """Resolve a job override before the profile's reasoning policy."""
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    effort = job.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip():
+        parsed = parse_reasoning_effort(effort)
+        if parsed is not None:
+            return parsed
+    return resolve_reasoning_config(config if isinstance(config, dict) else {}, model)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
@@ -3767,10 +3779,6 @@ def run_job(
         except Exception:
             pass
 
-        # Reasoning config is resolved after provider authentication so an auth
-        # fallback can first replace the primary model with its configured model.
-        from hermes_constants import resolve_reasoning_config
-
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
         # retained as a legacy fallback for older CLI/godmode configs.
@@ -3966,9 +3974,7 @@ def run_job(
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
-        )
+        reasoning_config = _resolve_cron_reasoning_config(job, _cfg, str(model))
 
         # Provider/model-drift fail-closed guard (#44585).
         #

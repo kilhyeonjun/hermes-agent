@@ -1325,6 +1325,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    reasoning_effort_override: Any = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1552,7 +1553,7 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = reasoning_effort_override if reasoning_effort_override is not None else delegation_cfg.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -3135,6 +3136,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    preset: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     parent_agent=None,
@@ -3192,6 +3194,10 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    try:
+        cfg = _resolve_delegation_preset_config(cfg, preset)
+    except ValueError as exc:
+        return tool_error(str(exc))
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3214,6 +3220,9 @@ def delegate_task(
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
+        if preset:
+            logger.warning("Delegation preset resolution failed: %s", exc)
+            return tool_error("Delegation preset could not be resolved. Check its operator configuration.")
         return tool_error(str(exc))
 
     # Normalize to task list
@@ -3362,6 +3371,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            reasoning_effort_override=cfg.get("reasoning_effort"),
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -3542,6 +3552,9 @@ def delegate_task(
         # conversation. Full text is spilled to disk so nothing is lost.
         # Covers both the single-task and batch paths. See PR #9126.
         _finalize_child_results(results, task_list, children, parent_agent)
+        if preset:
+            for entry in results:
+                entry.pop("model", None)
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
@@ -4026,6 +4039,45 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _get_delegation_presets(cfg: Optional[dict] = None) -> Dict[str, dict]:
+    source = cfg if isinstance(cfg, dict) else _load_config()
+    raw = source.get("presets")
+    if not isinstance(raw, dict):
+        return {}
+    return {name.strip(): value for name, value in sorted(raw.items()) if isinstance(name, str) and name.strip() and isinstance(value, dict)}
+
+
+def _build_preset_param_schema(presets: Dict[str, dict]) -> Dict[str, Any]:
+    names = list(presets)
+    return {
+        "type": "string",
+        "enum": names,
+        "description": "Operator-configured execution preset. It selects trusted model and reasoning settings without exposing those settings to the model. Only preset names are model-facing. Available presets: " + ", ".join(names) + ".",
+    }
+
+
+def _resolve_delegation_preset_config(cfg: dict, preset_name: Optional[str]) -> dict:
+    base = {key: value for key, value in cfg.items() if key != "presets"}
+    if not preset_name:
+        return base
+    preset = _get_delegation_presets(cfg).get(str(preset_name).strip())
+    if preset is None:
+        raise ValueError(f"Unknown delegation preset '{preset_name}'.")
+    unsupported = set(preset) - {"model", "provider", "reasoning_effort", "description"}
+    if unsupported:
+        raise ValueError(f"Delegation preset '{preset_name}' has unsupported key(s): {', '.join(sorted(unsupported))}.")
+    if "reasoning_effort" in preset:
+        from hermes_constants import parse_reasoning_effort
+        if parse_reasoning_effort(preset["reasoning_effort"]) is None:
+            raise ValueError(f"Delegation preset '{preset_name}' has invalid reasoning_effort '{preset['reasoning_effort']}'.")
+    for key in ("model", "provider", "reasoning_effort"):
+        if key in preset:
+            base[key] = preset[key]
+    if str(preset.get("provider") or "").strip():
+        base.update(base_url="", api_key="", api_mode="")
+    return base
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -4186,6 +4238,11 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    presets = _get_delegation_presets()
+    if presets:
+        overrides_params["properties"]["preset"] = _build_preset_param_schema(presets)
+    else:
+        overrides_params["properties"].pop("preset", None)
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -4267,6 +4324,7 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
+
             "output_schema": {
                 "type": "object",
                 "description": (
@@ -4346,6 +4404,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        preset=args.get("preset"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         parent_agent=kw.get("parent_agent"),
