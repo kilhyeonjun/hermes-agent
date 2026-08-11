@@ -3797,7 +3797,12 @@ class MCPServerTask:
         from tools.registry import registry
 
         with registry.mutation_transaction():
+            if _servers.get(self.name) is not self:
+                return
+            toolset_name = f"mcp-{self.name}"
             for tool_name in list(getattr(self, "_registered_tool_names", [])):
+                if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                    continue
                 registry.deregister(tool_name)
                 _forget_mcp_tool_server(tool_name)
             self._registered_tool_names = []

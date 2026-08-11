@@ -222,11 +222,11 @@ def collect(*, mutate: bool = True) -> Dict[str, Any]:
     # inspect the full pool. Quota reporting must include exhausted credentials
     # too; otherwise a 7d-reset-aware recommendation cannot see the account that
     # is about to recover next.
-    available_entries = pool._available_entries(
+    available_entries, _pending_refresh = pool._available_entries(
         clear_expired=mutate,
         refresh=mutate,
     )  # intentional internal API
-    routable_entries = pool._routable_entries(available_entries)  # intentional internal API
+    routable_entries = available_entries
     entries = pool.entries()
     strategy = str(getattr(pool, "_strategy", "fill_first"))
     if strategy == "fill_first":
@@ -288,7 +288,14 @@ def collect(*, mutate: bool = True) -> Dict[str, Any]:
         },
         "accounts": rows,
     }
-    payload["routing"].update(load_route_policy())
+    route_policy = load_route_policy()
+    payload["routing"].update(route_policy)
+    fixed_id = route_policy.get("fixed_credential_id")
+    if route_policy.get("mode") == "fixed" and fixed_id:
+        fixed_entry = next((entry for entry in entries if entry.id == fixed_id), None)
+        payload["routing"]["current_label"] = (
+            fixed_entry.label if fixed_entry is not None else None
+        )
     payload["recommendation"] = compute_recommendation(rows)
     return payload
 

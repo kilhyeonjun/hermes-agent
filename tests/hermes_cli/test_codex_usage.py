@@ -156,7 +156,7 @@ def test_collect_reports_fill_first_account_as_current_routing(monkeypatch, tmp_
         _strategy = "fill_first"
 
         def _available_entries(self, *, clear_expired=False, refresh=False):
-            return entries
+            return entries, []
 
         def _routable_entries(self, values):
             return values
@@ -197,7 +197,7 @@ def test_collect_read_only_disables_pool_reconciliation_and_refresh(
 
         def _available_entries(self, *, clear_expired, refresh):
             calls["available"] = (clear_expired, refresh)
-            return []
+            return [], []
 
         def _routable_entries(self, values):
             return values
@@ -239,7 +239,7 @@ def test_collect_merges_fixed_route_policy_into_live_routing(monkeypatch, tmp_pa
         _strategy = "fill_first"
 
         def _available_entries(self, **_kwargs):
-            return [personal_entry, Entry()]
+            return [personal_entry, Entry()], []
 
         def _routable_entries(self, entries):
             return [entry for entry in entries if entry.id == "company-id"]
@@ -307,7 +307,7 @@ def test_collect_and_compact_redact_raw_label_and_http_error_body(
         _strategy = "fill_first"
 
         def _available_entries(self, **_kwargs):
-            return [Entry()]
+            return [Entry()], []
 
         def _routable_entries(self, entries):
             return entries

@@ -25,7 +25,9 @@ def resolve_credential_label(agent: Any) -> Optional[str]:
         except Exception:
             return None
     try:
-        entries = pool._available_entries(clear_expired=False, refresh=False)
+        entries, _pending_refresh = pool._available_entries(
+            clear_expired=False, refresh=False
+        )
     except Exception:
         try:
             entries = getattr(pool, "_entries", []) or []
