@@ -1277,7 +1277,19 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - codex-runtime: profile-local runtime selection; reached through
+#     /hermes so its underscore alias cannot consume a native slot.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "codex-runtime"})
+
+# Aliases of curated commands must follow their canonical command's Slack
+# routing policy. Otherwise /codex_runtime or /hb could consume the slot that
+# /hermes <command> intentionally reserves at the native slash-command cap.
+_SLACK_VIA_HERMES_ALIASES = frozenset(
+    alias
+    for cmd in COMMAND_REGISTRY
+    if cmd.name in _SLACK_VIA_HERMES_ONLY
+    for alias in cmd.aliases
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1327,7 +1339,10 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             return
         if slack_name in _SLACK_RESERVED_COMMANDS:
             return
-        if slack_name in _SLACK_VIA_HERMES_ONLY:
+        if (
+            slack_name in _SLACK_VIA_HERMES_ONLY
+            or slack_name in _SLACK_VIA_HERMES_ALIASES
+        ):
             # Intentionally Slack-via-/hermes only (see _SLACK_VIA_HERMES_ONLY).
             return
         if len(entries) >= _SLACK_MAX_SLASH_COMMANDS:

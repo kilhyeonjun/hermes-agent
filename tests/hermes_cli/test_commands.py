@@ -14,6 +14,7 @@ from hermes_cli.commands import (
     SlashCommandCompleter,
     _CMD_NAME_LIMIT,
     _SLACK_RESERVED_COMMANDS,
+    _SLACK_VIA_HERMES_ALIASES,
     _SLACK_VIA_HERMES_ONLY,
     _TG_NAME_LIMIT,
     _clamp_command_names,
@@ -241,6 +242,18 @@ class TestSlackNativeSlashes:
         assert not missing, (
             f"commands on Telegram but missing from Slack native slashes: {sorted(missing)}"
         )
+
+    def test_curated_commands_and_aliases_stay_behind_hermes_catch_all(self):
+        """Profile-local controls must not consume scarce native Slack slots."""
+        expected = frozenset({
+            "topup", "moa", "debug", "egress", "init", "version", "diff",
+            "update", "heartbeat", "refine", "pause", "codex-runtime",
+        })
+        assert _SLACK_VIA_HERMES_ONLY == expected
+        assert _SLACK_VIA_HERMES_ALIASES == frozenset({"codex_runtime", "hb", "v"})
+
+        native_names = {name for name, _description, _hint in slack_native_slashes()}
+        assert not (expected | _SLACK_VIA_HERMES_ALIASES) & native_names
 
 
 class TestSlackAppManifest:
