@@ -189,19 +189,16 @@ def _is_openai_api_base_url(base_url: Any) -> bool:
 
 
 def _model_consumes_thought_signature(model: Any) -> bool:
-    """True when the outgoing model is a Gemini family model that requires
-    ``extra_content`` (thought_signature) to be replayed on tool calls.
-
-    Gemini 3 thinking models attach ``extra_content`` to each tool call and
-    reject subsequent requests with HTTP 400 if it is missing. Every other
-    strict OpenAI-compatible provider (Fireworks, Mistral, ...) rejects the
-    request with 400 if ``extra_content`` *is* present. So the field must be
-    kept only when the target model is itself Gemini-family, and stripped
-    otherwise — including when a non-Gemini model inherits stale Gemini
-    ``extra_content`` from earlier in a mixed-provider session.
-    """
+    """True for model families requiring thought_signature on tool calls."""
     m = str(model or "").lower()
     return "gemini" in m or "gemma" in m
+
+
+def _sanitize_chat_completion_request_overrides(overrides: Any) -> dict[str, Any]:
+    """Drop native-provider overrides unsupported by Chat Completions."""
+    if not isinstance(overrides, dict):
+        return {}
+    return {key: value for key, value in overrides.items() if key != "speed"}
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -589,7 +586,9 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs["extra_body"] = extra_body
 
         # Request overrides last (service_tier etc.)
-        overrides = params.get("request_overrides")
+        overrides = _sanitize_chat_completion_request_overrides(
+            params.get("request_overrides")
+        )
         if overrides:
             api_kwargs.update(overrides)
 
@@ -712,7 +711,9 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body.update(additions)
 
         # Request overrides (user config)
-        overrides = params.get("request_overrides")
+        overrides = _sanitize_chat_completion_request_overrides(
+            params.get("request_overrides")
+        )
         if overrides:
             for k, v in overrides.items():
                 if k == "extra_body" and isinstance(v, dict):
