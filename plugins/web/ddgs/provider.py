@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 # the (single, shared) agent loop indefinitely (#36776). Enforce a hard cap
 # here by killing a disposable worker process (#68096).
 _SEARCH_TIMEOUT_SECS = 30
+_VALID_TIMELIMITS = {"d", "w", "m", "y"}
+
 
 # How often the parent polls stdout / interrupt flag while waiting.
 _POLL_INTERVAL_SECS = 0.1
@@ -49,7 +51,41 @@ class _SearchInterrupted(Exception):
     """Raised when tools.interrupt.is_interrupted() trips during a search wait."""
 
 
-def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
+def _load_ddgs_web_config() -> Dict[str, Any]:
+    """Read ``web.ddgs`` from the active profile config."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        web = config.get("web") if isinstance(config, dict) else None
+        ddgs = web.get("ddgs") if isinstance(web, dict) else None
+        return ddgs if isinstance(ddgs, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not load web.ddgs config: %s", exc)
+        return {}
+
+
+def _ddgs_search_options() -> dict[str, str | None]:
+    config = _load_ddgs_web_config()
+    region = str(config.get("region") or "us-en").strip() or "us-en"
+    backend = str(config.get("backend") or "auto").strip() or "auto"
+    raw_timelimit = config.get("timelimit")
+    timelimit = str(raw_timelimit).strip().lower() if raw_timelimit else None
+    return {
+        "region": region,
+        "timelimit": timelimit if timelimit in _VALID_TIMELIMITS else None,
+        "backend": backend,
+    }
+
+
+def _run_ddgs_search(
+    query: str,
+    safe_limit: int,
+    *,
+    region: str = "us-en",
+    timelimit: str | None = None,
+    backend: str = "auto",
+) -> list[dict[str, Any]]:
     """Run the blocking ddgs query and return normalized hits.
 
     Module-level (not a closure) so the child worker can import it and so
@@ -61,7 +97,15 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
 
     results: list[dict[str, Any]] = []
     with DDGS(timeout=10) as client:
-        for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+        for i, hit in enumerate(
+            client.text(
+                query,
+                max_results=safe_limit,
+                region=region,
+                timelimit=timelimit,
+                backend=backend,
+            )
+        ):
             if i >= safe_limit:
                 break
             url = str(hit.get("href") or hit.get("url") or "")
@@ -152,7 +196,11 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
 
     global _last_worker_proc
 
-    request: dict[str, Any] = {"query": query, "safe_limit": safe_limit}
+    request: dict[str, Any] = {
+        "query": query,
+        "safe_limit": safe_limit,
+        **_ddgs_search_options(),
+    }
     if _test_hook:
         request["test_hook"] = _test_hook
 

@@ -41,7 +41,7 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
             return self
         def __exit__(self, *_a):
             return False
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **_options):
             if text_sleep is not None:
                 _time.sleep(text_sleep)
             if text_raises is not None:
@@ -106,6 +106,61 @@ class TestDDGSProviderSearch:
         assert len(web) == 3
         assert web[0] == {"title": "A", "url": "https://a.example.com", "description": "desc A", "position": 1}
         assert web[2]["position"] == 3
+
+    def test_profile_options_reach_ddgs_in_real_worker(self, monkeypatch, tmp_path):
+        """Real config, provider, worker, and fake DDGS module; no network."""
+        fake_ddgs_dir = tmp_path / "fake_ddgs"
+        fake_ddgs_dir.mkdir()
+        capture_path = tmp_path / "ddgs_call.json"
+        (fake_ddgs_dir / "ddgs.py").write_text(
+            """
+import json
+import os
+
+
+class DDGS:
+    def __init__(self, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def text(self, query, max_results=5, **options):
+        with open(os.environ[\"DDGS_CAPTURE_PATH\"], \"w\", encoding=\"utf-8\") as capture:
+            json.dump({\"query\": query, \"max_results\": max_results, **options}, capture)
+        return [{\"title\": \"Hit\", \"href\": \"https://example.com\", \"body\": \"body\"}]
+""".lstrip(),
+            encoding="utf-8",
+        )
+        home = tmp_path / "hermes_home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "web:\n  ddgs:\n    region: kr-kr\n    timelimit: w\n    backend: bing,duckduckgo\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PYTHONPATH", str(fake_ddgs_dir))
+        monkeypatch.setenv("DDGS_CAPTURE_PATH", str(capture_path))
+        monkeypatch.syspath_prepend(str(fake_ddgs_dir))
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        result = DDGSWebSearchProvider().search("한국 정책", limit=3)
+
+        assert result["success"] is True
+        assert result["data"]["web"][0]["url"] == "https://example.com"
+        assert json.loads(capture_path.read_text(encoding="utf-8")) == {
+            "query": "한국 정책",
+            "max_results": 3,
+            "region": "kr-kr",
+            "timelimit": "w",
+            "backend": "bing,duckduckgo",
+        }
+        _assert_worker_reaped(sys.modules["plugins.web.ddgs.provider"])
 
 
     def test_empty_results(self, monkeypatch):

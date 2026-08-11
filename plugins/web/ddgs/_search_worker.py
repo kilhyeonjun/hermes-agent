@@ -5,7 +5,8 @@ parent provider). Reads one JSON request from stdin, writes one JSON envelope
 to stdout, then exits.
 
 Request::
-    {"query": str, "safe_limit": int}
+    {"query": str, "safe_limit": int, "region": str, "timelimit": str | null,
+     "backend": str}
 
 Envelope::
     {"ok": true, "results": [...]}
@@ -97,11 +98,23 @@ def main() -> int:
 
     query = str(request.get("query") or "")
     safe_limit = max(1, int(request.get("safe_limit") or 1))
+    region = str(request.get("region") or "us-en").strip() or "us-en"
+    backend = str(request.get("backend") or "auto").strip() or "auto"
+    raw_timelimit = request.get("timelimit")
+    timelimit = str(raw_timelimit).strip().lower() if raw_timelimit else None
+    if timelimit not in {"d", "w", "m", "y"}:
+        timelimit = None
     try:
         # Import inside main so script startup stays light / patchable.
         from plugins.web.ddgs.provider import _run_ddgs_search
 
-        results = _run_ddgs_search(query, safe_limit)
+        results = _run_ddgs_search(
+            query,
+            safe_limit,
+            region=region,
+            timelimit=timelimit,
+            backend=backend,
+        )
         _write_envelope({"ok": True, "results": results})
         return 0
     except Exception as exc:  # noqa: BLE001
