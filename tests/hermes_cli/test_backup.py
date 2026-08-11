@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import stat
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -677,6 +678,108 @@ class TestQuickSnapshot:
         assert len(rows) == 1
         assert rows[0] == ("s1", "hello world")
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+    def test_snapshot_tree_is_private_under_permissive_umask(self, hermes_home):
+        """Quick snapshots protect state even when the caller's umask is 000."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        old_umask = os.umask(0)
+        try:
+            snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        finally:
+            os.umask(old_umask)
+
+        root = hermes_home / "state-snapshots"
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        snap_dir = root / snap_id
+        for path in [snap_dir, *snap_dir.rglob("*")]:
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            if path.is_dir():
+                assert mode == 0o700, path
+            else:
+                assert path.is_file() and not path.is_symlink(), path
+                assert mode == 0o600, path
+
+    @pytest.mark.skipif(os.name != "posix", reason="dir-fd hardening is POSIX-only")
+    def test_snapshot_copy_rejects_parent_swapped_to_symlink(self, tmp_path, monkeypatch):
+        """A checked snapshot parent cannot be swapped to redirect a write."""
+        import hermes_cli.backup as backup
+
+        src = tmp_path / "source.txt"
+        src.write_text("sensitive", encoding="utf-8")
+        snap_dir = tmp_path / "snapshot"
+        snap_dir.mkdir(mode=0o700)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dst = snap_dir / "nested" / "source.txt"
+        original_ensure = backup._ensure_private_snapshot_parents
+
+        def swap_parent(parent, root):
+            original_ensure(parent, root)
+            parent.rmdir()
+            parent.symlink_to(outside, target_is_directory=True)
+
+        monkeypatch.setattr(backup, "_ensure_private_snapshot_parents", swap_parent)
+        assert backup._copy_quick_snapshot_file(src, dst, snap_dir) is False
+        assert not (outside / "source.txt").exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW source hardening is POSIX-only")
+    def test_source_swap_to_sensitive_file_never_reaches_restore(self, hermes_home, tmp_path, monkeypatch):
+        """Swapping after source validation must not let a secret reach restore."""
+        import hermes_cli.backup as backup
+
+        source = hermes_home / "config.yaml"
+        secret = tmp_path / "sensitive.yaml"
+        secret.write_text("SECRET=do-not-restore\n", encoding="utf-8")
+        real_open = backup.os.open
+        source_opened = False
+
+        def open_then_swap(path, flags, *args, **kwargs):
+            nonlocal source_opened
+            fd = real_open(path, flags, *args, **kwargs)
+            if Path(path) == source and flags & os.O_NOFOLLOW:
+                source_opened = True
+                replacement = tmp_path / "replacement.yaml"
+                replacement.write_text(secret.read_text(encoding="utf-8"), encoding="utf-8")
+                os.replace(replacement, source)
+            return fd
+
+        monkeypatch.setattr(backup.os, "open", open_then_swap)
+        snap_id = backup.create_quick_snapshot(hermes_home=hermes_home)
+        assert source_opened, "ordinary source must be opened with O_NOFOLLOW"
+        source.write_text("model: later-change\n", encoding="utf-8")
+        assert backup.restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+        assert "SECRET=" not in source.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("label", ["x/../../escaped", "nested/label", "nested\\label"])
+    def test_snapshot_label_rejects_non_component_without_partial_tree(self, hermes_home, tmp_path, label):
+        """Labels are one filename component before snapshot paths are touched."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        outside = tmp_path / "escaped"
+        with pytest.raises(ValueError, match="label"):
+            create_quick_snapshot(label=label, hermes_home=hermes_home)
+        root = hermes_home / "state-snapshots"
+        assert not outside.exists()
+        assert not root.exists() or not list(root.iterdir())
+
+    def test_snapshot_does_not_follow_linked_sources(self, hermes_home, tmp_path):
+        """A selected quick-snapshot source may not escape through a symlink."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        outside = tmp_path / "outside-secret"
+        outside.write_text("DO_NOT_COPY=secret\n")
+        env_path = hermes_home / ".env"
+        env_path.unlink()
+        _symlink_file_or_skip(env_path, outside)
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        assert not (snap_dir / ".env").exists()
+        assert b"DO_NOT_COPY" not in b"".join(
+            path.read_bytes() for path in snap_dir.rglob("*") if path.is_file()
+        )
+
     def test_failed_state_db_copy_is_loud(self, hermes_home, monkeypatch, capsys):
         """#68474: unreadable state.db must not look like a silent success."""
         from hermes_cli import backup as backup_mod
@@ -905,8 +1008,9 @@ class TestQuickSnapshotProjectsKanban:
 
         monkeypatch.setattr(bk, "_safe_copy_db", _spy)
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
-        # The board db was copied via _safe_copy_db (not raw copy).
-        assert any(s.endswith("boards/work/kanban.db") for s in called["db"]), called["db"]
+        # The board db was copied via _safe_copy_db (not raw shutil.copy2).
+        # Secure SQLite anchoring passes a verified hard link to the backup API.
+        assert any(Path(s).name == "kanban.db" for s in called["db"]), called["db"]
         copy = hermes_home / "state-snapshots" / snap_id / "kanban" / "boards" / "work" / "kanban.db"
         rows = sqlite3.connect(str(copy)).execute("SELECT * FROM tasks").fetchall()
         assert rows == [("w1", "ship")]
