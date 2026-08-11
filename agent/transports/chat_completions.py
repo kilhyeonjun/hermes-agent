@@ -432,6 +432,14 @@ class ChatCompletionsTransport(ProviderTransport):
                         _tokenhub_effort = _e
                 api_kwargs["reasoning_effort"] = _tokenhub_effort
 
+        # Kiro Gateway consumes OpenAI-compatible top-level reasoning_effort.
+        if params.get("provider_name") == "kiro" and isinstance(reasoning_config, dict):
+            api_kwargs["reasoning_effort"] = (
+                "none"
+                if reasoning_config.get("enabled") is False
+                else str(reasoning_config.get("effort") or "medium").strip().lower()
+            )
+
         # LM Studio: top-level reasoning_effort. Only emit when the model
         # declares reasoning support via /api/v1/models capabilities (gated
         # upstream by params["supports_reasoning"]). resolve_lmstudio_effort

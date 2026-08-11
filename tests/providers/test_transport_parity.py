@@ -142,6 +142,31 @@ class TestKimiParity:
         assert kw["extra_body"]["thinking"] == {"type": "enabled"}
 
 
+class TestKiroParity:
+    """Kiro Gateway: OpenAI-compatible top-level reasoning effort."""
+
+    def test_reasoning_effort_is_forwarded_top_level(self, transport):
+        kw = transport.build_kwargs(
+            model="claude-sonnet-4.5",
+            messages=_simple_messages(),
+            tools=None,
+            provider_name="kiro",
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        assert kw["reasoning_effort"] == "medium"
+        assert "reasoning_effort" not in kw.get("extra_body", {})
+
+    def test_reasoning_none_is_forwarded_top_level(self, transport):
+        kw = transport.build_kwargs(
+            model="claude-sonnet-4.5",
+            messages=_simple_messages(),
+            tools=None,
+            provider_name="kiro",
+            reasoning_config={"enabled": False, "effort": "none"},
+        )
+        assert kw["reasoning_effort"] == "none"
+
+
 class TestOpenRouterParity:
     """OpenRouter: provider preferences, reasoning in extra_body."""
 

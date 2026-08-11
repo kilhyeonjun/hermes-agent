@@ -1028,6 +1028,14 @@ def create_profile(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
             "(cloning explicitly copies skills from the source profile)."
         )
+    shared_skills_root = _get_default_hermes_home() / "shared-skills"
+    use_shared_skills = (
+        clone_from is None
+        and not clone_config
+        and not clone_all
+        and not no_skills
+        and shared_skills_root.is_dir()
+    )
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
 
@@ -1135,14 +1143,29 @@ def create_profile(
         except Exception:
             pass  # best-effort — don't fail profile creation over this
 
+    if use_shared_skills:
+        (profile_dir / "config.yaml").write_text(
+            "skills:\n  external_dirs:\n    - "
+            + json.dumps(str(shared_skills_root.resolve()))
+            + "\n",
+            encoding="utf-8",
+        )
+
     # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
     # all-profile sync loop both skip this profile for bundled-skill seeding.
-    if no_skills:
-        try:
-            (profile_dir / NO_BUNDLED_SKILLS_MARKER).write_text(
+    if no_skills or use_shared_skills:
+        marker_text = (
+            "This profile uses the shared skill library.\n"
+            if use_shared_skills
+            else (
                 "This profile opted out of bundled-skill seeding "
                 "(`hermes profile create --no-skills`).\n"
-                "Delete this file to re-enable sync on the next `hermes update`.\n",
+            )
+        )
+        try:
+            (profile_dir / NO_BUNDLED_SKILLS_MARKER).write_text(
+                marker_text
+                + "Delete this file to re-enable sync on the next `hermes update`.\n",
                 encoding="utf-8",
             )
         except OSError:
