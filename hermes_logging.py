@@ -75,6 +75,8 @@ from hermes_constants import get_config_path, get_hermes_home
 # is idempotent — calling it twice is safe but the second call is a no-op
 # unless ``force=True``.
 _logging_initialized = False
+_logging_home: Optional[Path] = None
+_logging_setup_lock = threading.RLock()
 
 # Thread-local storage for per-conversation session context.
 _session_context = threading.local()
@@ -299,10 +301,37 @@ def setup_logging(
     Path
         The ``logs/`` directory where files are written.
     """
-    global _logging_initialized
+    with _logging_setup_lock:
+        return _setup_logging_locked(
+            hermes_home=hermes_home,
+            log_level=log_level,
+            max_size_mb=max_size_mb,
+            backup_count=backup_count,
+            mode=mode,
+            force=force,
+        )
+
+
+def _setup_logging_locked(
+    *,
+    hermes_home: Optional[Path],
+    log_level: Optional[str],
+    max_size_mb: Optional[int],
+    backup_count: Optional[int],
+    mode: Optional[str],
+    force: bool,
+) -> Path:
+    """Serialized implementation for setup_logging()."""
+    global _logging_initialized, _logging_home
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_home = home.resolve()
+    if _logging_initialized and not force and _logging_home == resolved_home:
+        return log_dir
+    if _logging_initialized and (_logging_home != resolved_home or force):
+        _reset_queued_handlers()
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -361,8 +390,6 @@ def setup_logging(
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
 
-    if _logging_initialized and not force:
-        return log_dir
 
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
@@ -373,6 +400,7 @@ def setup_logging(
         logging.getLogger(name).setLevel(logging.WARNING)
 
     _logging_initialized = True
+    _logging_home = resolved_home
     return log_dir
 
 
@@ -535,6 +563,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         super().handleError(record)
 
     def _open(self):
+        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
         stream = super()._open()
         self._chmod_if_managed()
         return stream

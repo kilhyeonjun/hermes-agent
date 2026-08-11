@@ -31,6 +31,7 @@ def _reset_logging_state():
     assertions are stable regardless of test ordering.
     """
     hermes_logging._logging_initialized = False
+    hermes_logging._logging_home = None
     # File handlers now live behind the async QueueListener, not on the root
     # logger; tear down any leaked from other xdist tests in this worker.
     hermes_logging._reset_queued_handlers()
@@ -51,6 +52,7 @@ def _reset_logging_state():
             h.close()
     root.setLevel(prev_root_level)
     hermes_logging._logging_initialized = False
+    hermes_logging._logging_home = None
     hermes_logging.clear_session_context()
 
 
@@ -98,9 +100,57 @@ class TestSetupLogging:
         ]
         assert len(agent_handlers) == 1
 
+    def test_switching_home_replaces_queued_handlers(self, hermes_home, tmp_path):
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        second_home = tmp_path / "second-home"
 
+        hermes_logging.setup_logging(hermes_home=second_home)
 
+        paths = {
+            Path(handler.baseFilename).parent
+            for handler in hermes_logging.rotating_file_handlers()
+        }
+        assert paths == {(second_home / "logs").resolve()}
 
+    def test_concurrent_home_switch_leaves_one_coherent_handler_set(self, tmp_path):
+        homes = [tmp_path / "home-a", tmp_path / "home-b"]
+        barrier = threading.Barrier(3)
+
+        def configure(home):
+            barrier.wait(timeout=2)
+            hermes_logging.setup_logging(hermes_home=home, force=True)
+
+        threads = [threading.Thread(target=configure, args=(home,)) for home in homes]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=2)
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        paths = {
+            Path(handler.baseFilename).parent
+            for handler in hermes_logging.rotating_file_handlers()
+        }
+        assert len(paths) == 1
+        assert hermes_logging._logging_home is not None
+        assert paths == {hermes_logging._logging_home / "logs"}
+
+    def test_recreates_removed_log_directory_before_emit(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging._reset_queued_handlers()
+        log_dir = hermes_home / "logs"
+        for child in log_dir.iterdir():
+            child.unlink()
+        log_dir.rmdir()
+
+        hermes_logging._logging_initialized = False
+        hermes_logging._logging_home = None
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        logging.getLogger("test.logging.recreate").warning("recreated")
+        hermes_logging.flush_log_queue()
+
+        assert (log_dir / "errors.log").exists()
 
     def test_writes_to_agent_log(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
