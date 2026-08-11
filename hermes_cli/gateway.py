@@ -3010,23 +3010,41 @@ def _strip_optional_systemd_directives(text: str) -> str:
     return "\n".join(filtered)
 
 
-def _normalize_launchd_plist_for_comparison(text: str) -> str:
-    """Normalize launchd plist text for staleness checks.
+def _normalize_launchd_plist_for_comparison(text: str | bytes) -> object:
+    """Parse XML or binary plist data into a semantic value for comparison."""
+    import plistlib
+    from xml.parsers.expat import ExpatError
 
-    The generated plist intentionally captures a broad PATH assembled from the
-    invoking shell so user-installed tools remain reachable under launchd.
-    That makes raw text comparison unstable across shells, so ignore the PATH
-    payload when deciding whether the installed plist is stale.
-    """
-    import re
+    try:
+        return plistlib.loads(text.encode("utf-8") if isinstance(text, str) else text)
+    except (
+        ExpatError,
+        IndexError,
+        plistlib.InvalidFileException,
+        UnicodeError,
+        ValueError,
+    ):
+        if isinstance(text, bytes):
+            try:
+                text = text.decode("utf-8")
+            except UnicodeDecodeError:
+                return text
+        return _normalize_service_definition(text)
 
-    normalized = _normalize_service_definition(text)
-    return re.sub(
-        r"(<key>PATH</key>\s*<string>)(.*?)(</string>)",
-        r"\1__HERMES_PATH__\3",
-        normalized,
-        flags=re.S,
-    )
+
+def _launchd_plist_values_equal(left: object, right: object) -> bool:
+    """Compare plist values without Python's bool/int/float coercion."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _launchd_plist_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _launchd_plist_values_equal(a, b) for a, b in zip(left, right)
+        )
+    return left == right
 
 
 def systemd_unit_is_current(system: bool = False) -> bool:
@@ -4214,11 +4232,29 @@ def launchd_plist_is_current() -> bool:
     if not plist_path.exists():
         return False
 
-    installed = plist_path.read_text(encoding="utf-8")
-    expected = generate_launchd_plist()
-    return _normalize_launchd_plist_for_comparison(
-        installed
-    ) == _normalize_launchd_plist_for_comparison(expected)
+    installed = _normalize_launchd_plist_for_comparison(plist_path.read_bytes())
+    expected = _normalize_launchd_plist_for_comparison(generate_launchd_plist())
+
+    if isinstance(installed, dict) and isinstance(expected, dict):
+        installed_environment = installed.get("EnvironmentVariables")
+        expected_environment = expected.get("EnvironmentVariables")
+        if isinstance(installed_environment, dict) and isinstance(
+            expected_environment, dict
+        ):
+            installed_has_path = "PATH" in installed_environment
+            expected_has_path = "PATH" in expected_environment
+            if installed_has_path or expected_has_path:
+                installed_path = installed_environment.get("PATH")
+                expected_path = expected_environment.get("PATH")
+                if not (
+                    isinstance(installed_path, str)
+                    and isinstance(expected_path, str)
+                ):
+                    return False
+                installed_environment["PATH"] = "__HERMES_PATH__"
+                expected_environment["PATH"] = "__HERMES_PATH__"
+
+    return _launchd_plist_values_equal(installed, expected)
 
 
 def refresh_launchd_plist_if_needed() -> bool:
