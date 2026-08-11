@@ -2354,32 +2354,38 @@ class MCPServerTask:
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
             }
-            for tool_name in stale_tool_names:
-                # Never let one server's refresh remove a colliding name that
-                # is currently owned by another server.
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
-                    continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+            old_mcp_tools = self._tools
+            try:
+                with registry.mutation_transaction():
+                    for tool_name in stale_tool_names:
+                        # Never let one server's refresh remove a colliding name
+                        # currently owned by another server.
+                        if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                            continue
+                        registry.deregister(tool_name)
+                        _forget_mcp_tool_server(tool_name)
 
-            # 3. Re-register with the fresh list. The helper may skip names that
-            # are ambiguous after normalization.
-            self._tools = new_mcp_tools
-            registered_names = _register_server_tools(
-                self.name, self, self._config
-            )
+                    # The helper may skip names ambiguous after normalization.
+                    self._tools = new_mcp_tools
+                    registered_names = _register_server_tools(
+                        self.name, self, self._config
+                    )
 
-            # A previously unique raw name can become ambiguous without changing
-            # its normalized registry name. In that case the pre-pass above does
-            # not consider it stale, so remove any old entry that the final,
-            # collision-checked registration set no longer owns.
-            registered_name_set = set(registered_names)
-            for tool_name in old_tool_names - registered_name_set:
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
-                    continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
-            self._registered_tool_names = registered_names
+                    # A formerly unique raw name can become ambiguous without
+                    # changing its normalized registry name.
+                    registered_name_set = set(registered_names)
+                    for tool_name in old_tool_names - registered_name_set:
+                        if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                            continue
+                        registry.deregister(tool_name)
+                        _forget_mcp_tool_server(tool_name)
+                    self._registered_tool_names = registered_names
+            except BaseException:
+                self._tools = old_mcp_tools
+                self._registered_tool_names = list(old_tool_names)
+                for tool_name in old_tool_names:
+                    _track_mcp_tool_server(tool_name, self.name)
+                raise
 
             # 4. Log what changed (user-visible notification)
             new_tool_names = set(self._registered_tool_names)
@@ -3036,9 +3042,15 @@ class MCPServerTask:
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth_manager import get_manager
-                _oauth_auth = get_manager().get_or_build_provider(
+                oauth_manager = get_manager()
+                _oauth_auth = oauth_manager.get_or_build_provider(
                     self.name, url, config.get("oauth"),
                 )
+                # Every entry is a fresh transport handshake. A cached provider
+                # may hold an access token that expired while the session was
+                # idle; reset its initialized flag so the SDK reloads expiry
+                # state and takes its refresh branch on this reconnect.
+                oauth_manager.reset_initialized(self.name)
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
                 raise
@@ -3784,10 +3796,11 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
-        self._registered_tool_names = []
+        with registry.mutation_transaction():
+            for tool_name in list(getattr(self, "_registered_tool_names", [])):
+                registry.deregister(tool_name)
+                _forget_mcp_tool_server(tool_name)
+            self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
         """Wait while an intentionally recycled stdio server is dormant."""
@@ -6278,7 +6291,7 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
-def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+def _register_server_tools_unlocked(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering and utility tools. Toolset resolution
@@ -6504,6 +6517,29 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
 
     return registered_names
+
+
+def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+    """Publish one MCP server's complete tool surface atomically."""
+    from tools.registry import registry
+
+    with _lock:
+        owned_before = {
+            tool_name
+            for tool_name, owner in _mcp_tool_server_names.items()
+            if owner == name
+        }
+    try:
+        with registry.mutation_transaction():
+            return _register_server_tools_unlocked(name, server, config)
+    except BaseException:
+        with _lock:
+            for tool_name, owner in list(_mcp_tool_server_names.items()):
+                if owner == name and tool_name not in owned_before:
+                    _mcp_tool_server_names.pop(tool_name, None)
+            for tool_name in owned_before:
+                _mcp_tool_server_names[tool_name] = name
+        raise
 
 
 class _CachedMCPTool:

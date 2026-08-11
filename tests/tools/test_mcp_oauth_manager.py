@@ -74,6 +74,34 @@ def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
     monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
 
 
+def test_reset_initialized_is_scoped_to_profile_home(tmp_path, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    manager = MCPOAuthManager()
+    _set_interactive_stdin(monkeypatch)
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        provider_a = manager.get_or_build_provider("shared", "https://mcp.example/mcp", {})
+    finally:
+        reset_hermes_home_override(token)
+    token = set_hermes_home_override(profile_b)
+    try:
+        provider_b = manager.get_or_build_provider("shared", "https://mcp.example/mcp", {})
+    finally:
+        reset_hermes_home_override(token)
+    provider_a._initialized = True
+    provider_b._initialized = True
+
+    assert manager.reset_initialized("shared", hermes_home=profile_a) is True
+    assert provider_a._initialized is False
+    assert provider_b._initialized is True
+    assert manager.reset_initialized("missing", hermes_home=profile_a) is False
+
+
 def test_hermes_provider_subclass_exists():
     """HermesMCPOAuthProvider is defined and subclasses OAuthClientProvider."""
     from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS

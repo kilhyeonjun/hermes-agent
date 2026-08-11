@@ -767,6 +767,66 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    @staticmethod
+    def _migrate_credential_usage_fk(cursor: sqlite3.Cursor) -> None:
+        """Rebuild legacy credential telemetry with a cascading session FK."""
+        fk_rows = cursor.execute(
+            "PRAGMA foreign_key_list('credential_usage')"
+        ).fetchall()
+        session_fk = next(
+            (
+                row
+                for row in fk_rows
+                if row[2] == "sessions" and row[3] == "session_id"
+            ),
+            None,
+        )
+        if session_fk is not None and (session_fk[6] or "").upper() == "CASCADE":
+            return
+
+        cursor.execute("SAVEPOINT migrate_credential_usage_fk")
+        try:
+            cursor.execute(
+                """CREATE TABLE credential_usage_new (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       session_id TEXT NOT NULL
+                           REFERENCES sessions(id) ON DELETE CASCADE,
+                       timestamp REAL NOT NULL,
+                       provider TEXT,
+                       credential_label TEXT,
+                       model TEXT,
+                       input_tokens INTEGER DEFAULT 0,
+                       output_tokens INTEGER DEFAULT 0,
+                       cache_read_tokens INTEGER DEFAULT 0,
+                       cache_write_tokens INTEGER DEFAULT 0,
+                       reasoning_tokens INTEGER DEFAULT 0,
+                       api_call_count INTEGER DEFAULT 0
+                   )"""
+            )
+            cursor.execute(
+                """INSERT INTO credential_usage_new (
+                       id, session_id, timestamp, provider, credential_label,
+                       model, input_tokens, output_tokens, cache_read_tokens,
+                       cache_write_tokens, reasoning_tokens, api_call_count
+                   )
+                   SELECT cu.id, cu.session_id, cu.timestamp, cu.provider,
+                          cu.credential_label, cu.model, cu.input_tokens,
+                          cu.output_tokens, cu.cache_read_tokens,
+                          cu.cache_write_tokens, cu.reasoning_tokens,
+                          cu.api_call_count
+                   FROM credential_usage AS cu
+                   INNER JOIN sessions AS s ON s.id = cu.session_id"""
+            )
+            cursor.execute("DROP TABLE credential_usage")
+            cursor.execute(
+                "ALTER TABLE credential_usage_new RENAME TO credential_usage"
+            )
+            cursor.execute("RELEASE SAVEPOINT migrate_credential_usage_fk")
+        except BaseException:
+            cursor.execute("ROLLBACK TO SAVEPOINT migrate_credential_usage_fk")
+            cursor.execute("RELEASE SAVEPOINT migrate_credential_usage_fk")
+            raise
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -790,6 +850,10 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Legacy credential telemetry used NO ACTION, which blocks all session
+        # deletion paths once usage rows exist. Rebuild before deferred indexes.
+        self._migrate_credential_usage_fk(cursor)
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is

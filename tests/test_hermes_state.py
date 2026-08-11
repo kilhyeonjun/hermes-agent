@@ -918,6 +918,68 @@ class TestCounts:
 # =========================================================================
 
 class TestDeleteAndExport:
+    def test_delete_session_cascades_credential_usage(self, db):
+        db.create_session(session_id="delete", source="cli")
+        db.create_session(session_id="keep", source="cli")
+        for session_id in ("delete", "keep"):
+            db._conn.execute(
+                """INSERT INTO credential_usage (
+                       session_id, timestamp, provider, credential_label, model
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (session_id, time.time(), "test", f"cred-{session_id}", "test-model"),
+            )
+        db._conn.commit()
+
+        assert db.delete_session("delete") is True
+        assert [row["session_id"] for row in db._conn.execute(
+            "SELECT session_id FROM credential_usage ORDER BY id"
+        )] == ["keep"]
+
+    def test_legacy_credential_usage_fk_is_migrated_to_cascade(self, tmp_path):
+        db_path = tmp_path / "legacy_credential_usage.db"
+        created = SessionDB(db_path=db_path)
+        created.create_session("legacy", "cli")
+        created.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE credential_usage")
+        conn.execute(
+            """CREATE TABLE credential_usage (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL REFERENCES sessions(id),
+                   timestamp REAL NOT NULL,
+                   provider TEXT,
+                   credential_label TEXT,
+                   model TEXT,
+                   input_tokens INTEGER DEFAULT 0,
+                   output_tokens INTEGER DEFAULT 0,
+                   cache_read_tokens INTEGER DEFAULT 0,
+                   cache_write_tokens INTEGER DEFAULT 0,
+                   reasoning_tokens INTEGER DEFAULT 0,
+                   api_call_count INTEGER DEFAULT 0
+               )"""
+        )
+        conn.execute(
+            "INSERT INTO credential_usage (session_id, timestamp) VALUES (?, ?)",
+            ("legacy", time.time()),
+        )
+        conn.commit()
+        conn.close()
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            fk = migrated._conn.execute(
+                "PRAGMA foreign_key_list('credential_usage')"
+            ).fetchone()
+            assert fk["on_delete"] == "CASCADE"
+            assert migrated.delete_session("legacy") is True
+            assert migrated._conn.execute(
+                "SELECT COUNT(*) FROM credential_usage"
+            ).fetchone()[0] == 0
+        finally:
+            migrated.close()
+
     def test_delete_session(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

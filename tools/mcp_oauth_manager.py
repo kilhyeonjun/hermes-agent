@@ -677,6 +677,27 @@ class MCPOAuthManager:
                 return True
             return False
 
+    def reset_initialized(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> bool:
+        """Force a cached provider to reload OAuth state on its next flow.
+
+        Reconnects reuse a provider, so an access token that expires while a
+        session is idle otherwise remains initialized and never re-seeds its
+        expiry from storage. Profile-aware keys keep same-named providers
+        isolated in multiplexed gateways.
+        """
+        entry = self._entries.get(self._key(server_name, hermes_home))
+        if entry is None or entry.provider is None:
+            return False
+        if not hasattr(entry.provider, "_initialized"):
+            return False
+        entry.provider._initialized = False  # noqa: SLF001
+        return True
+
     # -- 401 handler (dedup'd) -----------------------------------------------
 
     async def handle_401(
