@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -32,6 +33,12 @@ _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
 # Logs keep more of the body than the model sees, but still a bounded amount.
 _MAX_LOGGED_ERROR_CHARS = 8192
+_TOOL_ERROR_ROLE_TAG_RE = re.compile(
+    r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>',
+    re.IGNORECASE,
+)
+_TOOL_ERROR_FENCE_RE = re.compile(r'```(?:json|xml|html|markdown)?', re.IGNORECASE)
+_TOOL_ERROR_CDATA_RE = re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL)
 
 
 def _bound_error_text(text: str) -> str:
@@ -44,6 +51,13 @@ def _bound_error_text(text: str) -> str:
         text[:_MAX_LOGGED_ERROR_CHARS],
     )
     return text[:_MAX_TOOL_ERROR_CHARS] + _TOOL_ERROR_TRUNCATION_MARKER
+
+
+def _sanitize_error_text(text: str) -> str:
+    """Strip model-facing framing tokens without importing model_tools."""
+    text = _TOOL_ERROR_ROLE_TAG_RE.sub("", text)
+    text = _TOOL_ERROR_FENCE_RE.sub("", text)
+    return _TOOL_ERROR_CDATA_RE.sub("", text)
 
 
 def _bound_json_error_result(result: str) -> str:
@@ -841,20 +855,22 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
-            # exc_info already renders the exception, so keep the message copy bounded.
-            logger.exception(
-                "Tool %s dispatch error: %s", name, _bound_error_text(str(e))
+            # Logging an enormous traceback retains the full exception payload and can
+            # stall the suite/runtime. The bounded type+message is sufficient here.
+            logger.error(
+                "Tool %s dispatch error: %s: %s",
+                name,
+                type(e).__name__,
+                _bound_error_text(str(e)),
             )
-            # Route through the sanitizer so framing tokens / CDATA / fences
-            # in exception strings don't reach the model as structural noise.
-            # See model_tools._sanitize_tool_error for rationale.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
-            try:
-                from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(raw)
-            except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return tool_error(sanitized)
+            # Keep the registry dependency leaf-only. Importing model_tools here
+            # can deadlock on a concurrent partial import during suite startup.
+            raw = _bound_error_text(
+                _sanitize_error_text(
+                    f"Tool execution failed: {type(e).__name__}: {e}"
+                )
+            )
+            return tool_error(raw)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

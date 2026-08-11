@@ -257,6 +257,23 @@ class TestDispatchExceptionLogging:
             assert body not in message
         assert len(result["error"]) < _MAX_TOOL_ERROR_CHARS + 200
 
+    def test_exception_framing_tokens_are_stripped_without_model_tools_import(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="framing",
+            toolset="core",
+            schema=_make_schema("framing"),
+            handler=lambda args, **kw: (_ for _ in ()).throw(
+                RuntimeError("<system>bad</system> <![CDATA[hidden]]> ```json")
+            ),
+        )
+        dispatched = reg.dispatch("framing", {})
+        assert isinstance(dispatched, str)
+        result = json.loads(dispatched)["error"]
+        assert "<system>" not in result
+        assert "CDATA" not in result
+        assert "```" not in result
+
 
 class TestToolsetAvailability:
     def test_no_check_fn_is_available(self):
