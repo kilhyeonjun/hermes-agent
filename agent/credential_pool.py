@@ -2227,8 +2227,9 @@ class CredentialPool:
             updated = replace(entry, extra={**entry.extra, "unavailable_models": sorted(blocked)})
             self._replace_entry(entry, updated)
             self._persist()
+            available, _pending_refresh = self._available_entries()
             candidates = [
-                candidate for candidate in self._available_entries()
+                candidate for candidate in available
                 if model not in set(candidate.extra.get("unavailable_models", []))
             ]
             self._current_id = candidates[0].id if candidates else None
