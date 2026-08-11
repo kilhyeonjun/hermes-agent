@@ -96,16 +96,6 @@ def test_usage_policy_missing_is_empty_but_corrupt_or_unknown_is_invalid(
     }
 
 
-def test_codex_route_command_registered_with_telegram_alias():
-    from hermes_cli.commands import resolve_command
-
-    command = resolve_command("codex_route")
-
-    assert command is not None
-    assert command.name == "codex-route"
-    assert command.args_hint == "[status|auto|personal|company]"
-    assert command.gateway_only is True
-
 
 def test_risk_policy_supports_per_window_thresholds():
     payload = {

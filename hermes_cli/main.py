@@ -12630,18 +12630,6 @@ def main():
         return _codex_usage_main(argv)
     codex_usage_parser.set_defaults(func=_cmd_codex_usage)
 
-    codex_route_parser = subparsers.add_parser(
-        "codex-route", help="Manage OpenAI Codex credential routing"
-    )
-    codex_route_parser.add_argument(
-        "mode", nargs="?", default="status", choices=("status", "auto", "personal", "company")
-    )
-    codex_route_parser.set_defaults(
-        func=lambda args: __import__(
-            "hermes_cli.codex_route", fromlist=["main"]
-        ).main([args.mode])
-    )
-
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)
     # =========================================================================
