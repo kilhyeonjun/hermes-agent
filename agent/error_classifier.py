@@ -283,6 +283,7 @@ _CHATGPT_ACCOUNT_MODEL_REJECTION = re.compile(
 _CONTEXT_OVERFLOW_PATTERNS = [
     "context length",
     "context size",
+    "context limit reached",
     "maximum context",
     "token limit",
     "too many tokens",
