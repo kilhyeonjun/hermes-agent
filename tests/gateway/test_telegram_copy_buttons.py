@@ -48,3 +48,34 @@ async def test_send_attaches_copy_buttons_to_last_chunk():
     assert "COPY_BUTTON" not in call.kwargs["text"]
     button = call.kwargs["reply_markup"].inline_keyboard[0][0]
     assert (button.text, button.copy_text.text) == ("Copy", "secret")
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_markup_through_markdown_fallback_and_retry(monkeypatch):
+    class Retry(Exception):
+        retry_after = 0.01
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(side_effect=[Exception("parse entities"), Retry(), None])
+    monkeypatch.setattr(module.asyncio, "sleep", AsyncMock())
+
+    result = await adapter.edit_message("1", "7", "hello\nCOPY_BUTTON: Copy|secret", finalize=True)
+
+    assert result.success
+    calls = adapter._bot.edit_message_text.await_args_list
+    assert len(calls) == 3
+    assert all(call.kwargs.get("reply_markup") is not None for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_finalize_leaves_marker_visible_without_copy_capability(monkeypatch):
+    monkeypatch.setattr(module, "CopyTextButton", None)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(return_value=True)
+
+    result = await adapter.edit_message("1", "7", "hello\nCOPY_BUTTON: Copy|secret", finalize=True)
+
+    assert result.success
+    assert "COPY\\_BUTTON" in adapter._bot.edit_message_text.await_args.kwargs["text"]

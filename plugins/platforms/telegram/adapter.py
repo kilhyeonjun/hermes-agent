@@ -3444,23 +3444,29 @@ class TelegramAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
-    async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
+    async def _edit_text(
+        self, chat_id: str, message_id: str, text: str, parse_mode: Any = None, reply_markup: Any = None,
+    ) -> None:
         """``editMessageText`` with normalized ids; ``parse_mode=None`` sends plain text."""
         kwargs: Dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text}
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
         await self._bot.edit_message_text(**kwargs)
 
-    async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
+    async def _edit_markdown_or_plain(
+        self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str, reply_markup: Any = None,
+    ) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
         skip further work); the fallback edit's exceptions propagate."""
         try:
-            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2)
+            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2, reply_markup)
         except Exception as fmt_err:
             if "not modified" in str(fmt_err).lower():
                 return True
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
-            await self._edit_text(chat_id, message_id, plain)
+            await self._edit_text(chat_id, message_id, plain, reply_markup=reply_markup)
         return False
 
     async def edit_message(
@@ -3524,10 +3530,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=message_id)
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
-                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
-            if reply_markup is not None:
-                await self._bot.edit_message_reply_markup(
-                    chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reply_markup=reply_markup)
+                "[%s] MarkdownV2 edit failed, falling back to plain text: %s", reply_markup)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -3558,7 +3561,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     return _flood_cap_result(wait)
                 await asyncio.sleep(wait)
                 try:
-                    await self._edit_text(chat_id, message_id, content)
+                    await self._edit_markdown_or_plain(
+                        chat_id, message_id, self.format_message(content),
+                        _strip_mdv2(content) if content else content,
+                        "[%s] MarkdownV2 edit retry failed, falling back to plain text: %s", reply_markup)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)

@@ -1753,20 +1753,20 @@ class CredentialPool:
 
     # ---- selection ---------------------------------------------------------
 
-    def select(self) -> Optional[PooledCredential]:
-        entry, pending_refresh = self._select_under_lock()
+    def select(self, model: Optional[str] = None) -> Optional[PooledCredential]:
+        entry, pending_refresh = self._select_under_lock(model=model)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
             # Re-select now that the refreshed entries are back in the pool.
             if entry is None:
-                entry, _ = self._select_under_lock()
+                entry, _ = self._select_under_lock(model=model)
         if entry is not None:
             self._unmatched_rotation_streak = 0
         return entry
 
-    def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_under_lock(self, model: Optional[str] = None) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(model=model)
 
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
         """Refresh deferred single-use-token entries OUTSIDE the pool lock.
@@ -1794,7 +1794,7 @@ class CredentialPool:
         return self._sync_entry_from_auth_store(entry)
 
     def _available_entries(
-        self, *, clear_expired: bool = False, refresh: bool = False,
+        self, *, clear_expired: bool = False, refresh: bool = False, model: Optional[str] = None,
     ) -> Tuple[List[PooledCredential], List[PooledCredential]]:
         """Return (available, pending_refresh) for entries not in cooldown.
 
@@ -1812,6 +1812,8 @@ class CredentialPool:
         pending_refresh: List[PooledCredential] = []
         sole_credential = self._is_sole_credential()
         for entry in self._entries:
+            if model and model in (entry.extra.get("unavailable_models") or ()):
+                continue
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
             # unhydrated duplicate as an empty key.
@@ -1883,9 +1885,11 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_unlocked(
+        self, *, refresh: bool = True, model: Optional[str] = None,
+    ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         """Select the best available entry; returns ``(entry, pending_refresh)``."""
-        available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
+        available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh, model=model)
         if not available:
             self._current_id = None
             self._log_no_available_entries()
@@ -2071,8 +2075,8 @@ class CredentialPool:
             extra["unavailable_models"] = sorted(set(extra.get("unavailable_models") or ()) | {model})
             self._replace_entry(entry, replace(entry, extra=extra))
             self._persist()
-            available, _ = self._available_entries(clear_expired=True, refresh=False)
-            next_entry = next((e for e in available if model not in (e.extra.get("unavailable_models") or ())), None)
+            available, _ = self._available_entries(clear_expired=True, refresh=False, model=model)
+            next_entry = available[0] if available else None
             self._current_id = next_entry.id if next_entry else None
             return next_entry
 
@@ -2167,11 +2171,17 @@ class CredentialPool:
 
     def reset_statuses(self) -> int:
         with self._lock:
-            stale = [e for e in self._entries if e.last_status or e.last_status_at or e.last_error_code]
+            stale = [
+                e for e in self._entries
+                if e.last_status or e.last_status_at or e.last_error_code or "unavailable_models" in e.extra
+            ]
             if stale:
                 stale_ids = {e.id for e in stale}
                 self._entries = [
-                    replace(e, **_CLEAR_STATUS) if e.id in stale_ids else e for e in self._entries
+                    replace(
+                        e, **_CLEAR_STATUS,
+                        extra={k: v for k, v in e.extra.items() if k != "unavailable_models"},
+                    ) if e.id in stale_ids else e for e in self._entries
                 ]
                 self._persist()
             return len(stale)

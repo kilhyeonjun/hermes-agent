@@ -81,6 +81,20 @@ def test_codex_entitlement_rotates_model_scoped_entry():
     agent._swap_credential.assert_called_once_with(entries[1])
 
 
+def test_persisted_codex_entitlement_is_skipped_and_resettable():
+    entries = [
+        _make_entry(0, extra={"unavailable_models": ["gpt-5.6-sol"]}),
+        _make_entry(1),
+    ]
+    from agent.credential_pool import CredentialPool
+    pool = CredentialPool("openai-codex", entries)
+
+    assert pool.select(model="gpt-5.6-sol").id == "cred-1"
+    with patch.object(pool, "_persist"):
+        assert pool.reset_statuses() == 1
+    assert pool.select(model="gpt-5.6-sol").id == "cred-0"
+
+
 
 
 def test_rotate_on_second_429_when_not_exhausted():

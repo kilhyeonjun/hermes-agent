@@ -508,7 +508,7 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
         pool = None
     if not (pool and pool.has_credentials()):
         return None
-    entry = pool.select()
+    entry = pool.select(model=target_model) if target_model else pool.select()
     if entry is None:
         return None
     pool_api_key = _pool_entry_api_key(entry)
