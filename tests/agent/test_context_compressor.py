@@ -330,6 +330,24 @@ class TestPreflightDeferral:
 
         assert compressor.should_defer_preflight_to_real_usage(96_000) is False
 
+    def test_authoritative_over_threshold_usage_overrides_low_rough_estimate(self, compressor):
+        """A previous real provider count above threshold must not be discarded
+        when the next structured-tool request is undercounted by the rough estimator."""
+        compressor.threshold_tokens = 150_000
+        compressor.last_real_prompt_tokens = 160_000
+        compressor.awaiting_real_usage_after_compression = False
+
+        assert compressor.should_defer_preflight_to_real_usage(114_091) is False
+        assert compressor.should_compress(114_091) is True
+
+    def test_stale_over_threshold_usage_does_not_recompress_after_compaction(self, compressor):
+        compressor.threshold_tokens = 150_000
+        compressor.last_real_prompt_tokens = 160_000
+        compressor.awaiting_real_usage_after_compression = True
+
+        assert compressor.should_defer_preflight_to_real_usage(114_091) is True
+        assert compressor.should_compress(114_091) is False
+
     def test_does_not_defer_without_a_baseline(self, compressor):
         """No synchronized (rough, real) pair yet — fall back to trusting the
         rough estimate (conservative: compress)."""

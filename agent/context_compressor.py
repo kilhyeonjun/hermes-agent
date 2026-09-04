@@ -2872,8 +2872,6 @@ class ContextCompressor(ContextEngine):
         the aligned basis before every provider call, so a prologue
         over-defer never skips a needed compaction.
         """
-        if rough_tokens < self.threshold_tokens:
-            return False
         # Immediately after a compaction the post-compression path sets
         # ``awaiting_real_usage_after_compression`` and parks
         # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still
@@ -2886,6 +2884,8 @@ class ContextCompressor(ContextEngine):
         # arrives.  (#36718)
         if self.awaiting_real_usage_after_compression:
             return True
+        if rough_tokens < self.threshold_tokens:
+            return False
         if self.last_real_prompt_tokens <= 0:
             return False
         if self.last_real_prompt_tokens >= self.threshold_tokens:
@@ -2945,6 +2945,14 @@ class ContextCompressor(ContextEngine):
         where each pass removes only 1-2 messages.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if (
+            not self.awaiting_real_usage_after_compression
+            and self.last_real_prompt_tokens >= self.threshold_tokens
+        ):
+            # A provider-reported prompt count is authoritative. Structured
+            # tool payloads can tokenize much denser than the rough chars/4
+            # estimate, so never discard an already-over-threshold real count.
+            tokens = max(tokens, self.last_real_prompt_tokens)
         if tokens < self.threshold_tokens:
             return False, None
         if self._automatic_compression_blocked():
