@@ -1596,3 +1596,11 @@ class TestServerInjectedParameterRejection:
         assert result.retryable is False
 
 
+def test_400_model_context_limit_reached():
+    e = MockAPIError(
+        "Model context limit reached. Conversation size exceeds model capacity.",
+        status_code=400,
+    )
+    result = classify_api_error(e)
+    assert result.reason == FailoverReason.context_overflow
+    assert result.should_compress is True

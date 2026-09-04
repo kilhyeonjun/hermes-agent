@@ -175,7 +175,7 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = (
 # empty-response advisories mentioning it are intercepted earlier. Groups:
 # generic; vLLM; Ollama; llama.cpp; Chinese; Z.AI (1210); Bedrock; Together.
 _CONTEXT_OVERFLOW_PATTERNS = (
-    "context length", "context size", "maximum context", "token limit", "too many tokens",
+    "context length", "context size", "context limit reached", "maximum context", "token limit", "too many tokens",
     "reduce the length", "exceeds the limit", "context window", "prompt is too long",
     "prompt exceeds max length", "max_tokens", "maximum number of tokens",
     "exceeds the max_model_len", "max_model_len", "prompt length", "input is too long", "maximum model length",

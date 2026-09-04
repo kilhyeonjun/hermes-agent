@@ -310,6 +310,22 @@ class TestUpdateFromResponse:
 
 class TestPreflightDeferral:
 
+    def test_authoritative_over_threshold_usage_overrides_low_rough_estimate(self, compressor):
+        compressor.threshold_tokens = 150_000
+        compressor.last_real_prompt_tokens = 160_000
+        compressor.awaiting_real_usage_after_compression = False
+
+        assert compressor.should_defer_preflight_to_real_usage(114_091) is False
+        assert compressor.should_compress(114_091) is True
+
+    def test_stale_over_threshold_usage_does_not_recompress_after_compaction(self, compressor):
+        compressor.threshold_tokens = 150_000
+        compressor.last_real_prompt_tokens = 160_000
+        compressor.awaiting_real_usage_after_compression = True
+
+        assert compressor.should_defer_preflight_to_real_usage(114_091) is True
+        assert compressor.should_compress(114_091) is False
+
     def test_defers_while_projected_real_usage_fits(self, compressor):
         """Large rough growth alone must not trigger compaction: with real
         usage at 50K and 10K of rough growth since that reading, projected

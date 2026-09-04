@@ -2424,11 +2424,11 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         reading at/over threshold clears the baseline, and the overflow handler compacts reactively.
         Callers with a smaller (raw-messages) basis can only over-defer; the pre-API pressure check
         re-runs with the aligned basis."""
-        if rough_tokens < self.threshold_tokens:
-            return False
         # After compaction last_real_prompt_tokens is STALE (above threshold); defer one turn until real usage arrives.
         if self.awaiting_real_usage_after_compression:
             return True
+        if rough_tokens < self.threshold_tokens:
+            return False
         if self.last_real_prompt_tokens <= 0 or self.last_real_prompt_tokens >= self.threshold_tokens:
             return False
         baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
@@ -2446,6 +2446,8 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         ``reason`` is None unless compression is needed but blocked: ``"cooldown:<seconds>"`` or
         ``"ineffective"``. Callers should surface a warning when it is non-None."""
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if not self.awaiting_real_usage_after_compression and self.last_real_prompt_tokens >= self.threshold_tokens:
+            tokens = max(tokens, self.last_real_prompt_tokens)
         if tokens < self.threshold_tokens:
             return False, None
         if self._automatic_compression_blocked():

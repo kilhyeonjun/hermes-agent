@@ -493,6 +493,21 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 
+def _runtime_contract_parts() -> List[str]:
+    packaged = Path(__file__).resolve().parent / "runtime_contracts"
+    root = get_default_hermes_root() / "runtime-contracts"
+    parts = []
+    for name in ("performance-observation.md", "outcome-control.md"):
+        path = root / name
+        if not path.is_file():
+            path = packaged / name
+        try:
+            parts.append(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            pass
+    return parts
+
+
 def _guidance_parts(agent: Any) -> List[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
     parts: List[str] = []
@@ -596,6 +611,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    stable_parts.extend(_runtime_contract_parts())
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
