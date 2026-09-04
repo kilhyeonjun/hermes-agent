@@ -55,6 +55,29 @@ def test_rotate_immediately_when_credential_already_exhausted():
     assert recovered is True
     assert retried is False
     pool.mark_exhausted_and_rotate.assert_called_once()
+
+
+def test_codex_entitlement_rotates_model_scoped_entry():
+    entries = [_make_entry(0), _make_entry(1)]
+    pool = _make_pool(entries)
+    pool.provider = "openai-codex"
+    pool.mark_entitlement_unavailable_and_rotate.return_value = entries[1]
+    from run_agent import AIAgent
+    agent = MagicMock(spec=AIAgent)
+    agent._credential_pool = pool
+    agent.provider = "openai-codex"
+    agent.model = "gpt-5.6-sol"
+    agent.api_key = "key-0"
+    agent._credential_pool_entry_id = "cred-0"
+    agent._swap_credential = MagicMock()
+
+    recovered, retried = AIAgent._recover_with_credential_pool(
+        agent, status_code=400, has_retried_429=False,
+        classified_reason=FailoverReason.entitlement)
+
+    assert (recovered, retried) == (True, False)
+    pool.mark_entitlement_unavailable_and_rotate.assert_called_once_with(
+        model="gpt-5.6-sol", api_key_hint="key-0", credential_id="cred-0")
     agent._swap_credential.assert_called_once_with(entries[1])
 
 

@@ -113,6 +113,17 @@ class TestGetProfileDir:
 class TestCreateProfile:
     """Tests for create_profile()."""
 
+    def test_fresh_profile_uses_shared_skills_when_available(self, profile_env):
+        default_home = profile_env / ".hermes"
+        shared_root = default_home / "shared-skills"
+        shared_root.mkdir()
+
+        profile_dir = create_profile("coder", no_alias=True)
+
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert config["skills"]["external_dirs"] == [str(shared_root)]
+        assert (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
+        assert list((profile_dir / "skills").iterdir()) == []
 
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env

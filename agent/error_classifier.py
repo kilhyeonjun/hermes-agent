@@ -28,6 +28,7 @@ class FailoverReason(enum.Enum):
     auth_permanent = "auth_permanent"    # Auth failed after refresh — abort
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
+    entitlement = "entitlement"          # Codex account cannot use this model — rotate model-scoped entry
     upstream_rate_limit = "upstream_rate_limit"  # Aggregator's upstream model 429 — fallback model, key is healthy
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
@@ -692,6 +693,12 @@ def _classify_400(c: _Ctx) -> Verdict:
     # prompt_cache_retention ~20% of the time): transient, retry identical request.
     if _is_server_injected_param_rejection(msg, c.provider_slug):
         return _V_SERVER_ERROR
+    if c.provider_slug == "openai-codex" and any(
+        " ".join(str(value or "").split()).casefold()
+        == f"The '{c.model.strip()}' model is not supported when using Codex with a ChatGPT account.".casefold()
+        for value in (msg, *_body_message_candidates(c.body))
+    ):
+        return _v(_R.entitlement, retryable=False, should_fallback=True)
     # Before overflow: GPT-5's "Unsupported parameter: 'max_tokens'" contains it.
     if any(p in msg for p in _400_VALIDATION_PATTERNS) or code in _400_VALIDATION_CODES:
         return _V_FORMAT_ERROR
@@ -822,6 +829,7 @@ def _body_message_candidates(body: dict) -> Iterator[Any]:
     """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy shapes)."""
     yield _error_obj(body).get("message")
     yield body.get("message")
+    yield body.get("detail")
     yield body.get("errorMessage")
     args = body.get("errorArgs")
     yield args.get("reason") if isinstance(args, dict) else None

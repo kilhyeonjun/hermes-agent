@@ -56,7 +56,7 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "billing", "rate_limit", "entitlement",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -1604,3 +1604,12 @@ def test_400_model_context_limit_reached():
     result = classify_api_error(e)
     assert result.reason == FailoverReason.context_overflow
     assert result.should_compress is True
+
+
+def test_codex_flat_detail_model_rejection_is_entitlement():
+    detail = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+    error = MockAPIError("Bad request", status_code=400, body={"detail": detail})
+    result = classify_api_error(error, provider="openai-codex", model="gpt-5.6-sol")
+    assert result.reason == FailoverReason.entitlement
+    assert result.retryable is False
+    assert result.should_fallback is True

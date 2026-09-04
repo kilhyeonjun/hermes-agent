@@ -861,6 +861,17 @@ def recover_with_credential_pool(
                 "credential rotation, deferring to fallback chain"
             )
         return False, has_retried_429
+    if effective_reason == FailoverReason.entitlement:
+        if current_provider != "openai-codex":
+            return False, has_retried_429
+        next_entry = pool.mark_entitlement_unavailable_and_rotate(
+            model=getattr(agent, "model", "") or "", api_key_hint=api_key_hint,
+            credential_id=credential_id,
+        )
+        if next_entry is None:
+            return False, False
+        agent._swap_credential(next_entry)
+        return True, False
     if effective_reason == FailoverReason.billing:
         # A separate pool instance may have resolved runtime credentials, leaving no ``current_id``;
         # match the key that failed, not a different account.

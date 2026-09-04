@@ -114,6 +114,7 @@ async def _shutdown_abandoned_app(app) -> None:
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    CopyTextButton = getattr(__import__("telegram", fromlist=["CopyTextButton"]), "CopyTextButton", None)
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -129,6 +130,7 @@ except ImportError:
     Update = Bot = Message = InlineKeyboardButton = InlineKeyboardMarkup = Application = Any
     CommandHandler = CallbackQueryHandler = InlineQueryHandler = TypeHandler = TelegramMessageHandler = HTTPXRequest = Any
     LinkPreviewOptions = filters = ParseMode = ChatType = None
+    CopyTextButton = None
 
     # Mock so ContextTypes.DEFAULT_TYPE annotations don't crash class definition without the lib.
     class _MockContextTypes:
@@ -151,6 +153,23 @@ from plugins.platforms.telegram.telegram_network import (
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_COPY_BUTTON_PREFIX = "COPY_BUTTON:"
+_COPY_BUTTON_MAX_COUNT = 20
+
+
+def _extract_copy_buttons(content: str) -> tuple[str, list[tuple[str, str]]]:
+    """Strip valid full-line copy markers; leave malformed/overflow markers visible."""
+    visible, buttons = [], []
+    for line in content.splitlines(keepends=True):
+        raw = line.rstrip("\r\n")
+        if raw.startswith(_COPY_BUTTON_PREFIX):
+            label, sep, text = raw[len(_COPY_BUTTON_PREFIX):].strip().partition("|")
+            label, text = label.strip(), text.strip()
+            if sep and len(buttons) < _COPY_BUTTON_MAX_COUNT and 1 <= len(label) <= 64 and 1 <= len(text) <= 256:
+                buttons.append((label, text))
+                continue
+        visible.append(line)
+    return "".join(visible), buttons
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
 # Longer server penalties fail closed with a ``flood_control:{wait}`` SendResult so the caller's retry
@@ -225,7 +244,7 @@ def telegram_deps_present() -> bool:
 
 def check_telegram_requirements() -> bool:
     """Lazy-install python-telegram-bot if missing, then re-import and rebind the module aliases."""
-    global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
+    global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton, CopyTextButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, InlineQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest, TypeHandler
@@ -242,6 +261,7 @@ def check_telegram_requirements() -> bool:
             importlib.import_module(m) for m in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"))
         Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup = (
             getattr(_tg, n) for n in ("Update", "Bot", "Message", "InlineKeyboardButton", "InlineKeyboardMarkup"))
+        CopyTextButton = getattr(_tg, "CopyTextButton", None)
         LinkPreviewOptions = getattr(_tg, "LinkPreviewOptions", None)
         Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, TelegramMessageHandler = (
             getattr(_ext, n) for n in ("Application", "CommandHandler", "CallbackQueryHandler", "InlineQueryHandler", "MessageHandler"))
@@ -3211,7 +3231,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple, reply_markup: Any = None):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3232,6 +3252,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
+                if reply_markup is not None:
+                    send_kwargs["reply_markup"] = reply_markup
                 return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
@@ -3312,6 +3334,15 @@ class TelegramAdapter(BasePlatformAdapter):
         with contextlib.suppress(Exception):
             await self.send_typing(chat_id, metadata=metadata)
 
+    @staticmethod
+    def _copy_buttons_markup(buttons: list[tuple[str, str]]):
+        if not buttons or CopyTextButton is None:
+            return None
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, copy_text=CopyTextButton(text=text))]
+            for label, text in buttons
+        ])
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
@@ -3332,11 +3363,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        reply_markup = None
+        if _COPY_BUTTON_PREFIX in content:
+            visible, buttons = _extract_copy_buttons(content)
+            if CopyTextButton is not None and buttons:
+                content = visible if visible.strip() else "Copy buttons"
+                reply_markup = self._copy_buttons_markup(buttons)
         error_types = self._telegram_error_types()
         try:
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if reply_markup is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -3355,7 +3392,8 @@ class TelegramAdapter(BasePlatformAdapter):
             used_thread_fallback = False
             for i, chunk in enumerate(chunks):
                 outcome = await self._send_chunk_with_retries(
-                    chat_id, chunk, i, reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                    chat_id, chunk, i, reply_to, metadata, thread_id, used_thread_fallback, error_types,
+                    reply_markup if i == len(chunks) - 1 else None)
                 if isinstance(outcome, SendResult):
                     return outcome
                 msg, used_thread_fallback = outcome
@@ -3435,6 +3473,12 @@ class TelegramAdapter(BasePlatformAdapter):
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        reply_markup = None
+        if finalize and _COPY_BUTTON_PREFIX in content:
+            visible, buttons = _extract_copy_buttons(content)
+            if CopyTextButton is not None and buttons:
+                content = visible if visible.strip() else "Copy buttons"
+                reply_markup = self._copy_buttons_markup(buttons)
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
         # Rich finalize (Bot API 10.1): when the completed content has constructs the legacy MarkdownV2 edit
@@ -3444,7 +3488,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # 4,096 overflow pre-flight because the rich text cap is 32,768 — a rich table that exceeds the
         # MarkdownV2 limit must not be split into legacy chunks. Falls back to the legacy edit path
         # (overflow split included) on capability/permanent rejection.
-        if finalize and self._rich_eligible(content):
+        if finalize and reply_markup is None and self._rich_eligible(content):
             rich_result = await self._try_edit_rich(chat_id, message_id, content, metadata=metadata)
             if rich_result is not None:
                 return rich_result
@@ -3461,7 +3505,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._last_overflow_preview.pop(_preview_key, None)  # the final edit always delivers full content
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
             if finalize:
-                return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+                return await self._edit_overflow_split(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata, reply_markup=reply_markup)
             content = self._truncate_stream_overflow_preview(content)
             _saturated_preview = True
             # Saturated-preview dedup: past the cap every progressive edit truncates to the same text;
@@ -3480,6 +3525,9 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
                 "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+            if reply_markup is not None:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reply_markup=reply_markup)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -3490,7 +3538,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[%s] edit_message overflow (%d UTF-16 > %d), splitting", self.name, utf16_len(content), self.MAX_MESSAGE_LENGTH)
                 if finalize:
-                    return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+                    return await self._edit_overflow_split(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata, reply_markup=reply_markup)
                 # Mid-stream: truncate and retry instead of splitting (saturated-preview dedup as above).
                 # See #48648.
                 truncated = self._truncate_stream_overflow_preview(content)
@@ -3538,10 +3587,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _send_overflow_continuation(
         self, chat_id: str, chunk: str, reply_to_id: Optional[int], thread_kwargs: Dict[str, Any],
-        thread_id: Optional[str], metadata: Optional[Dict[str, Any]], finalize: bool):
+        thread_id: Optional[str], metadata: Optional[Dict[str, Any]], finalize: bool, reply_markup: Any = None):
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
+        if reply_markup is not None:
+            base["reply_markup"] = reply_markup
         for use_markdown in (True, False) if finalize else (False,):
             try:
                 if use_markdown:
@@ -3573,7 +3624,8 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     async def _edit_overflow_split(
-        self, chat_id: str, message_id: str, content: str, *, finalize: bool, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool,
+        metadata: Optional[Dict[str, Any]] = None, reply_markup: Any = None) -> SendResult:
         """Split an oversized edit across the existing message + continuations: edit ``message_id`` with
         chunk 1, send the rest as replies to the previous chunk, return ``message_id=<last-chunk-id>`` so
         the consumer keeps editing the newest message. ``success=False`` only if the first-chunk edit fails."""
@@ -3597,10 +3649,12 @@ class TelegramAdapter(BasePlatformAdapter):
         delivered_chunks = [first_chunk]
         prev_id = message_id
         thread_id = self._metadata_thread_id(metadata)
-        for chunk in chunks[1:]:
+        for index, chunk in enumerate(chunks[1:], start=1):
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id)
-            sent_msg = await self._send_overflow_continuation(chat_id, chunk, reply_to_id, thread_kwargs, thread_id, metadata, finalize)
+            sent_msg = await self._send_overflow_continuation(
+                chat_id, chunk, reply_to_id, thread_kwargs, thread_id, metadata, finalize,
+                reply_markup if index == len(chunks) - 1 else None)
             if sent_msg is None:
                 # Partial delivery: do NOT report success — the consumer would treat it as final delivery.
                 logger.warning("[%s] Overflow split: stopped at %d/%d chunks delivered", self.name, 1 + len(continuation_ids), len(chunks))

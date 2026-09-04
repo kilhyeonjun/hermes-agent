@@ -165,6 +165,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "unavailable_models",
     # Classified failure semantics for the last exhaustion (agent/error_classifier.py).
     # Providers return 403 for both an edge throttle and a spending limit, so the
     # raw status cannot size a cooldown; persisted so a restart doesn't downgrade
@@ -2047,6 +2048,32 @@ class CredentialPool:
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry:
                 logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
+            return next_entry
+
+    def mark_entitlement_unavailable_and_rotate(
+        self, *, model: str, api_key_hint: Optional[str] = None,
+        credential_id: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        """Bench one Codex credential for one unsupported model, never globally."""
+        if self.provider != "openai-codex" or not model:
+            return None
+        with self._lock:
+            id_entry = self._find(lambda e: e.id == credential_id) if credential_id else None
+            key_entry = self._find(lambda e: e.runtime_api_key == api_key_hint) if api_key_hint else None
+            if (credential_id and id_entry is None) or (api_key_hint and key_entry is None):
+                return None
+            if id_entry and key_entry and id_entry.id != key_entry.id:
+                return None
+            entry = id_entry or key_entry
+            if entry is None:
+                return None
+            extra = dict(entry.extra)
+            extra["unavailable_models"] = sorted(set(extra.get("unavailable_models") or ()) | {model})
+            self._replace_entry(entry, replace(entry, extra=extra))
+            self._persist()
+            available, _ = self._available_entries(clear_expired=True, refresh=False)
+            next_entry = next((e for e in available if model not in (e.extra.get("unavailable_models") or ())), None)
+            self._current_id = next_entry.id if next_entry else None
             return next_entry
 
     # ---- leases ------------------------------------------------------------

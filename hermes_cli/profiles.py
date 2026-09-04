@@ -825,6 +825,11 @@ def create_profile(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
             "(cloning explicitly copies skills from the source profile)."
         )
+    shared_skills_root = _get_default_hermes_home() / "shared-skills"
+    use_shared_skills = (
+        clone_from is None and not clone_config and not clone_all
+        and not no_skills and shared_skills_root.is_dir()
+    )
     canon = _canon_valid(name)
     if canon == "default":
         raise ValueError("Cannot create a profile named 'default' — it is the built-in profile (~/.hermes).")
@@ -857,13 +862,24 @@ def create_profile(
         from hermes_cli.default_soul import DEFAULT_SOUL_MD
         _seed_file_if_missing(profile_dir / "SOUL.md", DEFAULT_SOUL_MD)
 
-    # Opt-out marker read by seed_profile_skills() and `hermes update`'s all-profile sync
-    # (the feature still works via the empty skills/ dir if this fails).
-    if no_skills:
+    if use_shared_skills:
+        config_path = profile_dir / "config.yaml"
+        config = _load_yaml_dict(config_path) or {}
+        config.setdefault("skills", {})["external_dirs"] = [str(shared_skills_root.resolve())]
+        with contextlib.suppress(Exception):
+            import yaml
+            config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    # Shared-library profiles also opt out of bundled copies; external_dirs owns discovery.
+    if no_skills or use_shared_skills:
+        marker_reason = (
+            "This profile uses the shared skill library.\n"
+            if use_shared_skills else
+            "This profile opted out of bundled-skill seeding (`hermes profile create --no-skills`).\n"
+        )
         _seed_file_if_missing(
             profile_dir / NO_BUNDLED_SKILLS_MARKER,
-            "This profile opted out of bundled-skill seeding (`hermes profile create --no-skills`).\n"
-            "Delete this file to re-enable sync on the next `hermes update`.\n",
+            marker_reason + "Delete this file to re-enable sync on the next `hermes update`.\n",
         )
 
     # Migrate config-only clones now so desktop/status don't warn that a just-created
