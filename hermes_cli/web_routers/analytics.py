@@ -9,6 +9,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+from hermes_state_costs import cost_coverage
 from fastapi import APIRouter, HTTPException, Query
 
 from hermes_cli.config import get_config_path, read_raw_config
@@ -128,6 +130,7 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
         return {
             "daily": daily,
             "by_model": by_model,
+            "cost_coverage": cost_coverage(db, cutoff=cutoff),
             "by_task": _aux_task_summary(aux_rows),  # "what is compression costing me"
             "totals": totals,
             "period_days": days,
@@ -294,7 +297,8 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
             FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
         """, cutoff)[0]
 
-        return {"models": models, "totals": totals, "period_days": days}
+        return {"models": models, "totals": totals, "period_days": days,
+                "cost_coverage": cost_coverage(db, cutoff=cutoff)}
     finally:
         db.close()
 

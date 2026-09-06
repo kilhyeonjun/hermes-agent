@@ -34,6 +34,13 @@ def test_coverage_reports_unknown_storage_without_repricing_or_writes(tmp_path):
     assert db_path.read_bytes() == before
     assert "fixture-model" not in result.stdout
     assert "0.25" not in result.stdout  # counts, not misleading spend totals
+    request_result = subprocess.run(command + ["--requests"], capture_output=True, text=True, check=True)
+    coverage = json.loads(request_result.stdout)[0]["request_cost_coverage"]
+    assert coverage["estimated_reference_usd"] == 0.25
+    assert coverage["actual_reported_usd"] is None
+    # A status alone, without verified subscription route, cannot establish included usage.
+    assert coverage["requests"] == {"actual": 0, "estimated": 1, "included": 0, "unknown": 2}
+    assert db_path.read_bytes() == before
 
 
 def test_missing_database_is_not_created(tmp_path):

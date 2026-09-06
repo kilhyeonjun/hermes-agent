@@ -168,3 +168,20 @@ class TestSessionModelUsagePkHeal:
             assert left is None
         finally:
             db.close()
+
+
+def test_pk_heal_preserves_nonzero_cost_provenance_and_nullable_amounts(tmp_path):
+    path = _make_stale_v22_db(tmp_path, usage_rows=[("s1", "fixture", 10, 2)])
+    with sqlite3.connect(path) as conn:
+        for kind in ("actual", "estimated", "included", "unknown"):
+            conn.execute(f"ALTER TABLE session_model_usage ADD COLUMN cost_{kind}_requests INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE session_model_usage ADD COLUMN actual_reported_usd REAL")
+        conn.execute("ALTER TABLE session_model_usage ADD COLUMN estimated_reference_usd REAL")
+        conn.execute("UPDATE session_model_usage SET cost_actual_requests=2, cost_unknown_requests=3, actual_reported_usd=0.75")
+    db = SessionDB(db_path=path)
+    try:
+        assert "task" in _pk_cols(db)
+        row = db._conn.execute("SELECT cost_actual_requests, cost_unknown_requests, actual_reported_usd, estimated_reference_usd FROM session_model_usage").fetchone()
+        assert tuple(row) == (2, 3, 0.75, None)
+    finally:
+        db.close()

@@ -131,3 +131,20 @@ class TestWriteUsageAudit:
         scheduler._write_usage_audit({"job_id": "한글", "model": "gemma"})
         text = scheduler._usage_audit_path().read_text(encoding="utf-8")
         assert "한글" in text
+
+
+def test_fire_audit_records_resolved_route_and_unknown_usage(tmp_hermes_home):
+    audit = scheduler._FireAudit({}, "fixture", "configured-model")
+    audit.write({"model": "resolved-model", "provider": "fixture-provider", "session_id": "fixture-session",
+                 "prompt_tokens": 0, "completion_tokens": 0, "api_calls": 1}, None)
+    audit.write({}, "fixture failure")
+    first, missing = _read_jsonl(scheduler._usage_audit_path())
+    assert first["model"] == "resolved-model"
+    assert first["provider"] == "fixture-provider"
+    assert first["session_id"] == "fixture-session"
+    assert first["api_calls"] == 1
+    assert first["token_totals_present"] is True
+    assert missing["api_calls"] is None
+    assert missing["token_totals_present"] is False
+    assert missing["session_id"] is None
+    assert "base_url" not in first

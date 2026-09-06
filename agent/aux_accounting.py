@@ -75,8 +75,11 @@ def record_aux_usage(
             return
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
+        cost_status, cost_source, billing_mode = "unknown", None, None
         try:
             cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+            cost_status, cost_source = cost.status, cost.source
+            billing_mode = "subscription_included" if cost_status == "included" else None
             if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
         except Exception:
@@ -86,6 +89,7 @@ def record_aux_usage(
             input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens, cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens, estimated_cost_usd=estimated_cost,
+            cost_status=cost_status, cost_source=cost_source, billing_mode=billing_mode,
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

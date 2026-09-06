@@ -323,3 +323,6 @@ lifecycles to Relay. Explicit Relay plugin configuration can add
 [ATOF, ATIF, or OTEL](https://docs.nvidia.com/nemo/relay/configure-plugins/observability/about)
 exporters and execution middleware; see
 [Relay shared metrics](relay-shared-metrics.md).
+
+Local request-cost provenance and its coverage limits are documented in
+[cost coverage](cost-coverage.md).

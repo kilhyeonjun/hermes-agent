@@ -9,6 +9,8 @@ import logging
 import threading
 import time
 import weakref
+
+from hermes_state_costs import cost_provenance
 from typing import Any, Dict, List, Optional, Tuple
 
 # caplog tests pin the "hermes_state" logger name.
@@ -54,8 +56,10 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    task, api_call_count, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
                    estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                   first_seen, last_seen
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   first_seen, last_seen,
+                   cost_actual_requests, cost_estimated_requests, cost_included_requests,
+                   cost_unknown_requests, actual_reported_usd, estimated_reference_usd
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
                DO UPDATE SET
                    api_call_count = api_call_count + excluded.api_call_count,
@@ -68,7 +72,15 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
                    cost_status = COALESCE(excluded.cost_status, cost_status),
                    cost_source = COALESCE(excluded.cost_source, cost_source),
-                   last_seen = excluded.last_seen"""
+                   last_seen = excluded.last_seen,
+                   cost_actual_requests = COALESCE(cost_actual_requests, 0) + excluded.cost_actual_requests,
+                   cost_estimated_requests = COALESCE(cost_estimated_requests, 0) + excluded.cost_estimated_requests,
+                   cost_included_requests = COALESCE(cost_included_requests, 0) + excluded.cost_included_requests,
+                   cost_unknown_requests = COALESCE(cost_unknown_requests, 0) + excluded.cost_unknown_requests,
+                   actual_reported_usd = CASE WHEN excluded.actual_reported_usd IS NULL THEN actual_reported_usd
+                       ELSE COALESCE(actual_reported_usd, 0) + excluded.actual_reported_usd END,
+                   estimated_reference_usd = CASE WHEN excluded.estimated_reference_usd IS NULL THEN estimated_reference_usd
+                       ELSE COALESCE(estimated_reference_usd, 0) + excluded.estimated_reference_usd END"""
 
 
 # Kwargs forwarded verbatim from update_token_counts / record_auxiliary_usage into
@@ -218,7 +230,12 @@ class SessionUsageMixin:
         for session_id, kwargs in batch:
             key = None
             if not kwargs.get("absolute"):
-                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS))
+                provenance = cost_provenance(**{field: kwargs.get(field) for field in (
+                    "api_call_count", "cost_status", "billing_mode", "actual_cost_usd", "estimated_cost_usd")})
+                # Identical status/route is insufficient: a missing priced amount is
+                # unknown, and must not acquire its neighbour's provenance on merge.
+                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS),
+                       *(count > 0 for count in provenance[:4]))
             if groups and key is not None and groups[-1][0] == key:
                 merged = groups[-1][2]
                 for f in self._TOKEN_DELTA_SUM_FIELDS:
@@ -359,13 +376,17 @@ class SessionUsageMixin:
             billing_provider or sess.get("billing_provider") or "",
             billing_base_url or sess.get("billing_base_url") or "",
             billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts,
-            float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now))
+            float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now,
+            *cost_provenance(api_call_count=api_call_count, cost_status=cost_status,
+                billing_mode=billing_mode or sess.get("billing_mode"),
+                actual_cost_usd=actual_cost_usd, estimated_cost_usd=estimated_cost_usd)))
 
     def record_auxiliary_usage(
         self, session_id: str, task: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
         billing_base_url: Optional[str]=None, input_tokens: int=0, output_tokens: int=0, cache_read_tokens: int=0,
         cache_write_tokens: int=0, reasoning_tokens: int=0, estimated_cost_usd: Optional[float]=None,
-        api_call_count: int=1,
+        api_call_count: int=1, actual_cost_usd: Optional[float]=None,
+        cost_status: Optional[str]=None, cost_source: Optional[str]=None, billing_mode: Optional[str]=None,
     ) -> None:
         """Record an auxiliary LLM call's usage (vision, compression, title generation, ...)
         as a per-(model, provider, task) delta in ``session_model_usage`` WITHOUT touching

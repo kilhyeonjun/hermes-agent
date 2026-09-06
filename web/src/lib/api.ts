@@ -2146,6 +2146,7 @@ export interface AnalyticsSkillsSummary {
 }
 
 export interface AnalyticsResponse {
+  cost_coverage?: CostCoverage;
   daily: AnalyticsDailyEntry[];
   by_model: AnalyticsModelEntry[];
   totals: {
@@ -2218,7 +2219,17 @@ export interface ModelsAnalyticsModelEntry {
   };
 }
 
+export interface CostCoverage {
+  actual_reported_usd: number | null;
+  estimated_reference_usd: number | null;
+  requests: { actual: number; estimated: number; included: number; unknown: number };
+  route_api_calls: number;
+  main_api_call_discrepancy: number;
+  provenance_count_discrepancy: number;
+}
+
 export interface ModelsAnalyticsResponse {
+  cost_coverage?: CostCoverage;
   models: ModelsAnalyticsModelEntry[];
   totals: {
     distinct_models: number;

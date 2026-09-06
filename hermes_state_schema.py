@@ -70,6 +70,12 @@ _SESSION_MODEL_USAGE_HEAL_DDL = """CREATE TABLE session_model_usage (
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
     actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_actual_requests INTEGER NOT NULL DEFAULT 0,
+    cost_estimated_requests INTEGER NOT NULL DEFAULT 0,
+    cost_included_requests INTEGER NOT NULL DEFAULT 0,
+    cost_unknown_requests INTEGER NOT NULL DEFAULT 0,
+    actual_reported_usd REAL,
+    estimated_reference_usd REAL,
     cost_status TEXT,
     cost_source TEXT,
     first_seen REAL,
@@ -761,7 +767,9 @@ class SessionSchemaMixin:
                        billing_mode, task, api_call_count, input_tokens,
                        output_tokens, cache_read_tokens, cache_write_tokens,
                        reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                       cost_status, cost_source, first_seen, last_seen
+                       cost_status, cost_source, first_seen, last_seen,
+                          cost_actual_requests, cost_estimated_requests, cost_included_requests,
+                          cost_unknown_requests, actual_reported_usd, estimated_reference_usd
                    )
                    SELECT session_id, model,
                           COALESCE(billing_provider, ''),
@@ -771,7 +779,9 @@ class SessionSchemaMixin:
                           api_call_count, input_tokens,
                           output_tokens, cache_read_tokens, cache_write_tokens,
                           reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                          cost_status, cost_source, first_seen, last_seen
+                          cost_status, cost_source, first_seen, last_seen,
+                          cost_actual_requests, cost_estimated_requests, cost_included_requests,
+                          cost_unknown_requests, actual_reported_usd, estimated_reference_usd
                    FROM session_model_usage_legacy_pk""",
                 _SESSION_MODEL_USAGE_INDEX_SQL,
             )

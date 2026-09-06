@@ -109,6 +109,12 @@ def test_compression_attempt_telemetry_is_metadata_only(caplog):
     assert payload["prompt_build_ms"] is None
     assert payload["time_to_first_progress_ms"] is None
     assert payload["summary_generation_ms"] is None
+    assert payload["messages_before_estimated_tokens"] > 0
+    assert payload["messages_after_estimated_tokens"] > 0
+    assert payload["messages_saved_estimated_tokens"] == (
+        payload["messages_before_estimated_tokens"] - payload["messages_after_estimated_tokens"]
+    )
+    assert payload["token_measurement_basis"] == "message_only_rough_estimate"
 
     raw_log = json.dumps(payload)
     assert "TOPSECRET_TRANSCRIPT_TEXT" not in raw_log
@@ -198,3 +204,32 @@ def test_aux_call_telemetry_records_content_free_phase_timings():
         "commit_ms": 11,
     }
     assert "TOPSECRET_TRANSCRIPT_TEXT" not in json.dumps(payload)
+
+
+def test_latest_approved_scope_and_policy_survive_with_profile_private_summary_isolation():
+    policy = 'Fixture policy: LOCAL_WRITE_ONLY. External sends need explicit authorization.'
+    prior_secret = 'OTHER_PROFILE_PRIVATE_FIXTURE_9281'
+    active_scope = 'SCOPE_SNAPSHOT: fix fixture; approved local edits only. No publication authorized.'
+    messages = [{'role': 'system', 'content': policy}, {'role': 'user', 'content': 'Old completed task.'}]
+    for index in range(18):
+        messages.extend([{'role': 'user', 'content': f'Historical discussion {index}' * 30},
+                         {'role': 'assistant', 'content': 'Historical result. ' * 70}])
+    messages.extend([{'role': 'user', 'content': active_scope},
+                     {'role': 'assistant', 'content': 'Working on the scoped change.'}])
+    captured = []
+
+    def summary_response(*args, **kwargs):
+        captured.append(str(kwargs.get('messages', args)))
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='Historical facts only.'))])
+
+    with patch('agent.context_compressor.get_model_context_length', return_value=100_000):
+        compressor = ContextCompressor(model='fixture', quiet_mode=True, protect_first_n=2, protect_last_n=2, config_context_length=100_000)
+    compressor.tail_token_budget = 500
+    compressor._previous_summary = prior_secret
+    with patch('agent.context_compressor.call_llm', side_effect=summary_response):
+        compressed, live_policy = compress_context(_Agent(compressor), messages, policy, approx_tokens=75_000, force=True)
+    assert captured, 'The actual compressor must reach summary generation.'
+    assert live_policy == policy
+    assert active_scope in str(compressed)
+    assert prior_secret not in str(compressed)
+    assert all(prior_secret not in payload for payload in captured)

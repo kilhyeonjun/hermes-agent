@@ -238,7 +238,8 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             f"unintended spend. {remediation}"
         )
 
-    # no_agent jobs never reach a model, so provider errors are structurally impossible for them.
+    # no_agent skips the scheduler model route. Its script can still call an external LLM;
+    # classify that subprocess failure separately instead of inferring a host provider failure.
     # Gate on job MODE before substring matching, or a script's own wording ("timed out", "429")
     # would blame the wrong subsystem; the generic cleaner below reports what actually happened.
     provider_reachable = not job.get("no_agent")
@@ -1252,7 +1253,8 @@ def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
 def _run_no_agent_job(
     job: dict, job_id: str, job_name: str, cancel_event,
 ) -> tuple[bool, str, str, Optional[str]]:
-    """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
+    """no_agent short-circuit — the script IS the job (no AIAgent). stdout → delivered
+    Scripts may call LLMs themselves; skipping the host agent does not establish zero cost.
     verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
     """
     # Load .env first so auto-delivery can resolve *_HOME_CHANNEL: the agent path's per-run dotenv
@@ -2281,7 +2283,12 @@ class _FireAudit:
             "total_tokens": result.get("total_tokens"),
             "response_silent": bool(result.get("response_silent")),
             "deliver_target": self.job.get("deliver"),
-            "model": self.model or None,
+            "model": result.get("model") or self.model or None,
+            "provider": result.get("provider"),
+            "session_id": result.get("session_id"),
+            "api_calls": result.get("api_calls"),
+            "token_totals_present": any(result.get(key) is not None for key in
+                                  ("prompt_tokens", "completion_tokens", "total_tokens")),
             "duration_ms": int((time.monotonic() - self.t_start) * 1000),
             "error": error})
 

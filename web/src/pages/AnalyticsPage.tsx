@@ -1,3 +1,4 @@
+import { CostCoverage } from "@/components/CostCoverage";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import {
   ArrowDown,
@@ -570,6 +571,7 @@ export default function AnalyticsPage() {
                     },
                   ]}
                 />
+                <CostCoverage coverage={data.cost_coverage} />
               </CardContent>
             </Card>
 

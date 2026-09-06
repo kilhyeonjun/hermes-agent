@@ -4543,7 +4543,16 @@ Write only the summary body. Do not include any preamble or prefix."""
         # messages-only; comparing them fakes ~96% savings and kills the anti-thrashing guard.
         # Message-only savings are diagnostic; the verdict belongs to the next provider prompt count.
         pre_estimate = estimate_messages_tokens_rough(messages)
-        saved_estimate = pre_estimate - estimate_messages_tokens_rough(compressed)
+        post_estimate = estimate_messages_tokens_rough(compressed)
+        saved_estimate = pre_estimate - post_estimate
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry.update(
+                messages_before_estimated_tokens=pre_estimate,
+                messages_after_estimated_tokens=post_estimate,
+                messages_saved_estimated_tokens=saved_estimate,
+                token_measurement_basis="message_only_rough_estimate",
+            )
         savings_pct = (saved_estimate / pre_estimate * 100) if pre_estimate > 0 else 0
         self._last_compression_savings_pct = savings_pct
         if not self.quiet_mode:

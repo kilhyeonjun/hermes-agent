@@ -1,3 +1,4 @@
+import { CostCoverage } from "@/components/CostCoverage";
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -1278,10 +1279,6 @@ export default function ModelsPage() {
                           value: formatTokens(data.totals.total_output),
                         },
                         {
-                          label: t.models.estimatedCost,
-                          value: formatCost(data.totals.total_estimated_cost),
-                        },
-                        {
                           label: t.analytics.totalSessions,
                           value: String(data.totals.total_sessions),
                         },
@@ -1299,6 +1296,7 @@ export default function ModelsPage() {
                 }
               />
               </div>
+              {showTokens && <CostCoverage coverage={data.cost_coverage} />}
               {!showTokens && (
                 <p className="mt-4 text-xs text-text-tertiary leading-relaxed">
                   Token & cost analytics are hidden because the local counts
