@@ -289,7 +289,9 @@ def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *,
         api_kwargs, messages=sanitized, tools=api_kwargs.get("tools"), supports_prompt_cache_key=supports_prompt_cache_key,
         session_id=params.get("session_id"), cache_scope_id=params.get("cache_scope_id"),
     )
-    return api_kwargs
+    from agent.astra_compat import finalize_astra_kwargs
+
+    return finalize_astra_kwargs(api_kwargs, responses=False)
 
 
 def _sanitize_message(msg: Any, strip_extra_content: bool) -> dict | None:

@@ -335,6 +335,9 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
+    # Isolate contract content while verifying its place in the stable prefix.
+    monkeypatch.setattr(system_prompt, "_runtime_contract_parts", lambda: ["RUNTIME_CONTRACT"])
+
     # Production renders this as str(get_hermes_home()) + "/profiles/<name>/",
     # and str(Path("/hermes")) is platform-dependent (backslash on Windows) —
     # build the expectation the same way instead of hardcoding "/hermes".
@@ -348,6 +351,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     )
     expected = "\n\n".join((
         "IDENTITY",
+        "RUNTIME_CONTRACT",
         "HELP",
         "STEER",
         "CODING_STABLE",
@@ -377,7 +381,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

@@ -592,7 +592,9 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["extra_body"].setdefault("prompt_cache_key", kwargs.get("prompt_cache_key", cache_key))
 
         _bound_prompt_cache_key_field(kwargs.get("extra_body"))
-        return kwargs
+        from agent.astra_compat import finalize_astra_kwargs
+
+        return finalize_astra_kwargs(kwargs, responses=True)
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Codex Responses API response to NormalizedResponse."""
@@ -660,7 +662,10 @@ class ResponsesApiTransport(ProviderTransport):
         ``sanitize_harmony_tokens`` is for the ChatGPT Codex backend only (rejects literal Harmony tokens).
         """
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+        from agent.astra_compat import finalize_astra_kwargs
 
+        if isinstance(api_kwargs, dict):
+            api_kwargs = finalize_astra_kwargs(dict(api_kwargs), responses=True)
         normalized = _preflight_codex_api_kwargs(
             api_kwargs, allow_stream=allow_stream, is_github_responses=is_github_responses,
             sanitize_harmony_tokens=sanitize_harmony_tokens,

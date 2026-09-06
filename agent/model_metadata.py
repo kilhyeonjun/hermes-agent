@@ -538,6 +538,11 @@ def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
     if parsed.scheme.lower() != "https" or port not in (None, 443) or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
         return None
     host, path, model_key = (parsed.hostname or "").lower(), parsed.path.rstrip("/"), model.strip().lower()
+    from agent.astra_compat import is_astra_model
+
+    # Published direct-API window; never apply it to a proxy or Codex OAuth endpoint.
+    if host == "api.openai.com" and path in ("", "/v1") and is_astra_model(model):
+        return 1_050_000
     return next((ctx for scoped_host, paths, models, ctx in _ENDPOINT_SCOPED_CONTEXT if host == scoped_host and path in paths and model_key in models), None)
 
 

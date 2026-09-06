@@ -210,3 +210,43 @@ Fallback behavior is exercised across several suites:
 - [Agent Loop Internals](./agent-loop.md)
 - [ACP Internals](./acp-internals.md)
 - [Context Compression & Prompt Caching](./context-compression-and-caching.md)
+
+
+## GPT-6 Astra API contract
+
+`agent/astra_compat.py` recognizes the published `gpt-6-astra` alias, including
+provider-qualified `publisher/gpt-6-astra` names. It deliberately does not infer
+future snapshots or variants. Astra tool calling requires Responses; a named
+custom provider configured for Chat Completions gets a local migration error
+before building a tool request. Set its `api_mode: responses` only after verifying
+that endpoint supports Responses. Hermes does not silently change its transport.
+
+Astra supports reasoning efforts `low`, `medium`, `high`, `xhigh`, and `max`.
+Hermes' internal `ultra` is clamped to `max` on this API wire. Effort strings are
+trimmed and lowercased; unknown levels and explicit non-string overrides are rejected
+locally before an API request. Unsupported sampling
+and logprob options, including `message.output_text.logprobs` in `include`, are
+removed after request overrides. The same checks cover `extra_body`; caller-owned
+configuration dictionaries remain unchanged. Other model contracts are unchanged.
+
+The published direct API window is 1,050,000 tokens and its maximum output is
+128,000 tokens. The context resolver applies the documented window only to the
+canonical `https://api.openai.com[/v1]` endpoint, after explicit config overrides.
+It does not assign that window to Codex OAuth or proxies, whose limits must come
+from their own metadata or configuration. Existing output-budget resolution is
+unchanged. See the [official model reference](https://developers.openai.com/api/docs/models/gpt-6-astra)
+and [migration guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra).
+
+### Checking cost-record coverage without repricing
+
+Run `python scripts/report_usage_coverage.py --db /path/to/profile/state.db`
+(repeat `--db` for other profiles). The command opens existing databases read-only
+and reports numeric NULL/zero/status row counts for `sessions` and
+`session_model_usage`. It does not read message bodies, migrate data, call providers,
+or reinterpret a subscription as API spend.
+
+The current per-model schema stores missing amounts as zero and cumulative rows
+retain the latest cost status. Therefore these counts measure stored-row coverage,
+not per-request billing completeness. An unknown value must not be interpreted as
+free usage; historical unknown calls cannot be recovered from overwritten statuses
+alone. The command intentionally does not calculate a dollar total or savings rate.
