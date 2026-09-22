@@ -109,6 +109,7 @@ class PricingEntry:
     input_cost_per_million_above: Optional[Decimal] = None
     output_cost_per_million_above: Optional[Decimal] = None
     cache_read_cost_per_million_above: Optional[Decimal] = None
+    cache_write_cost_per_million_above: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,15 @@ for _provider, _url, _version, _rows in _SNAPSHOTS:
             _OFFICIAL_DOCS_PRICING[(_provider, _model)] = _entry
 del _SNAPSHOTS, _provider, _url, _version, _rows, _models, _rates, _entry, _model
 
+# GPT-6 Sol: prompts above 272K apply the published multipliers to the whole request.
+_OFFICIAL_DOCS_PRICING[("openai", "gpt-6-sol")] = _snap(
+    "2.00", "10.00", "0.20", "2.50",
+    url="https://developers.openai.com/api/docs/models/gpt-6-sol", version="openai-gpt-6-sol-2026-09",
+    tier_threshold_tokens=272_000, input_cost_per_million_above=Decimal("4.00"),
+    output_cost_per_million_above=Decimal("15.00"), cache_read_cost_per_million_above=Decimal("0.40"),
+    cache_write_cost_per_million_above=Decimal("5.00"),
+)
+
 # Context-tiered Gemini Pro: above 200k prompt tokens the *_above rates apply to
 # the whole request (see PricingEntry).
 _OFFICIAL_DOCS_PRICING[("google", "gemini-3.1-pro")] = _snap(
@@ -296,7 +306,8 @@ def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct
 # api.openai.com). Google and Fireworks are matched by name OR host below.
 _SNAPSHOT_PROVIDER_ALIASES = {
-    "anthropic": "anthropic", "openai": "openai", "openai-api": "openai", "minimax": "minimax", "minimax-cn": "minimax-cn",
+    "anthropic": "anthropic", "openai": "openai", "openai-api": "openai", "cliproxy": "openai",
+    "minimax": "minimax", "minimax-cn": "minimax-cn",
 }
 # AI Studio and Vertex host the same Gemini models (the Vertex "google/" vendor
 # prefix is stripped with the rest of the path).
@@ -555,7 +566,7 @@ def estimate_usage_cost(
         (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, ()),
         (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
          ("cache-read pricing unavailable for route",)),
-        (usage.cache_write_tokens, entry.cache_write_cost_per_million, None,
+        (usage.cache_write_tokens, entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above,
          ("cache-write pricing unavailable for route",)),
     ):
         if above and rate_above is not None:

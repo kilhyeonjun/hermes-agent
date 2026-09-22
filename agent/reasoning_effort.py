@@ -85,7 +85,8 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
 
     if is_astra_model(model):
         return CODEX_ASTRA_EFFORTS
-    return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() else CODEX_LEGACY_EFFORTS
+    slug = (model or "").lower()
+    return CODEX_GPT56_EFFORTS if "gpt-5.6" in slug or "gpt-6-sol" in slug else CODEX_LEGACY_EFFORTS
 
 
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
