@@ -678,6 +678,25 @@ class TestEdgeCases:
         # Actually the condition is > 1 platforms OR non-cli, so single cli won't show
 
 
+    def test_saved_luna_estimate_keeps_pricing_status_without_provider_alias(self, db):
+        db.create_session(session_id="luna-route", source="cli", model="gpt-6-luna")
+        db.update_token_counts(
+            "luna-route", input_tokens=1000, model="gpt-6-luna",
+            billing_provider="custom", billing_base_url="http://127.0.0.1:8317/v1",
+            estimated_cost_usd=0.0001, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1,
+        )
+        db.create_session(session_id="unpriced", source="cli", model="my-local-llama")
+        db.update_token_counts("unpriced", input_tokens=1000, model="my-local-llama",
+                               billing_provider="custom", api_call_count=1)
+        report = InsightsEngine(db).generate(days=30)
+        overview = report["overview"]
+        assert overview["estimated_cost"] == pytest.approx(0.0001)
+        assert "gpt-6-luna" in overview["models_with_pricing"]
+        assert "my-local-llama" in overview["models_without_pricing"]
+        assert overview["unknown_cost_sessions"] == 1
+        assert next(m for m in report["models"] if m["model"] == "gpt-6-luna")["has_pricing"]
+
     def test_cost_buckets_displayed_in_terminal_format(self, db):
         """#77223: included/estimated/unknown cost buckets surface in terminal."""
         # Estimated cost session

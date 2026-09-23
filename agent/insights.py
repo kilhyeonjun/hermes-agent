@@ -32,6 +32,8 @@ def _estimate_cost(session_or_model: Dict[str, Any] | str, input_tokens: int = 0
         model = s.get("model") or ""
         usage = CanonicalUsage(**{k: s.get(k) or 0 for k in _TOKEN_KEYS})
         provider, base_url = s.get("billing_provider"), s.get("billing_base_url")
+        if s.get("cost_status") in ("estimated", "included") and s.get("estimated_cost_usd") is not None:
+            return float(s["estimated_cost_usd"]), s["cost_status"]
     else:
         model = session_or_model or ""
         usage = CanonicalUsage(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
@@ -277,7 +279,7 @@ class InsightsEngine:
             total_cost += estimated
             actual_cost += s.get("actual_cost_usd") or 0.0
             status_counts[status] += 1
-            known = has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url"))
+            known = status in ("estimated", "included") or has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url"))
             (models_with_pricing if known else models_without_pricing).add(_short_model(model))
         if models:
             total_cost = sum(float(m.get("cost") or 0.0) for m in models)
@@ -333,7 +335,8 @@ class InsightsEngine:
             d["cost"] += estimate
             d["actual_cost"] += float(actual_cost or 0.0)
             d["cost_status"] = status
-            d["has_pricing"] = has_known_pricing(model, provider or None, base_url) or d.get("has_pricing", False)
+            d["has_pricing"] = (status in ("estimated", "included") or
+                                has_known_pricing(model, provider or None, base_url) or d.get("has_pricing", False))
         usage_totals = defaultdict(lambda: dict.fromkeys(count_keys, 0) | {"estimated_cost_usd": 0.0, "actual_cost_usd": 0.0})
         for r in self._get_model_usage(cutoff, source):
             totals: Dict[str, Any] = usage_totals[r["session_id"]]

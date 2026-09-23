@@ -147,6 +147,7 @@ def _estimate_attempt_cost(agent: Any, response: Any) -> Optional[Decimal]:
         result = estimate_usage_cost(
             getattr(agent, "model", "") or "", canonical, provider=getattr(agent, "provider", None),
             base_url=getattr(agent, "base_url", None), api_key=getattr(agent, "api_key", None),
+            requested_provider=getattr(agent, "requested_provider", None),
         )
     except Exception:  # noqa: BLE001 — pricing must never break the loop
         logger.debug("empty-guard: cost estimation failed", exc_info=True)

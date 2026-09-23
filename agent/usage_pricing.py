@@ -247,6 +247,13 @@ _OFFICIAL_DOCS_PRICING[("openai", "gpt-6-sol")] = _snap(
     output_cost_per_million_above=Decimal("15.00"), cache_read_cost_per_million_above=Decimal("0.40"),
     cache_write_cost_per_million_above=Decimal("5.00"),
 )
+_OFFICIAL_DOCS_PRICING[("openai", "gpt-6-luna")] = _snap(
+    "0.10", "0.50", "0.01", "0.125",
+    url="https://developers.openai.com/api/docs/models/gpt-6-luna", version="openai-gpt-6-luna-2026-09",
+    tier_threshold_tokens=272_000, input_cost_per_million_above=Decimal("0.20"),
+    output_cost_per_million_above=Decimal("0.75"), cache_read_cost_per_million_above=Decimal("0.02"),
+    cache_write_cost_per_million_above=Decimal("0.25"),
+)
 
 # Context-tiered Gemini Pro: above 200k prompt tokens the *_above rates apply to
 # the whole request (see PricingEntry).
@@ -306,7 +313,7 @@ def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct
 # api.openai.com). Google and Fireworks are matched by name OR host below.
 _SNAPSHOT_PROVIDER_ALIASES = {
-    "anthropic": "anthropic", "openai": "openai", "openai-api": "openai", "cliproxy": "openai",
+    "anthropic": "anthropic", "openai": "openai", "openai-api": "openai", "cliproxy": "openai", "cliproxy-luna": "openai",
     "minimax": "minimax", "minimax-cn": "minimax-cn",
 }
 # AI Studio and Vertex host the same Gemini models (the Vertex "google/" vendor
@@ -315,10 +322,16 @@ _GOOGLE_PROVIDER_NAMES = {"google", "gemini", "vertex", "google-gemini", "google
 
 
 def resolve_billing_route(
-    model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None
+    model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
+    requested_provider: Optional[str] = None,
 ) -> BillingRoute:
     provider_name = (provider or "").strip().lower()
     base = (base_url or "").strip().lower()
+    # Named CLIProxy endpoints resolve to "custom" at runtime. Trust the configured
+    # identity only for this exact local proxy, never for an arbitrary custom host.
+    if (provider_name == "custom" and base.rstrip("/") == "http://127.0.0.1:8317/v1"
+            and requested_provider in ("cliproxy", "cliproxy-luna")):
+        provider_name = requested_provider
     model = (model_name or "").strip()
     if not provider_name and "/" in model:
         inferred_provider, bare_model = model.split("/", 1)
@@ -434,9 +447,10 @@ def _pricing_entry_from_metadata(
 
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None, requested_provider: Optional[str] = None,
 ) -> Optional[PricingEntry]:
-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    route = resolve_billing_route(model_name, provider=provider, base_url=base_url,
+                                  requested_provider=requested_provider)
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
     if route.provider == "openrouter":
@@ -545,15 +559,18 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
+    requested_provider: Optional[str] = None,
 ) -> CostResult:
-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    route = resolve_billing_route(model_name, provider=provider, base_url=base_url,
+                                  requested_provider=requested_provider)
     if route.billing_mode == "subscription_included":
         return CostResult(
             amount_usd=_ZERO, status="included", source="none", label="included",
             pricing_version="included-route", notes=(_INCLUDED_NOTE,),
         )
 
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key,
+                              requested_provider=requested_provider)
     if not entry:
         return _unknown_cost("none")
 
