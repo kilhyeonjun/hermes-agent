@@ -4682,11 +4682,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 with contextlib.suppress(OSError):
                     os.unlink(_transcoded_voice_path)
 
+    async def _send_images_individually_or_raise(
+        self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]], human_delay: float = 0.0
+    ) -> None:
+        from urllib.parse import unquote as _unquote
+        for image_url, caption in images:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            if image_url.startswith("file://"):
+                result = await self.send_image_file(
+                    chat_id, _unquote(image_url[7:]), caption=caption, metadata=metadata)
+            elif self._is_animation_url(image_url):
+                result = await self.send_animation(chat_id, image_url, caption=caption, metadata=metadata)
+            else:
+                result = await self.send_image(chat_id, image_url, caption=caption, metadata=metadata)
+            if not result.success:
+                raise RuntimeError(result.error or "Telegram image delivery failed")
+
     async def send_multiple_images(
-        self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> None:
-        """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
-        media group (need ``send_animation``) so they go via the base per-image path, as does a failed chunk."""
+        self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0
+    ) -> None:
+        """Send one photo directly; use Telegram albums only for actual multi-image batches."""
         if not self._bot or not images:
+            return
+        if len(images) == 1:
+            await self._send_images_individually_or_raise(chat_id, images, metadata)
             return
         try:
             from telegram import InputMediaPhoto
@@ -4698,7 +4718,7 @@ class TelegramAdapter(BasePlatformAdapter):
         animations = [img for img in images if is_anim(img[0])]
         photos = [img for img in images if not is_anim(img[0])]
         if animations:
-            await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay)
+            await self._send_images_individually_or_raise(chat_id, animations, metadata, human_delay)
         if not photos:
             return
         from urllib.parse import unquote as _unquote
@@ -4737,7 +4757,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                await self._send_images_individually_or_raise(chat_id, chunk, metadata, human_delay)
             finally:
                 for fh in opened_files:
                     with contextlib.suppress(Exception):

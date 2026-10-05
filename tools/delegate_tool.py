@@ -14,6 +14,7 @@ tool calls or reasoning.
 import logging
 import time
 import weakref
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
@@ -94,12 +95,12 @@ def _open_child_session_db(parent_agent) -> Any:
     # breaking parent_session_id lineage and session_search. AsyncSessionDB wrappers (gateway) forward
     # .db_path via __getattr__, so this works through them.
     parent_session_db = getattr(parent_agent, "_session_db", None)
-    if parent_session_db is None:
+    parent_db_path = getattr(parent_session_db, "db_path", None)
+    if not isinstance(parent_db_path, (str, Path)):
         return None
     with _quiet("subagent: failed to open dedicated SessionDB; child persistence disabled", exc_info=True):
         from hermes_state_registry import acquire
-        _parent_db_path = getattr(parent_session_db, "db_path", None)
-        return acquire(_parent_db_path) if _parent_db_path is not None else acquire()
+        return acquire(Path(parent_db_path))
     return None
 
 def _build_child_agent(

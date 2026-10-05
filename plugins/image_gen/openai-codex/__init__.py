@@ -55,6 +55,17 @@ _ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/gif", "image
 _PARTIAL_IMAGES_REQUESTED = 0
 _NONFINAL_RETRIES = 1  # content-agnostic retries when the stream yields no final result
 
+_MODELS = {
+    **GPT_IMAGE_2_TIERS,
+    "gpt-image-2.5-sunburst-high": {
+        "display": "GPT Image 2.5 Sunburst (High)",
+        "speed": "varies",
+        "strengths": "Highest editing precision and prompt adherence",
+        "quality": "high",
+        "api_model": "gpt-image-2.5-sunburst",
+    },
+}
+
 _NO_AUTH = (
     "No Codex/ChatGPT OAuth credentials available. Run "
     "`hermes auth codex` (or `hermes setup` → Codex) to sign in.")
@@ -76,7 +87,7 @@ def _summarize_error_body(body: str) -> str:
 
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     return resolve_static_model(
-        GPT_IMAGE_2_TIERS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai-codex")
+        _MODELS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai-codex")
 
 
 def _read_codex_access_token() -> Optional[str]:
@@ -174,7 +185,8 @@ def _normalize_input_images(
 
 
 def _build_responses_payload(
-    *, prompt: str, size: str, quality: str, input_images: Optional[List[Dict[str, str]]] = None
+    *, prompt: str, size: str, quality: str, api_model: str = API_MODEL,
+    input_images: Optional[List[Dict[str, str]]] = None
 ) -> Dict[str, Any]:
     """Responses body for an image_generation call. No ``tool_choice``: Codex rejects every shape
     for forcing the hosted tool (looks it up as a *function* name), so the host model decides,
@@ -187,7 +199,7 @@ def _build_responses_payload(
         "input": [{"type": "message", "role": "user", "content": content}],
         "tools": [{
             "type": "image_generation",
-            "model": API_MODEL,
+            "model": api_model,
             "size": size,
             "quality": quality,
             "output_format": "png",
@@ -279,7 +291,8 @@ def _iter_sse_json(response: Any):
 
 
 def _collect_image_b64(
-    token: str, *, prompt: str, size: str, quality: str, input_images: Optional[List[Dict[str, str]]] = None
+    token: str, *, prompt: str, size: str, quality: str, api_model: str = API_MODEL,
+    input_images: Optional[List[Dict[str, str]]] = None
 ) -> Optional[Dict[str, str]]:
     """Stream a Codex Responses image_generation call → ``{"b64", "source": "final"|"partial"}`` or
     ``None``. A partial is kept only when no final arrives; callers must not treat it as success."""
@@ -293,7 +306,7 @@ def _collect_image_b64(
         "Content-Type": "application/json",
     })
     payload = _build_responses_payload(
-        prompt=prompt, size=size, quality=quality, input_images=input_images)
+        prompt=prompt, size=size, quality=quality, api_model=api_model, input_images=input_images)
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     final_b64: Optional[str] = None
@@ -322,7 +335,7 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
 
     provider_id = "openai-codex"
     label = "OpenAI (Codex auth)"
-    models = GPT_IMAGE_2_TIERS
+    models = _MODELS
     default_model_id = DEFAULT_MODEL
     price = "varies"
 
@@ -373,6 +386,7 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
             for attempt in range(attempts):
                 collected = _collect_image_b64(
                     token, prompt=prompt, size=size, quality=meta["quality"],
+                    api_model=meta.get("api_model", API_MODEL),
                     input_images=input_images or None)
                 if collected and collected.get("source") == "final" and collected.get("b64"):
                     break

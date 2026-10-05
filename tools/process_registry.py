@@ -807,6 +807,10 @@ class ProcessRegistry:
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
         pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
+        if not _IS_WINDOWS and not _IS_LINUX:
+            # Already inside our PTY: prevent Kiro's shell integration from
+            # replacing the interactive login shell with another PTY.
+            pty_env["PROCESS_LAUNCHED_BY_Q"] = "1"
         pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)

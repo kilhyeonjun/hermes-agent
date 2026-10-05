@@ -1094,7 +1094,8 @@ class _NonStreamRequest:
     def __init__(self, agent, api_kwargs: dict):
         self.agent = agent
         self.api_kwargs = api_kwargs
-        self.result = {"response": None, "error": None}
+        self.result: dict[str, Any] = {"response": None, "error": None}
+        self.watchdog_error: Optional[TimeoutError] = None
         self.clients = _RequestClientRegistry(agent)
         # Request-local cancel flag: agent._interrupt_requested is cleared at turn
         # boundaries but this daemon worker can outlive the turn, so it must know THIS
@@ -1170,8 +1171,8 @@ class _NonStreamRequest:
     def _await_worker_after_kill(self, timeout_message: str) -> None:
         # Wait briefly for the worker to notice the closed connection.
         self.thread.join(timeout=2.0)
-        if self.result["error"] is None and self.result["response"] is None:
-            self.result["error"] = TimeoutError(timeout_message)
+        # Keep the watchdog verdict separate: a late worker must not overwrite it.
+        self.watchdog_error = TimeoutError(timeout_message)
 
     def _model(self) -> str:
         return self.api_kwargs.get("model", "unknown")
@@ -1286,6 +1287,8 @@ class _NonStreamRequest:
                 break
             if agent._interrupt_requested:
                 self._interrupt(elapsed)
+        if self.watchdog_error is not None:
+            raise self.watchdog_error
         if self.result["error"] is not None:
             raise self.result["error"]
         # Success — the provider proved responsive: clear the breaker (#58962).

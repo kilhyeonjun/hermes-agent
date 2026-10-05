@@ -1066,6 +1066,7 @@ def main() -> int:
     fail_count = 0
     tests_passed = 0
     tests_failed = 0
+    tests_errors = 0
     tests_skipped = 0
     # Every collected outcome, not just pass/fail: a legitimately all-skipped
     # (platform-gated) file reports "2 skipped" and must NOT trip the
@@ -1075,7 +1076,7 @@ def main() -> int:
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, Dict[str, int], float]]") -> None:
-        nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed, tests_skipped
+        nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed, tests_errors, tests_skipped
         nonlocal tests_collected
         n_tests = test_counts.get(file, 0)
         try:
@@ -1100,6 +1101,7 @@ def main() -> int:
             # Accumulate test-level counts from parsed summary.
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
+            tests_errors += summary.get("errors", 0)
             tests_skipped += summary.get("skipped", 0)
             tests_collected += sum(
                 summary.get(k, 0)
@@ -1142,7 +1144,8 @@ def main() -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     skipped_note = f", {tests_skipped} skipped" if tests_skipped else ""
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    errors_note = f", {tests_errors} errors" if tests_errors else ""
+    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{errors_note}{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux

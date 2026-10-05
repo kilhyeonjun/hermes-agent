@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -132,10 +133,12 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
         return None
     if sys.platform == "win32":
         return None
+    ps_command = ("ps -axo pid,ppid,%cpu,command -r | head -60" if sys.platform == "darwin"
+                  else "ps -eo pid,ppid,pcpu,args --sort=-pcpu | head -60")
     script = (
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+        f"echo '--- processes (top 60 by cpu) ---'; {ps_command}; "
         f"echo '--- pstree of self ---'; pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
         "echo '--- /proc/loadavg ---'; cat /proc/loadavg 2>/dev/null || true; "
         "echo '--- recent dmesg (oom/killed) ---'; "
@@ -147,8 +150,13 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
     except OSError:
         return None
     try:  # start_new_session: outlive systemd killing our cgroup (KillMode=control-group) to flush
+        timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+        command = ([timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script] if timeout_bin else
+                   [sys.executable, "-c", "import subprocess,sys; "
+                    "subprocess.run(['bash','-c',sys.argv[2]], timeout=float(sys.argv[1]))",
+                    str(timeout_seconds), script])
         return subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script], stdout=fd,
+            command, stdout=fd,
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
             close_fds=True).pid
     except OSError:

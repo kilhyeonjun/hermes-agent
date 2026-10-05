@@ -282,6 +282,10 @@ class GatewayNotificationsMixin:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
                     await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    logger.info(
+                        "[%s] Post-stream image delivery completed (%d file(s))",
+                        adapter.name, len(image_paths),
+                    )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
