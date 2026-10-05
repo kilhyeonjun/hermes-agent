@@ -301,18 +301,29 @@ class TestCronjobRunToolIntegration:
         with _bound_session_key():
             with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-12')), \
                  patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
-                 patch("cron.scheduler.run_one_job", return_value=True), \
+                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
                                      "last_status": "ok", "last_error": None}):
                 out = json.loads(cronjob(action="run", job_id="job-bg-12"))
+                import time
+                from tools.async_delegation import list_async_delegations
+                deadline = time.monotonic() + 5
+                record = None
+                while time.monotonic() < deadline:
+                    record = next((r for r in list_async_delegations()
+                                   if r["delegation_id"] == out["job"]["delegation_id"]), None)
+                    if record and record["status"] == "completed":
+                        break
+                    time.sleep(0.01)
+                assert record is not None and record["status"] == "completed"
+                assert m_run.call_count == 1
 
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_mode"] == "background"
         assert out["job"]["delegation_id"]
         assert "background" in out["note"]
-
     def test_run_action_sync_path_unchanged_without_session(self):
         """No session context → the legacy synchronous behavior (executed +
         execution_success populated from the completed run)."""

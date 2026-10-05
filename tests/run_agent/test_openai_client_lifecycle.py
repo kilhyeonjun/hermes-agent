@@ -100,8 +100,10 @@ def test_retry_after_api_connection_error_recreates_request_client(monkeypatch):
 
 
 def test_stale_non_stream_close_is_single_owner(monkeypatch):
+    aborted = threading.Event()
+
     def slow_responder(**kwargs):
-        time.sleep(0.1)
+        assert aborted.wait(timeout=3), "stale detector did not abort the request"
         raise _connection_error()
 
     request_client = FakeRequestClient(slow_responder)
@@ -110,8 +112,13 @@ def test_stale_non_stream_close_is_single_owner(monkeypatch):
 
     agent = _build_agent()
     agent._compute_non_stream_stale_timeout = lambda api_payload: 0.01
+    original_abort = agent._abort_request_openai_client
+    def signal_abort(*args, **kwargs):
+        original_abort(*args, **kwargs)
+        aborted.set()
+    monkeypatch.setattr(agent, "_abort_request_openai_client", signal_abort)
 
-    with pytest.raises(APIConnectionError):
+    with pytest.raises(TimeoutError):
         agent._interruptible_api_call({"model": agent.model, "messages": []})
 
     assert request_client.close_calls == 1

@@ -75,6 +75,10 @@ def _install_modal_test_modules(
     env_package = types.ModuleType("tools.environments")
     env_package.__path__ = [str(TOOLS_DIR / "environments")]  # type: ignore[attr-defined]
     sys.modules["tools.environments"] = env_package
+    # Only the SDK is faked; avoid the real lazy-installer policy rejecting it.
+    lazy_deps = types.ModuleType("tools.lazy_deps")
+    lazy_deps.ensure = lambda *a, **kw: None  # type: ignore[attr-defined]
+    sys.modules["tools.lazy_deps"] = lazy_deps
 
     class _DummyBaseEnvironment:
         def __init__(self, cwd: str, timeout: int, env=None):

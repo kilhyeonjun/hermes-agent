@@ -134,7 +134,7 @@ class TestPoolRuntimeResolution:
     def _pool(self, entry):
         return SimpleNamespace(
             has_credentials=lambda: True,
-            select=lambda: entry,
+            select=lambda model=None: entry,
         )
 
     @pytest.fixture

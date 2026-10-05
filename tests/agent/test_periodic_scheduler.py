@@ -2,6 +2,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 
 from agent import periodic_scheduler
 from agent.periodic_scheduler import PeriodicScheduler, schedule
@@ -16,26 +17,40 @@ def _wait_until(pred, timeout=3.0):
     return pred()
 
 
-def test_two_intervals_fire_proportionally_and_cancel_stops_one():
+def test_two_intervals_fire_proportionally_and_cancel_stops_one(monkeypatch):
     sched = PeriodicScheduler()
+    clock = [0.0]
+    monkeypatch.setattr(periodic_scheduler, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     fast, slow = [], []
-    h_fast = sched.schedule(lambda: fast.append(time.monotonic()), 0.01)
-    h_slow = sched.schedule(lambda: slow.append(time.monotonic()), 0.05)
+    h_fast = sched.schedule(lambda: fast.append(clock[0]), 0.125)
+    h_slow = sched.schedule(lambda: slow.append(clock[0]), 0.625)
 
-    assert _wait_until(lambda: len(slow) >= 3)
-    assert len(fast) > len(slow)  # 5x interval ratio -> clearly more fast ticks
-    # Both ran on this scheduler's single thread, not on new threads.
-    before = threading.active_count()
-    sched.schedule(lambda: None, 0.01).cancel()
-    assert threading.active_count() == before
-    assert sched._thread is not None and sched._thread.is_alive()
+    def advance(t, expected_fast, expected_slow):
+        with sched._cond:
+            clock[0] = t
+            sched._cond.notify_all()
+            assert sched._cond.wait_for(
+                lambda: len(fast) == expected_fast and len(slow) == expected_slow,
+                timeout=2.0,
+            ), (fast, slow)
 
-    h_fast.cancel()
-    n_fast = len(fast)
-    time.sleep(0.1)
-    assert len(fast) == n_fast, "cancelled callback kept firing"
-    assert len(slow) > 3, "sibling callback stopped when another was cancelled"
-    h_slow.cancel()
+    try:
+        for tick in range(1, 16):
+            advance(tick * 0.125, tick, tick // 5)
+        assert len(fast) == 5 * len(slow)
+        # Scheduling more timers does not create another worker thread.
+        before = threading.active_count()
+        sched.schedule(lambda: None, 0.01).cancel()
+        assert threading.active_count() == before
+        assert sched._thread is not None and sched._thread.is_alive()
+
+        h_fast.cancel()
+        advance(2.5, 15, 4)
+        assert len(fast) == 15, "cancelled callback kept firing"
+        assert len(slow) == 4, "sibling callback stopped when another was cancelled"
+    finally:
+        h_fast.cancel()
+        h_slow.cancel()
 
 
 def test_raising_callback_is_rescheduled_and_does_not_kill_sibling():

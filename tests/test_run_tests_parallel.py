@@ -20,6 +20,7 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -226,6 +227,40 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             f"diag={diag!r} test_pid={test_pid} test_pgid={test_pgid}; "
             f"runner output:\n{proc.stdout}"
         )
+
+
+def test_summary_parser_keeps_failures_and_setup_errors_separate() -> None:
+    runner = Path(__file__).resolve().parent.parent / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("run_tests_parallel", runner)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module._parse_pytest_summary(
+        "= 44969 passed, 2 failed, 38 errors, 17 skipped in 1.23s =\n"
+    ) == {"passed": 44969, "failed": 2, "errors": 38, "skipped": 17}
+
+
+def test_aggregate_headline_reports_errors_without_inflating_failed(tmp_path: Path) -> None:
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    (probe_dir / "test_mixed_outcomes.py").write_text(
+        "import pytest\n"
+        "@pytest.fixture\n"
+        "def broken_setup():\n"
+        "    raise RuntimeError('setup error')\n"
+        "@pytest.mark.parametrize('case', range(38))\n"
+        "def test_setup(case, broken_setup):\n"
+        "    pass\n"
+        "@pytest.mark.parametrize('case', range(2))\n"
+        "def test_failure(case):\n"
+        "    assert False\n",
+        encoding="utf-8",
+    )
+    proc = _run_runner(probe_dir, "--file-retries", "0", "-q")
+    assert proc.returncode != 0, proc.stdout
+    headline = next(line for line in proc.stdout.splitlines() if line.startswith("=== Summary:"))
+    assert "2 failed, 38 errors" in headline, headline
+    assert "40 failed" not in headline, headline
 
 
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────

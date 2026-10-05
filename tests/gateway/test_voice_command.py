@@ -1066,7 +1066,8 @@ class TestStreamTtsToSpeaker:
         text_q.put("Hello world.")
         text_q.put(None)
 
-        stream_tts_to_speaker(text_q, stop_evt, done_evt, display_callback=display)
+        with patch("tools.tts_tool.text_to_speech_tool", return_value={"success": True}):
+            stream_tts_to_speaker(text_q, stop_evt, done_evt, display_callback=display)
         assert done_evt.is_set()
         assert any("Hello" in s for s in spoken)
 

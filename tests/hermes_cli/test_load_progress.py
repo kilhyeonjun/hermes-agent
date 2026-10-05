@@ -57,7 +57,8 @@ def _loading_event(value: float, current: str = "text_model") -> dict:
                          "current": current, "value": value}}
 
 
-def test_loading_events_build_snapshot_and_terminal_clears():
+def test_loading_events_build_snapshot_and_terminal_clears(monkeypatch):
+    monkeypatch.setattr(lp, "_ensure_watcher", lambda: None)
     lp._apply_event("m1", "status_change", _loading_event(0.5))
     snap = lp.get_loading_progress()
     assert "m1" in snap

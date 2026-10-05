@@ -1,6 +1,6 @@
-"""Sibling regression test for #79178: background-PTY stdin must round-trip
-surrogateescape content instead of crashing on the strict UTF-8 encode."""
+"""POSIX PTY input round-trips surrogateescape bytes through write_stdin."""
 import shlex
+import sys
 import time
 
 import pytest
@@ -8,38 +8,85 @@ import pytest
 from tools.process_registry import ProcessRegistry
 
 
+@pytest.mark.macos_only
+def test_macos_pty_preserves_zshrc_and_stdin_without_nested_terminal(tmp_path, monkeypatch):
+    pytest.importorskip("ptyprocess")
+    import tools.process_registry as process_registry
+    monkeypatch.setattr(process_registry, "_find_shell", lambda: "/bin/zsh")
+    zdot = tmp_path / "z"
+    zdot.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "hermes-pty-tool").symlink_to(sys.executable)
+    # A shell pre-hook checks this marker before wrapping its own PTY.
+    (zdot / ".zshrc").write_text(
+        f"export PATH={shlex.quote(str(bin_dir))}:$PATH\n"
+        "[[ -n $PROCESS_LAUNCHED_BY_Q ]] || export HERMES_NESTED_PTY=1\n"
+    )
+    monkeypatch.delenv("PROCESS_LAUNCHED_BY_Q", raising=False)
+    child = tmp_path / "child.py"
+    received = tmp_path / "received.bin"
+    child.write_text(
+        "import os, tty\ntty.setraw(0)\n"
+        "assert os.getenv('PROCESS_LAUNCHED_BY_Q') == '1'\n"
+        "assert os.getenv('HERMES_NESTED_PTY') is None\n"
+        "print('READY', flush=True)\n"
+        "data = b''\nwhile len(data) < 2: data += os.read(0, 2 - len(data))\n"
+        f"open({str(received)!r}, 'wb').write(data)\n"
+    )
+    registry = ProcessRegistry()
+    session = registry.spawn_local(
+        f"hermes-pty-tool {shlex.quote(str(child))}", cwd=str(tmp_path),
+        env_vars={"ZDOTDIR": str(zdot)}, use_pty=True,
+    )
+    try:
+        assert session._pty is not None
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "READY" not in registry.poll(session.id)["output_preview"]:
+            time.sleep(.02)
+        assert "READY" in registry.poll(session.id)["output_preview"], registry.poll(session.id)
+        assert registry.write_stdin(session.id, b"\xff\n".decode("utf-8", "surrogateescape"))["status"] == "ok"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not received.exists():
+            time.sleep(.02)
+        assert received.read_bytes() == b"\xff\n"
+    finally:
+        registry.kill_process(session.id)
+
+
+@pytest.mark.macos_only
 def test_write_stdin_pty_surrogateescape_roundtrip(tmp_path):
+    pytest.importorskip("ptyprocess")
     registry = ProcessRegistry()
     out = tmp_path / "out.bin"
     script = tmp_path / "read_stdin.py"
-    # readline(): a PTY never delivers EOF, so read one line (canonical mode
-    # delivers it after the newline we send).
     script.write_text(
-        f"import sys\nopen({str(out)!r}, 'wb').write(sys.stdin.buffer.readline())\n"
+        "import os, tty\ntty.setraw(0)\nprint('READY', flush=True)\n"
+        "data = b''\nwhile len(data) < 2:\n"
+        " data += os.read(0, 2 - len(data))\n"
+        f"open({str(out)!r}, 'wb').write(data)\n"
     )
     session = registry.spawn_local(
-        f"python3 {shlex.quote(str(script))}",
-        cwd=str(tmp_path),
-        use_pty=True,
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+        cwd=str(tmp_path), use_pty=True,
     )
-    if session._pty is None:
-        registry.kill_process(session.id)
-        pytest.skip("ptyprocess not available; PTY path not exercised")
     try:
+        assert session._pty is not None, "spawn_local fell back to pipe mode"
+        assert session._reader_thread is not None
+        # Wait until raw mode is installed before writing a byte that canonical mode transforms.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "READY" in registry.poll(session.id)["output_preview"]:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("PTY session never reached READY")
         result = registry.write_stdin(
             session.id, b"\xff".decode("utf-8", "surrogateescape") + "\n"
         )
         assert result["status"] == "ok", result
-        # Wait for the CONTENT, and not for the file to exist. The child runs
-        # open(out,'wb').write(...). open() creates the file empty, and the
-        # bytes arrive only after the PTY delivers the line. The previous wait
-        # stopped at out.exists(), which the empty file already satisfies, so
-        # the read returned b'' when the parent won that gap.
-        #
-        # On a 144-worker runner the gap is wide enough to lose every time.
-        # This test failed both attempts in CI, and not one time only. It also
-        # loses 6 times in 25 runs on an idle 16-core machine.
-        deadline = time.monotonic() + 30
+        assert result["bytes_written"] == 2
+        deadline = time.monotonic() + 5
         got = b""
         while time.monotonic() < deadline:
             try:
@@ -49,6 +96,6 @@ def test_write_stdin_pty_surrogateescape_roundtrip(tmp_path):
             if got == b"\xff\n":
                 break
             time.sleep(0.05)
-        assert got == b"\xff\n"
+        assert got == b"\xff\n", registry.poll(session.id)["output_preview"]
     finally:
         registry.kill_process(session.id)

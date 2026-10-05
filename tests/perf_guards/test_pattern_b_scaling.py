@@ -176,38 +176,41 @@ class TestListSessionsRichQueryBound:
 
 
 class TestToolCallFragmentAssemblyLinear:
-    """Assembling a fragmented tool call must cost O(bytes), not O(bytes²).
-
-    Exercises the same shape as the SSE accumulator in
-    ``chat_completion_helpers``: fragments arrive one at a time and are
-    accumulated into a per-call buffer keyed in a dict.  Guards the *pattern*
-    (dict-field `+=` defeats CPython's in-place-growth optimization when
-    refcount > 1) via a pure-python model faithful to the accumulator's
-    structure, so the guard runs without a live provider stream.
-    """
+    """The real streaming accumulator must not recopy arguments per fragment."""
 
     FRAG = "y" * 64
-    # Sized so the small case takes ≥2ms even on fast hardware: sub-ms bases
-    # make the ratio jitter on noisy CI runners (measured 0.185ms at 8k).
-    N_SMALL = 128_000
-    N_LARGE = 512_000
-    MAX_RATIO = 8.0  # linear ≈ 4; dict-field quadratic measured >> 10
+    N_SMALL = 8_000
+    N_LARGE = 32_000
+    MAX_RATIO = 8.0  # linear ≈ 4; repeated string copies approach 16
 
     @staticmethod
-    def _assemble_dict_field(n_frags: int, frag: str) -> int:
-        """Accumulator model: buffered parts, joined once (fixed shape)."""
-        acc = {0: {"function": {"name": "tool", "arguments_parts": []}}}
-        entry = acc[0]
+    def _assemble(n_frags: int, frag: str) -> None:
+        from types import SimpleNamespace
+
+        from agent.chat_completion_helpers import _ToolCallAccumulator
+
+        acc = _ToolCallAccumulator()
+        delta = SimpleNamespace(index=0, id="call", function=SimpleNamespace(
+            name=None, arguments=frag), extra_content=None)
         for _ in range(n_frags):
-            entry["function"]["arguments_parts"].append(frag)
-        return len("".join(entry["function"]["arguments_parts"]))
+            acc.feed(delta)
+        assert acc.materialize()[0]["function"]["arguments"] == frag * n_frags
 
     def test_4x_fragments_cost_about_4x_time(self):
-        t_small = _min_time(lambda: self._assemble_dict_field(self.N_SMALL, self.FRAG), repeat=3)
-        t_large = _min_time(lambda: self._assemble_dict_field(self.N_LARGE, self.FRAG), repeat=3)
+        # CPU time excludes other pytest workers' scheduler delays under -j12.
+        def best_cpu_time(n: int) -> float:
+            best = float("inf")
+            for _ in range(3):
+                t0 = time.process_time()
+                self._assemble(n, self.FRAG)
+                best = min(best, time.process_time() - t0)
+            return best
+
+        t_small = best_cpu_time(self.N_SMALL)
+        t_large = best_cpu_time(self.N_LARGE)
         ratio = t_large / max(t_small, 1e-9)
         assert ratio < self.MAX_RATIO, (
             f"tool-call fragment assembly is superlinear: 4x fragments cost "
-            f"{ratio:.1f}x time. Fragments must be buffered in a list and "
+            f"{ratio:.1f}x CPU time. Fragments must be buffered in a list and "
             f"joined once (PR #92242 shape), never `+=` into a dict field."
         )

@@ -68,6 +68,7 @@ class _StalledSummaryWorker:
         self.fences = []
         self._lock = threading.Lock()
         self.release = threading.Event()
+        self.started = threading.Event()
 
     @property
     def attempts(self):
@@ -78,6 +79,7 @@ class _StalledSummaryWorker:
             self.routes.append(take_pinned_summary_route())
             self.fences.append(fence)
             attempt = len(self.routes)
+        self.started.set()
         if attempt <= self.stall_attempts:
             # Connection open, zero tokens, zero fence progress.
             self.release.wait(timeout=10)
@@ -108,19 +110,32 @@ def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
 
 
 def test_stalled_summary_attempts_configured_fallback_chain():
+    """A primary idle stall invokes the configured route once."""
     original = [{"role": "user", "content": "keep-me"}]
     compressed = [{"role": "user", "content": "summary of earlier turns"}]
     worker = _StalledSummaryWorker(compressed)
     timeouts = []
+    causes = []
 
     try:
-        msgs, prompt = _run(
-            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
-        )
+        with _patch_chain([CHAIN_ENTRY]):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="degraded-prompt",
+                idle_timeout_seconds=2,
+                total_ceiling_seconds=5,
+                on_timeout=lambda *args: timeouts.append(args),
+                on_timeout_cause=lambda *args: causes.append(args),
+            )
     finally:
         worker.release.set()
 
+    assert worker.started.is_set()
+    assert causes == [(False, False)], "the real idle budget expired without progress before the ceiling"
     assert worker.attempts == 2, "the aborted stall must be retried once"
+    assert worker.fences[0].is_cancelled
+    assert worker.fences[1].deadline_monotonic - worker.fences[0].deadline_monotonic > 30
     assert worker.routes[0] is None, "the primary attempt is never pinned"
     pinned = worker.routes[1]
     assert pinned is not None, "the retry must carry the configured fallback route"

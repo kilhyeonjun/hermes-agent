@@ -345,6 +345,27 @@ class TestDelegateTask(unittest.TestCase):
         finally:
             parent_db.close()
 
+    def test_auto_created_mock_db_path_never_opens_sqlite(self):
+        import tempfile
+        from pathlib import Path
+        from hermes_state_registry import release_or_close
+        from tools.delegate_tool import _open_child_session_db
+
+        parent = MagicMock()  # _session_db.db_path is auto-created, not a real path.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"HERMES_HOME": tmp}):
+            previous = Path.cwd()
+            os.chdir(tmp)  # Trap accidental relative SQLite files inside the temp dir.
+            try:
+                child_db = _open_child_session_db(parent)
+                try:
+                    self.assertIsNone(child_db)
+                    self.assertFalse((Path(tmp) / "MagicMock").exists())
+                finally:
+                    if child_db is not None:
+                        release_or_close(child_db)
+            finally:
+                os.chdir(previous)
+
     def test_child_without_parent_db_still_degrades_to_none(self):
         """Parent without a SessionDB -> child gets None (pre-fix behaviour).
 
@@ -414,7 +435,7 @@ class TestDelegateTask(unittest.TestCase):
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    child_db.db_path, parent_db.db_path.resolve()
                 )
             finally:
                 if child_db is not None:

@@ -104,6 +104,34 @@ def _wait_for_mock_call(mock, timeout=3.0):
     raise AssertionError(f"{mock!r} was not called within {timeout}s")
 
 
+def test_stale_timeout_survives_late_worker_transport_error(monkeypatch):
+    agent = _make_anthropic_agent()
+    agent._compute_non_stream_stale_timeout.return_value = 0.01
+    agent._codex_silent_hang_hint = MagicMock(return_value=None)
+    client = MagicMock()
+    agent._create_request_anthropic_client.return_value = client
+    release = threading.Event()
+    finished = threading.Event()
+
+    def create(_api_kwargs, *, client):
+        assert release.wait(timeout=4)
+        finished.set()
+        raise httpx.RemoteProtocolError("late abort error")
+
+    agent._anthropic_messages_create.side_effect = create
+    original = cch._NonStreamRequest._await_worker_after_kill
+
+    def after_join(self, message):
+        original(self, message)
+        release.set()
+        assert finished.wait(timeout=2)
+        self.thread.join(timeout=2)
+
+    monkeypatch.setattr(cch._NonStreamRequest, "_await_worker_after_kill", after_join)
+    with pytest.raises(TimeoutError):
+        cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+
+
 def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
     """Stale non-streaming Anthropic call: the poll thread aborts the
     request-local client's socket; the shared client is never closed/rebuilt,
@@ -114,14 +142,14 @@ def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
 
     request_client = MagicMock()
     agent._create_request_anthropic_client = MagicMock(return_value=request_client)
-    agent._abort_request_anthropic_client = MagicMock()
+    aborted = threading.Event()
+    agent._abort_request_anthropic_client = MagicMock(side_effect=lambda *a, **kw: aborted.set())
     agent._close_request_anthropic_client = MagicMock()
 
     def _create(_api_kwargs, *, client):
         assert client is request_client
-        # Outlive the 0.05s stale timeout AND the worker join (2.0s) so the
-        # stale detector surfaces its TimeoutError.
-        time.sleep(2.5)
+        assert aborted.wait(timeout=3), "stale detector did not abort the request"
+        # A transport may deliver a response while its aborted worker unwinds.
         return object()
 
     agent._anthropic_messages_create = MagicMock(side_effect=_create)

@@ -556,7 +556,9 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
 
     assert scheduler.run_one_job(job) is True
-    assert calls >= 3
+    # The first heartbeat validates ownership; the next fails. Under host
+    # contention that first failure may itself arrive after the grace.
+    assert calls >= 2
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):

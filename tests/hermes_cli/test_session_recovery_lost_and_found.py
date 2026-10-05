@@ -220,6 +220,7 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     import hermes_cli.session_lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    monkeypatch.setattr(laf, "find_sqlite3_cli_refusal", lambda: {"reason": "missing"})
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,
@@ -330,7 +331,7 @@ def _make_synthetic_lost_and_found(
     # The floor guards against accidentally reading an empty/old schema.
     current_width = len(sessions_columns)
     assert current_width >= 55
-    assert len(usage_columns) == 18
+    assert len(usage_columns) >= 18  # The synthetic usage row retains the historical 18-column layout.
 
     max_fields = current_width
     conn = sqlite3.connect(str(path), isolation_level=None)

@@ -40,14 +40,16 @@ def test_guest_barriers_apply_configured_synchronous(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
+@pytest.mark.macos_only
+def test_guest_barriers_keep_macos_durability_floor_when_unset(monkeypatch, tmp_path):
     _config(monkeypatch, {})
     conn = sqlite3.connect(tmp_path / "state.db")
     try:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA synchronous=1")
         apply_durability_barriers(conn)
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        # Unset config never overrides the mandatory macOS FULL floor.
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
     finally:
         conn.close()
 

@@ -1,6 +1,7 @@
 """Tests for progressive subdirectory hint discovery."""
 
 import time
+from threading import Event
 
 import pytest
 from pathlib import Path
@@ -135,9 +136,10 @@ class TestSubdirectoryHintTracker:
 
 
     def test_timeout_skips_slow_hint_files(self, project, monkeypatch, caplog):
-        """Slow hint reads time out instead of blocking the turn."""
+        """Both candidate reads time out; a slow reader cannot block the turn."""
         backend = project / "backend"
         (backend / "AGENTS.md").write_text("Backend-specific instructions")
+        (backend / "agents.md").write_text("Lowercase fallback instructions")
         import sys
 
         from agent import subdirectory_hints as sh_mod
@@ -147,25 +149,30 @@ class TestSubdirectoryHintTracker:
         monkeypatch.setattr(pb_mod, "_get_context_file_read_timeout", lambda: 0.05)
 
         original_read_text = Path.read_text
+        release = Event()
 
         def slow_read_text(self, *args, **kwargs):
-            if self.name.lower() == "agents.md" and self.parent == backend:
-                time.sleep(0.6)
+            if self.parent == backend and self.name in ("AGENTS.md", "agents.md"):
+                release.wait(2)  # finite backstop if the timeout path regresses
             return original_read_text(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", slow_read_text)
 
         tracker = SubdirectoryHintTracker(working_dir=str(project))
-        start = time.monotonic()
-        with caplog.at_level("WARNING", logger="agent.prompt_builder"):
-            result = tracker.check_tool_call(
-                "read_file", {"path": str(project / "backend" / "src" / "main.py")}
-            )
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 0.4, f"hint load blocked for {elapsed:.2f}s"
-        assert result is None
-        assert "timed out" in caplog.text.lower()
+        try:
+            start = time.monotonic()
+            with caplog.at_level("WARNING", logger="agent.prompt_builder"):
+                result = tracker.check_tool_call(
+                    "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+                )
+            elapsed = time.monotonic() - start
+            assert elapsed < 2.5, f"timed-out hint reads blocked the turn for {elapsed:.2f}s"
+            assert result is None
+            assert "AGENTS.md read timed out" in caplog.text
+            assert "agents.md read timed out" in caplog.text
+            assert caplog.text.count("read timed out") == 2
+        finally:
+            release.set()
 
 
 class TestPermissionErrorHandling:

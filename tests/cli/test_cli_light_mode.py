@@ -256,25 +256,37 @@ class TestOsc11DrainGuard:
         # loop exits fast — then a straggler payload lands during teardown.
         os.write(write_fd, b"\x1b[?62;22c")
 
+        import select
         import threading
+        drain_started = threading.Event()
+        written = threading.Event()
+        real_select = select.select
 
         def straggler():
-            import time
-            time.sleep(0.02)  # inside the 50ms drain window
-            os.write(write_fd, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\")
+            if drain_started.wait(timeout=3):
+                os.write(write_fd, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\")
+                written.set()
 
-        t = threading.Thread(target=straggler, daemon=True)
+        def select_at_drain(read, write, error, timeout=None):
+            if timeout is not None and timeout <= 0.05 and not drain_started.is_set():
+                drain_started.set()
+                assert written.wait(timeout=3)
+            return real_select(read, write, error, timeout)
+
+        monkeypatch.setattr(select, "select", select_at_drain)
+        t = threading.Thread(target=straggler)
         t.start()
-
-        result = cli_mod._query_osc11_background()
-        assert result is None  # OSC 11 was swallowed; only DA1 answered
-
-        import select
-        r, _, _ = select.select([read_fd], [], [], 0)
-        assert not r, "drain loop should have consumed the straggler bytes"
-
-        os.close(read_fd)
-        os.close(write_fd)
+        try:
+            result = cli_mod._query_osc11_background()
+            assert result is None  # OSC 11 was swallowed; only DA1 answered
+            assert drain_started.is_set()
+            r, _, _ = real_select([read_fd], [], [], 0)
+            assert not r, "drain loop should have consumed the straggler bytes"
+        finally:
+            drain_started.set()
+            t.join(timeout=3)
+            os.close(read_fd)
+            os.close(write_fd)
 
 
 # ────────────────────────────────────────────────────────────────────────

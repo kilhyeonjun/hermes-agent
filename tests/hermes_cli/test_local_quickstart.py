@@ -52,7 +52,7 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, quickstart_fit, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -107,7 +107,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, quickstart_fit, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
@@ -153,15 +153,10 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
 
 
 @pytest.fixture
-def quickstart_ready(monkeypatch):
-    """Preflight passes without hardware or network: the runtime reads as
-    installed and every entry's first variant is servable, so the POST
-    reaches the single-flight lock instead of 409ing at fit/engine
-    preflight on machines where nothing fits."""
+def quickstart_fit(monkeypatch):
+    """A catalog variant fits independent of the runner's RAM/VRAM."""
     from hermes_cli.local_runtime.catalog import VariantChoice
 
-    monkeypatch.setattr(
-        "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b10362"])
     monkeypatch.setattr(
         "hermes_cli.local_runtime.catalog.select_variant",
         lambda entry, budget: VariantChoice(variant=entry.variants[0],
@@ -170,6 +165,12 @@ def quickstart_ready(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.web_routers.local_models._engine_too_old",
         lambda min_engine: False)
+
+
+@pytest.fixture
+def quickstart_ready(quickstart_fit, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b10362"])
 
 
 def test_quickstart_is_single_flight(client, quickstart_ready, monkeypatch):

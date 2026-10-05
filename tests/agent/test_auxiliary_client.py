@@ -3411,12 +3411,27 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        elapsed = [0.0]
+        monkeypatch.setattr(aux, "time", SimpleNamespace(monotonic=lambda: elapsed[0]))
+        monkeypatch.setattr(aux, "_aux_stream_total_ceiling", lambda _: 0.16)
+
+        class _NoTimer:
+            def __init__(self, *_args, **_kwargs): self.daemon = True
+            def start(self): pass
+            def cancel(self): pass
+
+        monkeypatch.setattr(aux.threading, "Timer", _NoTimer)
+        emitted = []
+
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
-                    time.sleep(0.03)
-                    yield SimpleNamespace(type="response.in_progress")
+                for _ in range(20):
+                    elapsed[0] += 0.025
+                    emitted.append(1)
+                    yield SimpleNamespace(type="response.output_text.delta", delta="token")
 
             def close(self): pass
 
@@ -3427,14 +3442,14 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
-        with pytest.raises(TimeoutError):
+        with pytest.raises(TimeoutError, match="hard ceiling"):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert 2 <= len(emitted) < 20  # timeout interrupts the stream, not just its result
+        assert elapsed[0] <= 0.16 + 0.025 + 1e-9  # at most one event past the ceiling
 
 
 class TestCodexAuxiliaryAdapterCacheScope:

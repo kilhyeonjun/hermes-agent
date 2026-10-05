@@ -596,6 +596,28 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_update_launchd_discovery(request, monkeypatch, tmp_path):
+    """Updater command tests must not discover the account's real LaunchAgent.
+
+    Explicit launchd fleet tests provide their own fake discovery/restart seams.
+    """
+    if request.node.path.name not in {
+        "test_update_autostash.py", "test_cmd_update.py", "test_update_yes_flag.py",
+        "test_update_fleet_restart_pending.py", "test_update_head_moved_gate.py",
+    }:
+        return
+    from hermes_cli import gateway
+    import hermes_cli.update_cmd_fleet as fleet
+
+    # Patch the invocation boundary, not gateway's module state: updater purge
+    # evicts gateway after the simulated pull, while explicit launchd fleet
+    # tests (separate file) still exercise the actual restart behavior.
+    monkeypatch.setattr(fleet, "_restart_macos_launchd_gateways", lambda *a, **k: None)
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent-gateway.plist")
+    monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [])
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser
@@ -1459,6 +1481,73 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         return any(verb in tokens for verb in _MUTATING_VERBS)
 
+    def _is_blocked_launchctl(cmd) -> bool:
+        # A bootstrap command names only a plist path; its Label can still be
+        # a live Hermes gateway even when the filename says nothing about it.
+        if isinstance(cmd, (list, tuple)):
+            tokens = [str(arg) for arg in cmd]
+        else:
+            cmd_str = _cmd_to_string(cmd)
+            try:
+                lexer = _shlex.shlex(cmd_str, posix=False, punctuation_chars=";&|()\n")
+                lexer.whitespace_split = True
+                lexer.whitespace = " \t\r"  # Newline is a shell command separator.
+                # Non-POSIX shlex retains quoting, distinguishing a literal
+                # ';' argument from a shell command separator.
+                parts = [(token, token[:1] in ("'", '"')) for token in lexer]
+            except ValueError:
+                parts = [(token, False) for token in cmd_str.split()]
+            # Shell separators delimit commands, but quoted mentions remain
+            # ordinary arguments. Inspect every pipeline/list branch (including
+            # branches skipped at runtime depending on an earlier exit status).
+            command = []
+            for token, quoted in [*parts, (";", False)]:
+                if not quoted and token and all(char in ";&|()\n" for char in token):
+                    if command and _is_blocked_launchctl(command):
+                        return True
+                    command = []
+                else:
+                    command.append(_shlex.split(token)[0] if quoted else token)
+            return False
+        if not tokens:
+            return False
+        if tokens[0] == "exec":
+            return _is_blocked_launchctl(tokens[1:])
+        head = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if head in _WRAPPER_COMMANDS:
+            # A wrapper invokes its first command operand, not every later
+            # argument. Shell -c is special: the next operand is shell source.
+            if head in ("sh", "bash", "zsh", "dash"):
+                command = next((i + 1 for i, arg in enumerate(tokens[1:], 1)
+                                if arg.startswith("-") and "c" in arg[1:]
+                                and arg[1:].isalpha()), len(tokens))
+                return command < len(tokens) and _is_blocked_launchctl(tokens[command])
+            i = 1
+            value_flags = {
+                "env": ("-u",), "sudo": ("-u", "-g", "-h", "-p", "-C", "-r", "-t"),
+                "timeout": ("-k", "--kill-after", "-s", "--signal"),
+                "nice": ("-n",), "ionice": ("-c", "-n", "-t"),
+                "stdbuf": ("-i", "-o", "-e"), "flock": ("-w", "-E"),
+            }
+            while i < len(tokens):
+                arg = tokens[i]
+                if head == "env" and arg == "-S":
+                    return i + 1 < len(tokens) and _is_blocked_launchctl(
+                        [*_shlex.split(tokens[i + 1]), *tokens[i + 2:]]
+                    )
+                if arg in value_flags.get(head, ()):
+                    i += 2
+                elif arg.startswith("-") or (head == "env" and "=" in arg):
+                    i += 1
+                elif head == "timeout" and arg[0].isdigit():
+                    i += 1
+                else:
+                    return _is_blocked_launchctl(tokens[i:])
+            return False
+        return head == "launchctl" and any(verb in tokens[1:] for verb in (
+            "kickstart", "bootout", "bootstrap", "submit", "enable", "disable", "kill", "remove", "unload", "load", "stop", "start",
+        ))
+
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
         try:
@@ -1492,7 +1581,17 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
-    def _check_subprocess_cmd(name, cmd):
+    def _check_subprocess_cmd(name, cmd, *, executable=None, shell=False):
+        launch_cmd = cmd[0] if shell and isinstance(cmd, (list, tuple)) and cmd else cmd
+        if executable and not shell and isinstance(cmd, (list, tuple)):
+            launch_cmd = [executable, *cmd[1:]]
+        elif executable and not shell:
+            launch_cmd = executable
+        if _is_blocked_launchctl(launch_cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked subprocess.{name}({cmd!r}) "
+                "— would mutate a live launchd Hermes gateway; mock the launchctl seam."
+            )
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -1547,7 +1646,7 @@ def _live_system_guard(request, monkeypatch):
 
     def _wrap_subprocess(name, real):
         def _guarded(cmd, *args, **kwargs):
-            _check_subprocess_cmd(name, cmd)
+            _check_subprocess_cmd(name, cmd, executable=kwargs.get("executable"), shell=kwargs.get("shell", False))
             return real(cmd, *args, **kwargs)
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
@@ -1565,7 +1664,7 @@ def _live_system_guard(request, monkeypatch):
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, cmd, *args, **kwargs):
-                _check_subprocess_cmd("Popen", cmd)
+                _check_subprocess_cmd("Popen", cmd, executable=kwargs.get("executable"), shell=kwargs.get("shell", False))
                 super().__init__(cmd, *args, **kwargs)
 
         _GuardedPopen.__name__ = "Popen"

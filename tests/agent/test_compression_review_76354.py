@@ -466,10 +466,12 @@ class TestS3IdleChargedFromLastProgress:
         _drain_admission_slots()
         idle = 0.4
         release = threading.Event()
+        progress_at = []
 
         def worker(fence: CompressionCommitFence):
             time.sleep(0.05)
             fence.touch_progress()  # early progress, then total silence
+            progress_at.append(time.monotonic())
             assert release.wait(timeout=10)
             return ([], "late")
 
@@ -487,11 +489,12 @@ class TestS3IdleChargedFromLastProgress:
             elapsed = time.monotonic() - t0
             release.set()
         assert prompt == "fb"
-        # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
+        assert progress_at, "worker never reported progress"
+        # Compare the host's elapsed wait with the progress timestamp so a
+        # delayed worker start does not consume the test's idle allowance.
+        silence = time.monotonic() - progress_at[0]
+        assert silence < idle * 1.8, (
+            f"silence exceeded ~2x idle budget shape: {silence:.2f}s (total {elapsed:.2f}s)"
         )
         _drain_admission_slots()
 

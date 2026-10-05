@@ -13,7 +13,7 @@ from hermes_cli import runtime_provider as rp
 @pytest.fixture(autouse=True)
 def _no_live_builtin_provider_probes(monkeypatch):
     """Keep picker tests offline: builtin-provider catalog fetches hit the network."""
-    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_a, **_kw: None)
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         "hermes_cli.models.cached_provider_model_ids", lambda *_a, **_kw: []
     )
@@ -85,6 +85,7 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
             "name": "Local Ollama",
             "api": "http://localhost:11434/v1",
             "default_model": "minimax-m2.7:cloud",
+            "discover_models": False,
             "models": {
                 "minimax-m2.7:cloud": {"context_length": 196608},
                 "kimi-k2.5:cloud": {"context_length": 200000},
@@ -131,7 +132,7 @@ def test_list_authenticated_providers_uses_live_models_for_user_provider(monkeyp
         calls.append((api_key, base_url, kwargs))
         return ["old-configured-model", "new-live-model"]
 
-    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch_api_models)
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", fake_fetch_api_models)
 
     user_providers = {
         "crs-henkee": {
@@ -265,7 +266,7 @@ def test_list_authenticated_providers_no_duplicate_labels_across_schemas(monkeyp
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
     # Singular ``model:``-only entries are un-narrowed → section 3 now probes
     # them; stub the probe so the test stays hermetic (endpoints are fake).
-    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", lambda *a, **k: None)
 
     shared_entries = [
         ("endpoint-a", "http://a.local/v1"),
@@ -484,7 +485,7 @@ def test_section3_probes_no_key_endpoint_without_explicit_models(monkeypatch):
         probed["kwargs"] = kwargs
         return ["live-model-1", "live-model-2", "live-model-3"]
 
-    monkeypatch.setattr("hermes_cli.models.fetch_api_models", _fake_fetch)
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", _fake_fetch)
 
     user_providers = {
         "local-llamacpp": {
@@ -511,8 +512,8 @@ def test_section3_probes_no_key_endpoint_without_explicit_models(monkeypatch):
 
 def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch):
     """A providers: entry with no api_key and only a singular ``default_model``
-    (no explicit ``models:`` list) must still probe /v1/models — the singular
-    field is just the active selection, not the user narrowing the endpoint.
+    (no explicit ``models:`` list) probes /v1/models when live probing is requested —
+    the singular field is just the active selection, not an endpoint allowlist.
 
     Regression for #40554 / PR #68984 (@vigilancetech-com): section 3 derived
     ``has_explicit_models`` from the merged models list, so the lone
@@ -529,7 +530,8 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
         probed["api_key"] = api_key
         return ["live-model-1", "live-model-2", "live-model-3"]
 
-    monkeypatch.setattr("hermes_cli.models.fetch_api_models", _fake_fetch)
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", _fake_fetch)
+    monkeypatch.setattr("hermes_cli.models_local.should_use_ollama_native_catalog", lambda *a, **k: False)
 
     user_providers = {
         "local-ollama": {
@@ -545,6 +547,7 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
         user_providers=user_providers,
         custom_providers=[],
         max_models=50,
+        probe_current_custom_provider=True,
     )
 
     assert probed.get("called") is True, (

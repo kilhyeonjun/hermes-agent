@@ -473,6 +473,18 @@ class TestDelegationCleanup:
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # The 0.1s budget starts in Future.result(), before worker initialization.
+        # Synchronize the test at submission so contention cannot consume that budget.
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+        submit = DaemonThreadPoolExecutor.submit
+
+        def submit_after_child_starts(executor, fn, *args, **kwargs):
+            future = submit(executor, fn, *args, **kwargs)
+            if executor._thread_name_prefix != "relay-scope-op":
+                assert child_started.wait(timeout=5), "child did not enter its turn"
+            return future
+
+        monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_after_child_starts)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -487,7 +499,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                release_child.wait()
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -528,5 +540,6 @@ class TestDelegationCleanup:
             )
         finally:
             release_child.set()
+            child_finished.wait(timeout=5)
             reset_hermes_home_override(profile_token)
             relay_runtime._reset_for_tests()

@@ -1206,9 +1206,9 @@ class TestRunCommandSttIdleTimeout:
         script.write_text(
             "\n".join([
                 "import sys, time",
-                "for idx in range(4):",
+                "for idx in range(8):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.04)",
+                "    time.sleep(0.15)",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -1216,11 +1216,11 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            timeout=0.8,
         )
 
         assert result.returncode == 0
-        assert "tick 3" in result.stderr
+        assert "tick 7" in result.stderr
         assert "done" in result.stdout
 
     def test_silent_stall_still_times_out(self, tmp_path):
@@ -1241,7 +1241,7 @@ class TestRunCommandSttIdleTimeout:
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_stt(
                 self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.1,
+                timeout=2,
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")

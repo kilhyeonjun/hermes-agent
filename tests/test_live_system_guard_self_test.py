@@ -202,6 +202,89 @@ def test_subprocess_getstatusoutput_systemctl_blocked():
         subprocess.getstatusoutput("systemctl --user restart hermes-gateway")
 
 
+def test_effective_launchctl_executable_is_blocked(tmp_path):
+    # This path is a symlink to true: a missed guard can never run launchctl.
+    surrogate = tmp_path / "launchctl"
+    surrogate.symlink_to("/usr/bin/true")
+    with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+        subprocess.run(["true", "submit", "ai.hermes.gateway"],
+                       executable=str(surrogate), check=True)
+
+
+def test_launchctl_argv_with_true_executable_is_allowed():
+    # argv[0] is not executed when executable= overrides it.
+    subprocess.run(["launchctl", "submit", "ai.hermes.gateway"],
+                   executable="/usr/bin/true", check=True)
+
+
+def test_launchctl_submit_is_blocked_without_running_launchctl(tmp_path):
+    # A fake PATH resolves launchctl to true if the guard misses it.
+    (tmp_path / "launchctl").symlink_to("/usr/bin/true")
+    env = {**os.environ, "PATH": str(tmp_path)}
+    for cmd in (
+        ["launchctl", "submit", "ai.hermes.gateway"],
+        ["env", "launchctl", "submit", "ai.hermes.gateway"],
+        ["sh", "-c", "launchctl submit ai.hermes.gateway"],
+        "launchctl submit ai.hermes.gateway",
+    ):
+        with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+            subprocess.run(cmd, env=env, shell=isinstance(cmd, str), check=True)
+
+
+@pytest.mark.parametrize("cmd", [
+    ["sh", "-c", "true; launchctl submit ai.hermes.gateway"],
+    ["bash", "-c", "true && launchctl bootout gui/501/ai.hermes.gateway"],
+    "sh -c 'true; launchctl submit ai.hermes.gateway'",
+    "true || launchctl bootout gui/501/ai.hermes.gateway",
+    ["sh", "-c", "true\nlaunchctl submit ai.hermes.gateway"],
+    "true;\nlaunchctl bootout gui/501/ai.hermes.gateway",
+    ["sh", "-c", "true;\nlaunchctl bootout gui/501/ai.hermes.gateway"],
+])
+def test_compound_shell_launchctl_is_blocked_without_running_launchctl(cmd, tmp_path):
+    (tmp_path / "launchctl").symlink_to("/usr/bin/true")
+    with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+        subprocess.run(cmd, env={**os.environ, "PATH": str(tmp_path)},
+                       shell=isinstance(cmd, str), check=True)
+
+
+def test_env_split_string_launchctl_is_blocked(tmp_path):
+    (tmp_path / "launchctl").symlink_to("/usr/bin/true")
+    with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+        subprocess.run(["/usr/bin/env", "-S", f"{tmp_path}/launchctl submit ai.hermes.gateway"],
+                       check=True)
+
+
+def test_shell_exec_launchctl_is_blocked(tmp_path):
+    (tmp_path / "launchctl").symlink_to("/usr/bin/true")
+    with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+        subprocess.run(["/bin/sh", "-c", f"exec {tmp_path}/launchctl submit ai.hermes.gateway"],
+                       check=True)
+
+
+def test_shell_combined_lc_launchctl_is_blocked(tmp_path):
+    (tmp_path / "launchctl").symlink_to("/usr/bin/true")
+    with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+        subprocess.run(["/bin/sh", "-lc", f"{tmp_path}/launchctl submit ai.hermes.gateway"],
+                       check=True)
+
+
+def test_shell_true_sequence_launchctl_is_blocked(tmp_path):
+    (tmp_path / "launchctl").symlink_to("/usr/bin/true")
+    with pytest.raises(RuntimeError, match="live-system guard.*launchd"):
+        subprocess.run(["launchctl submit ai.hermes.gateway"], shell=True,
+                       env={**os.environ, "PATH": str(tmp_path)}, check=True)
+
+
+def test_launchctl_mentioned_as_inert_argument_is_allowed():
+    for cmd in (
+        ["/usr/bin/true", "launchctl", "kickstart", "gui/501/ai.hermes.gateway"],
+        ["env", "/usr/bin/true", "launchctl", "kickstart"],
+        ["sh", "-c", "true ';' launchctl submit ai.hermes.gateway"],
+        "true ';' launchctl submit ai.hermes.gateway",
+    ):
+        subprocess.run(cmd, executable="/usr/bin/true", check=True)
+
+
 # ──────────────────── os.system / os.popen ────────────────────
 
 

@@ -19,6 +19,16 @@ import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
 
 
+def test_update_tests_do_not_discover_real_launchd_install():
+    import hermes_cli.update_cmd_fleet as fleet
+    from hermes_cli import gateway
+
+    assert not gateway.get_launchd_plist_path().exists()
+    assert gateway.launchd_gateway_labels_for_install() == []
+    # Invocation seam stays inert even when gateway module is re-imported.
+    assert fleet._restart_macos_launchd_gateways([], [], 0) is None
+
+
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     calls = {"n": 0}
@@ -131,14 +141,19 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
+    import hermes_cli.update_cmd_fleet as fleet
+
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
     _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    calls = []
+    monkeypatch.setattr(fleet, "_restart_macos_launchd_gateways", lambda *a: calls.append(a))
 
     hermes_main.cmd_update(args)  # completes normally (no SystemExit)
 
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
     assert "Code did not move" not in out
+    assert len(calls) == 1  # command still invokes the fleet restart seam
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):

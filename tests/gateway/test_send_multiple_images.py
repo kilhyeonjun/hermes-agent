@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
 def _run(coro):
@@ -113,6 +113,26 @@ class TestTelegramMultiImage:
         call_kwargs = adapter._bot.send_media_group.call_args.kwargs
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
+
+    def test_single_local_photo_uses_send_photo_and_returns_receipt(self, adapter, tmp_path):
+        """One generated local image is a photo, not a one-item album; its receipt reaches the caller."""
+        image = tmp_path / "generated.png"
+        image.write_bytes(b"\x89PNG fake")
+        adapter.send_image_file = AsyncMock(return_value=SendResult(success=True, message_id="42"))
+
+        _run(adapter.send_multiple_images("12345", [(image.as_uri(), "portrait")]))
+
+        adapter.send_image_file.assert_awaited_once_with(
+            "12345", str(image), caption="portrait", metadata=None)
+        adapter._bot.send_media_group.assert_not_awaited()
+
+    def test_single_local_photo_failure_propagates(self, adapter, tmp_path):
+        image = tmp_path / "generated.png"
+        image.write_bytes(b"\x89PNG fake")
+        adapter.send_image_file = AsyncMock(return_value=SendResult(success=False, error="sendPhoto failed"))
+
+        with pytest.raises(RuntimeError, match="sendPhoto failed"):
+            _run(adapter.send_multiple_images("12345", [(image.as_uri(), "portrait")]))
 
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""

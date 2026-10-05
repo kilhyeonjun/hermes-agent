@@ -59,9 +59,22 @@ class TestMetadata:
     def test_default_model(self, provider):
         assert provider.default_model() == "gpt-image-2-medium"
 
-    def test_list_models_three_tiers(self, provider):
+    def test_lists_sunburst_quality_tiers(self, provider):
         ids = [m["id"] for m in provider.list_models()]
-        assert ids == ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"]
+        assert "gpt-image-2.5-sunburst-high" in ids
+
+    def test_sunburst_selection_reaches_hosted_tool(self, provider, monkeypatch):
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst-high")
+        model_id, meta = codex_plugin._resolve_model()
+        payload = codex_plugin._build_responses_payload(
+            prompt="a red circle",
+            size="1024x1024",
+            quality=meta["quality"],
+            api_model=meta["api_model"],
+        )
+        assert model_id == "gpt-image-2.5-sunburst-high"
+        assert payload["tools"][0]["model"] == "gpt-image-2.5-sunburst"
+        assert payload["tools"][0]["quality"] == "high"
 
     def test_setup_schema_has_no_required_env_vars(self, provider):
         schema = provider.get_setup_schema()
@@ -127,11 +140,12 @@ class TestGenerate:
 
         captured = {}
 
-        def _collect(token, *, prompt, size, quality, input_images=None):
+        def _collect(token, *, prompt, size, quality, api_model="gpt-image-2", input_images=None):
             captured.update(codex_plugin._build_responses_payload(
                 prompt=prompt,
                 size=size,
                 quality=quality,
+                api_model=api_model,
                 input_images=input_images,
             ))
             return {"b64": _b64_png(), "source": "final"}

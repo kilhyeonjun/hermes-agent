@@ -124,27 +124,36 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
 
 
 def test_run_stdio_malware_check_times_out_fail_open():
-    """A check that hangs past the timeout must NOT freeze startup: it times
-    out, logs, and proceeds (fail-open) so the server still starts."""
-    import time
+    """A held OSV worker must not prevent stdio startup after the timeout."""
+    import threading
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
 
     def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
-        return "MALWARE"  # would block startup if awaited to completion
+        started.set()
+        try:
+            release.wait(timeout=5)
+            return "MALWARE"  # would block startup if awaited to completion
+        finally:
+            finished.set()
 
     async def _test():
         with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
-             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
+             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.05), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
             server = MCPServerTask("srv")
-            start = time.monotonic()
-            await server.start({"command": "npx", "args": ["-y", "pkg"]})
-            elapsed = time.monotonic() - start
-            await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+            try:
+                await asyncio.wait_for(server.start({"command": "npx", "args": ["-y", "pkg"]}), timeout=2)
+                assert started.is_set()
+                assert not finished.is_set(), "startup waited for the held OSV worker"
+                mock_stdio_cm.__aenter__.assert_awaited_once()
+            finally:
+                release.set()
+                await server.shutdown()
+                assert await asyncio.to_thread(finished.wait, 2)
 
     asyncio.run(_test())

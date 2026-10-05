@@ -219,6 +219,12 @@ class TestGetServicePidsScoping:
         services, not only the invoking profile's (else the sweep SIGTERMs
         gateways launchd just respawned)."""
         self._wire(monkeypatch)
+        # The read-only prefix scan may see the developer's real LaunchAgents;
+        # isolate that input while preserving the derived-label assertions.
+        monkeypatch.setattr(
+            gw.subprocess, "run",
+            lambda cmd, **kwargs: _completed(stdout=""),
+        )
         assert gw._get_service_pids(all_profiles=True) == {100, 200}
 
     def test_default_stays_scoped_to_current_profile(self, monkeypatch):
@@ -642,13 +648,15 @@ class TestWaitForLaunchdServicePid:
 
 
 class TestIncompleteWarningMentionsLaunchctl:
-    def test_launchd_labels_get_launchctl_hint(self, capsys):
+    def test_launchd_labels_get_launchctl_hint(self, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: True)
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
-        assert "launchctl kickstart -k" in out
+        assert "launchctl bootstrap" in out
 
-    def test_systemd_units_keep_systemctl_hint(self, capsys):
+    def test_systemd_units_keep_systemctl_hint(self, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: False)
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
         assert "systemctl" in out

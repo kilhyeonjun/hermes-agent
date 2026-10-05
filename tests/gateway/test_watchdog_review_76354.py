@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_state
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
 from hermes_state import SessionDB
 
@@ -40,11 +41,29 @@ def _hold_write_lock(db_path: Path, held: threading.Event, release: threading.Ev
         conn.close()
 
 
-def test_s1_contended_activity_write_gives_up_within_short_budget(tmp_path):
+def _fake_write_retry_clock(db, monkeypatch):
+    # Keep SQLite's real lock; advance only the application retry clock virtually.
+    db._conn.execute("PRAGMA busy_timeout=1")
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(hermes_state, "time", SimpleNamespace(
+        monotonic=lambda: clock.now,
+        sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+    ))
+    return clock
+
+
+def test_s1_contended_activity_write_gives_up_within_short_budget(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "S1_CONTENDED"
     db.create_session(sid, source="cli")
+    patience = []
+    original = db._execute_write
 
+    def _spy(fn, patience_s=None):
+        patience.append(patience_s)
+        return original(fn, patience_s=patience_s)
+
+    monkeypatch.setattr(db, "_execute_write", _spy)
     held = threading.Event()
     release = threading.Event()
     locker = threading.Thread(
@@ -53,17 +72,15 @@ def test_s1_contended_activity_write_gives_up_within_short_budget(tmp_path):
     locker.start()
     try:
         assert held.wait(timeout=5)
-        t0 = time.monotonic()
+        clock = _fake_write_retry_clock(db, monkeypatch)
         with pytest.raises(sqlite3.OperationalError):
             db.touch_session_activity(sid, time.time(), description="working")
-        elapsed_touch = time.monotonic() - t0
     finally:
         release.set()
         locker.join(timeout=10)
 
-    # The observational write gave up within the short budget — far below
-    # the 20s routine patience the review flagged.
-    assert elapsed_touch < 3.0, f"activity touch waited {elapsed_touch:.1f}s"
+    assert patience == [db._ACTIVITY_WRITE_PATIENCE_S]
+    assert 0 < clock.now <= 0.5
 
 
 def test_s1_clear_labels_noop_skips_transaction(tmp_path, monkeypatch):
@@ -75,7 +92,7 @@ def test_s1_clear_labels_noop_skips_transaction(tmp_path, monkeypatch):
     original = db._execute_write
 
     def _spy(fn, patience_s=None):
-        calls.append(fn)
+        calls.append(patience_s)
         return original(fn, patience_s=patience_s)
 
     monkeypatch.setattr(db, "_execute_write", _spy)
@@ -86,17 +103,24 @@ def test_s1_clear_labels_noop_skips_transaction(tmp_path, monkeypatch):
     db.touch_session_activity(sid, time.time(), description="doing work")
     calls.clear()
     db.clear_session_activity_labels(sid)
-    assert len(calls) == 1
+    assert calls == [db._ACTIVITY_WRITE_PATIENCE_S]
     activity = _activity_snapshot(db, sid)
     assert activity["last_activity_description"] == ""
 
 
-def test_s1_contended_clear_gives_up_within_short_budget(tmp_path):
+def test_s1_contended_clear_gives_up_within_short_budget(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "S1_CLEAR_CONTENDED"
     db.create_session(sid, source="cli")
     db.touch_session_activity(sid, time.time(), description="busy")
+    patience = []
+    original = db._execute_write
 
+    def _spy(fn, patience_s=None):
+        patience.append(patience_s)
+        return original(fn, patience_s=patience_s)
+
+    monkeypatch.setattr(db, "_execute_write", _spy)
     held = threading.Event()
     release = threading.Event()
     locker = threading.Thread(
@@ -105,14 +129,14 @@ def test_s1_contended_clear_gives_up_within_short_budget(tmp_path):
     locker.start()
     try:
         assert held.wait(timeout=5)
-        t0 = time.monotonic()
+        clock = _fake_write_retry_clock(db, monkeypatch)
         with pytest.raises(sqlite3.OperationalError):
             db.clear_session_activity_labels(sid)
-        elapsed = time.monotonic() - t0
     finally:
         release.set()
         locker.join(timeout=10)
-    assert elapsed < 3.0, f"label clear waited {elapsed:.1f}s under contention"
+    assert patience == [db._ACTIVITY_WRITE_PATIENCE_S]
+    assert 0 < clock.now <= 0.5
 
 
 # ── S2: watchdog revalidates immediately before /new delivery ────────────────

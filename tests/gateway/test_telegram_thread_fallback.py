@@ -474,6 +474,8 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
     adapter = _make_adapter()
     image_path = tmp_path / "photo.png"
     image_path.write_bytes(b"png-data")
+    second_image_path = tmp_path / "photo2.png"
+    second_image_path.write_bytes(b"png-data-2")
     call_log = []
 
     async def mock_send_media_group(**kwargs):
@@ -486,7 +488,7 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
 
     await adapter.send_multiple_images(
         chat_id="123",
-        images=[(f"file://{image_path}", "caption")],
+        images=[(f"file://{image_path}", "caption"), (f"file://{second_image_path}", "caption 2")],
         metadata={
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,

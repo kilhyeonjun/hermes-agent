@@ -387,47 +387,52 @@ class TestStdioPgroupReaping:
             [sys.executable, str(parent_script)],
             start_new_session=True,
         )
-        parent_pgid = os.getpgid(parent.pid)
-        # Wait for parent to exit and grandchild to spin up.
-        parent.wait(timeout=15)
-        deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
-        while _time.time() < deadline and not grandchild_pid_file.exists():
-            _time.sleep(0.05)
-        assert grandchild_pid_file.exists(), "grandchild did not start"
-        grandchild_pid = int(grandchild_pid_file.read_text().strip())
-
-        # Sanity: grandchild is alive and shares the parent's pgid.
-        assert psutil.pid_exists(grandchild_pid)
-        assert os.getpgid(grandchild_pid) == parent_pgid
-
-        # Drive the reaper: register the parent pid + pgid as an orphan.
-        from tools.mcp_tool_lifecycle import (
-            _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids)
-        from tools.mcp_tool import _lock
-        with _lock:
-            _stdio_pids.clear()
-            _orphan_stdio_pids.clear()
-            _orphan_stdio_pid_servers.clear()
-            _stdio_pgids.clear()
-            _orphan_stdio_pids.add(parent.pid)
-            _orphan_stdio_pid_servers[parent.pid] = "orphan"
-            _stdio_pgids[parent.pid] = parent_pgid
+        # start_new_session makes the child the group leader (PGID == PID).
+        # The wrapper may exit before we can query it, but its group survives
+        # while the grandchild runs; verify membership on that live process.
+        parent_pgid = parent.pid
         try:
+            # Wait for parent to exit and grandchild to spin up.
+            assert parent.wait(timeout=15) == 0
+            deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
+            while _time.time() < deadline and not grandchild_pid_file.exists():
+                _time.sleep(0.05)
+            assert grandchild_pid_file.exists(), "grandchild did not start"
+            grandchild_pid = int(grandchild_pid_file.read_text().strip())
+
+            # Sanity: grandchild is alive and shares the parent's pgid.
+            assert psutil.pid_exists(grandchild_pid)
+            assert os.getpgid(grandchild_pid) == parent_pgid
+
+            # Drive the reaper: register the parent pid + pgid as an orphan.
+            from tools.mcp_tool_lifecycle import (
+                _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids)
+            from tools.mcp_tool import _lock
+            with _lock:
+                _stdio_pids.clear()
+                _orphan_stdio_pids.clear()
+                _orphan_stdio_pid_servers.clear()
+                _stdio_pgids.clear()
+                _orphan_stdio_pids.add(parent.pid)
+                _orphan_stdio_pid_servers[parent.pid] = "orphan"
+                _stdio_pgids[parent.pid] = parent_pgid
             _kill_orphaned_mcp_children()
+
+            # Observe production reaping before the test's emergency cleanup.
+            deadline = _time.time() + 10
+            while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
+                _time.sleep(0.05)
+            assert not psutil.pid_exists(grandchild_pid), (
+                "grandchild survived killpg-based reaping (issue #23799 regression)"
+            )
         finally:
-            # Belt-and-suspenders: ensure grandchild is dead even if test fails.
+            # Reap the test-owned group even if setup, production, or assertion fails.
             try:
-                os.kill(grandchild_pid, signal.SIGKILL)
+                os.killpg(parent_pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-
-        # Grandchild should be gone — SIGTERM via killpg in phase 1 reached it.
-        deadline = _time.time() + 10
-        while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
-            _time.sleep(0.05)
-        assert not psutil.pid_exists(grandchild_pid), (
-            "grandchild survived killpg-based reaping (issue #23799 regression)"
-        )
+            if parent.poll() is None:
+                parent.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------

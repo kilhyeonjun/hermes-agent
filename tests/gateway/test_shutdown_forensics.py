@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
-import sys
 import time
 from pathlib import Path
 
@@ -89,8 +89,19 @@ class TestFormatters:
 # ---------------------------------------------------------------------------
 
 class TestSpawnAsyncDiagnostic:
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
-    def test_spawns_subprocess_and_writes_output(self, tmp_path):
+    @pytest.mark.windows_only
+    def test_windows_does_not_spawn_diagnostic(self, tmp_path):
+        assert sf.spawn_async_diagnostic(tmp_path / "diag.log", "SIGTERM") is None
+
+    @pytest.mark.linux_only
+    def test_linux_spawns_subprocess_and_writes_output(self, tmp_path):
+        self._assert_diagnostic_output(tmp_path)
+
+    @pytest.mark.macos_only
+    def test_macos_spawns_subprocess_and_writes_output(self, tmp_path):
+        self._assert_diagnostic_output(tmp_path)
+
+    def _assert_diagnostic_output(self, tmp_path):
         log_path = tmp_path / "diag.log"
         pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=3.0)
         assert pid is not None and pid > 0
@@ -114,6 +125,12 @@ class TestSpawnAsyncDiagnostic:
         contents = log_path.read_text(encoding="utf-8", errors="replace")
         assert "shutdown diagnostic" in contents
         assert "SIGTERM" in contents
+        assert "--- processes (top 60 by cpu) ---" in contents
+        header, *rows = contents.split("--- processes (top 60 by cpu) ---", 1)[1].split(
+            "--- pstree of self ---", 1
+        )[0].strip().splitlines()
+        assert re.search(r"\bPID\s+PPID\b", header)
+        assert any(re.match(r"\s*\d+\s+\d+\s+\S+\s+\S+", row) for row in rows)
 
 
 # ---------------------------------------------------------------------------

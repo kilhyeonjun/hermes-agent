@@ -110,10 +110,13 @@ def test_heartbeat_touches_periodically_and_stops():
 
     touches: list = []
     stop = threading.Event()
+    two_touches = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            if len(touches) >= 2:
+                two_touches.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -122,12 +125,13 @@ def test_heartbeat_touches_periodically_and_stops():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.12)
-    stop.set()
-    thread.join(timeout=1.0)
+    try:
+        assert two_touches.wait(2.0), f"expected periodic touches, got {len(touches)}"
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
 
     assert not thread.is_alive(), "heartbeat thread did not exit on stop"
-    assert len(touches) >= 2, f"expected periodic touches, got {len(touches)}"
     n = len(touches)
     time.sleep(0.1)
     assert len(touches) == n, "heartbeat kept touching after stop_event set"
@@ -149,24 +153,36 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    executing = threading.Event()
+    two_heartbeats = threading.Event()
 
+    def _touch(desc):
+        touches.append((desc, executing.is_set()))
+        if sum(label == "tool running: terminal" and in_call for label, in_call in touches) >= 2:
+            two_heartbeats.set()
+
+    def _execute(next_args):
+        executing.set()
+        try:
+            assert two_heartbeats.wait(2.0), f"expected two heartbeats during call, got {touches}"
+            return json.dumps({"ok": True})
+        finally:
+            executing.clear()
+
+    agent._touch_activity = _touch
     result = te._run_agent_tool_execution_middleware(
         agent,
         function_name="terminal",
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=_execute,
         display_index=1,
     )
 
     assert json.loads(result.result) == {"ok": True}
-
-    # Start stamp + at least one heartbeat mid-call (0.25s run, 0.05s cadence).
-    assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
-    spread = touches[-1] - touches[0]
-    assert spread >= 0.15, f"touches not spread across the call: {spread:.3f}s"
+    assert touches[0] == ("executing tool: terminal", False)
+    assert len([label for label, in_call in touches if label == "tool running: terminal" and in_call]) >= 2
 
 
 def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):

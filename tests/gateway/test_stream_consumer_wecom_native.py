@@ -626,7 +626,7 @@ class TestClarifyEagerReseed:
 
         # User answered → request an eager re-seed.  NO on_delta yet.
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)  # let run() process _REOPEN_SEED
+        assert await self._wait_until(lambda: consumer._native_stream_opened)
 
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
@@ -1060,8 +1060,8 @@ class TestClarifyEagerReseed:
 
         # 第二轮 eager seed：即便标志有残留，仍能正确再次开流。
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)
-
+        # Wait for the run loop's seed ACK, not one 0.05s tick under contention.
+        assert await self._wait_until(lambda: consumer._native_stream_opened)
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
         )

@@ -5,6 +5,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_personal_skills(tmp_path: Path, monkeypatch):
+    # Migration discovers Path.home()/.agents/skills as an additional source.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[2]
