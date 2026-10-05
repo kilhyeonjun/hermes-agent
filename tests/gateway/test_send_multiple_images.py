@@ -134,6 +134,40 @@ class TestTelegramMultiImage:
         with pytest.raises(RuntimeError, match="sendPhoto failed"):
             _run(adapter.send_multiple_images("12345", [(image.as_uri(), "portrait")]))
 
+    def test_failed_animation_does_not_skip_remaining_images(self, adapter):
+        """A failed GIF still lets later GIFs and the photo album go out; the failure is raised after."""
+        import telegram
+        telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media})
+        gifs = [(f"https://x.com/{i}.gif", "") for i in range(3)]
+        photos = [(f"https://x.com/{i}.png", "") for i in range(2)]
+        adapter.send_animation = AsyncMock(side_effect=[
+            SendResult(success=True, message_id="1"),
+            SendResult(success=False, error="sendAnimation failed"),
+            SendResult(success=True, message_id="3"),
+        ])
+
+        with pytest.raises(RuntimeError, match="sendAnimation failed"):
+            _run(adapter.send_multiple_images("12345", gifs + photos))
+
+        assert adapter.send_animation.await_count == 3
+        adapter._bot.send_media_group.assert_awaited_once()
+
+    def test_failed_album_fallback_attempts_every_photo(self, adapter):
+        """When the album falls back to per-image sends, one failed photo does not stop the rest."""
+        import telegram
+        telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media})
+        adapter._bot.send_media_group = AsyncMock(side_effect=RuntimeError("album rejected"))
+        adapter.send_image = AsyncMock(side_effect=[
+            SendResult(success=False, error="sendPhoto failed"),
+            SendResult(success=True, message_id="2"),
+            SendResult(success=True, message_id="3"),
+        ])
+
+        with pytest.raises(RuntimeError, match="sendPhoto failed"):
+            _run(adapter.send_multiple_images("12345", [(f"https://x.com/{i}.png", "") for i in range(3)]))
+
+        assert adapter.send_image.await_count == 3
+
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
         import telegram

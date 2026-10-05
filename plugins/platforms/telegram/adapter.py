@@ -4685,7 +4685,16 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _send_images_individually_or_raise(
         self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]], human_delay: float = 0.0
     ) -> None:
+        errors = await self._send_images_individually(chat_id, images, metadata, human_delay)
+        if errors:
+            raise RuntimeError(errors[0])
+
+    async def _send_images_individually(
+        self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]], human_delay: float = 0.0
+    ) -> List[str]:
+        """Attempt every image even after a failure; return the failure messages in send order."""
         from urllib.parse import unquote as _unquote
+        errors: List[str] = []
         for image_url, caption in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4697,7 +4706,8 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 result = await self.send_image(chat_id, image_url, caption=caption, metadata=metadata)
             if not result.success:
-                raise RuntimeError(result.error or "Telegram image delivery failed")
+                errors.append(result.error or "Telegram image delivery failed")
+        return errors
 
     async def send_multiple_images(
         self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0
@@ -4717,11 +4727,21 @@ class TelegramAdapter(BasePlatformAdapter):
         is_anim = lambda url: not url.startswith("file://") and self._is_animation_url(url)  # noqa: E731
         animations = [img for img in images if is_anim(img[0])]
         photos = [img for img in images if not is_anim(img[0])]
+        errors: List[str] = []
         if animations:
-            await self._send_images_individually_or_raise(chat_id, animations, metadata, human_delay)
-        if not photos:
-            return
+            errors += await self._send_images_individually(chat_id, animations, metadata, human_delay)
+        if photos:
+            errors += await self._send_photo_albums(chat_id, photos, metadata, human_delay, InputMediaPhoto)
+        if errors:
+            raise RuntimeError(errors[0])
+
+    async def _send_photo_albums(
+        self, chat_id: str, photos: List[tuple], metadata: Optional[Dict[str, Any]], human_delay: float,
+        InputMediaPhoto: Any,
+    ) -> List[str]:
+        """Send photos as albums of 10; a failed chunk falls back to per-image sends. Returns failures."""
         from urllib.parse import unquote as _unquote
+        errors: List[str] = []
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
         for chunk_idx, chunk in enumerate(chunks):
@@ -4757,11 +4777,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
-                await self._send_images_individually_or_raise(chat_id, chunk, metadata, human_delay)
+                errors += await self._send_images_individually(chat_id, chunk, metadata, human_delay)
             finally:
                 for fh in opened_files:
                     with contextlib.suppress(Exception):
                         fh.close()
+        return errors
 
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
