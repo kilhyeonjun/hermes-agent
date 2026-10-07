@@ -312,67 +312,6 @@ from pathlib import Path
 from typing import Optional
 
 
-from hermes_cli.subcommands.cron import build_cron_parser
-from hermes_cli.subcommands.sync import build_sync_parser
-from hermes_cli.subcommands.gateway import build_gateway_parser
-from hermes_cli.subcommands.profile import build_profile_parser
-from hermes_cli.subcommands.model import build_model_parser
-from hermes_cli.subcommands.setup import build_setup_parser
-
-from hermes_cli.subcommands.whatsapp import build_whatsapp_parser, build_whatsapp_cloud_parser
-from hermes_cli.subcommands.slack import build_slack_parser
-from hermes_cli.subcommands.login import build_login_parser
-from hermes_cli.subcommands.logout import build_logout_parser
-from hermes_cli.subcommands.auth import build_auth_parser
-from hermes_cli.subcommands.status import build_status_parser
-from hermes_cli.subcommands.pause import build_pause_parser
-from hermes_cli.subcommands.webhook import build_webhook_parser
-from hermes_cli.subcommands.hooks import build_hooks_parser
-from hermes_cli.subcommands.doctor import build_doctor_parser
-from hermes_cli.subcommands.verify import build_verify_parser
-from hermes_cli.subcommands.security import build_security_parser
-from hermes_cli.subcommands.approvals import build_approvals_parser
-from hermes_cli.subcommands.dump import build_dump_parser
-from hermes_cli.subcommands.debug import build_debug_parser
-from hermes_cli.subcommands.backup import build_backup_parser
-from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
-from hermes_cli.subcommands.import_agent import build_import_agent_parser
-from hermes_cli.subcommands.config import build_config_parser
-from hermes_cli.subcommands.skin import build_skin_parser
-from hermes_cli.subcommands.console import build_console_parser
-from hermes_cli.subcommands.update import build_update_parser
-from hermes_cli.subcommands.uninstall import build_uninstall_parser
-from hermes_cli.subcommands.dashboard import build_dashboard_parser, build_serve_parser
-from hermes_cli.subcommands.gui import build_gui_parser
-from hermes_cli.subcommands.logs import build_logs_parser
-from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.memory import build_memory_parser
-from hermes_cli.subcommands.acp import build_acp_parser
-from hermes_cli.subcommands.tools import build_tools_parser
-from hermes_cli.subcommands.insights import build_insights_parser
-from hermes_cli.subcommands.monitoring import build_monitoring_parser
-from hermes_cli.subcommands.skills import build_skills_parser
-from hermes_cli.subcommands.pairing import build_pairing_parser
-from hermes_cli.subcommands.plugins import build_plugins_parser
-from hermes_cli.subcommands.mcp import build_mcp_parser
-from hermes_cli.subcommands.claw import build_claw_parser
-from hermes_cli.subcommands.moa import build_moa_parser
-from hermes_cli.subcommands.fallback import build_fallback_parser
-from hermes_cli.subcommands.worktree import build_worktree_parser
-from hermes_cli.subcommands.browser import build_browser_parser
-from hermes_cli.subcommands.secrets import build_secrets_parser
-from hermes_cli.subcommands.egress import build_egress_parser
-from hermes_cli.subcommands.migrate import build_migrate_parser
-from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
-from hermes_cli.subcommands.bundles import build_bundles_parser
-from hermes_cli.subcommands.curator import build_curator_parser
-from hermes_cli.subcommands.pets import build_pets_parser
-from hermes_cli.subcommands.journey import build_journey_parser
-from hermes_cli.subcommands.computer_use import build_computer_use_parser
-from hermes_cli.subcommands.sessions import build_sessions_parser
-from hermes_cli.subcommands.completion import build_completion_parser
-
-
 def _require_tty(command_name: str) -> None:
     """Exit 1 if stdin is not a terminal: curses/input() prompts spin at 100% CPU on a pipe."""
     if not sys.stdin.isatty():
@@ -2925,6 +2864,8 @@ def _try_fast_serve_launch() -> bool:
     except Exception:
         return False
 
+    from hermes_cli.subcommands.dashboard import build_serve_parser
+
     parser = build_serve_parser(
         cmd_dashboard=cmd_dashboard,
         add_help=False,
@@ -3156,6 +3097,67 @@ def _build_cli_parser():
     those modules never import main.
     """
     from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.subcommands.acp import build_acp_parser
+    from hermes_cli.subcommands.approvals import build_approvals_parser
+    from hermes_cli.subcommands.auth import build_auth_parser
+    from hermes_cli.subcommands.backup import build_backup_parser
+    from hermes_cli.subcommands.browser import build_browser_parser
+    from hermes_cli.subcommands.bundles import build_bundles_parser
+    from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
+    from hermes_cli.subcommands.claw import build_claw_parser
+    from hermes_cli.subcommands.completion import build_completion_parser
+    from hermes_cli.subcommands.computer_use import build_computer_use_parser
+    from hermes_cli.subcommands.config import build_config_parser
+    from hermes_cli.subcommands.console import build_console_parser
+    from hermes_cli.subcommands.cron import build_cron_parser
+    from hermes_cli.subcommands.curator import build_curator_parser
+    from hermes_cli.subcommands.dashboard import build_dashboard_parser
+    from hermes_cli.subcommands.debug import build_debug_parser
+    from hermes_cli.subcommands.doctor import build_doctor_parser
+    from hermes_cli.subcommands.dump import build_dump_parser
+    from hermes_cli.subcommands.egress import build_egress_parser
+    from hermes_cli.subcommands.fallback import build_fallback_parser
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+    from hermes_cli.subcommands.gui import build_gui_parser
+    from hermes_cli.subcommands.hooks import build_hooks_parser
+    from hermes_cli.subcommands.import_agent import build_import_agent_parser
+    from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
+    from hermes_cli.subcommands.insights import build_insights_parser
+    from hermes_cli.subcommands.journey import build_journey_parser
+    from hermes_cli.subcommands.login import build_login_parser
+    from hermes_cli.subcommands.logout import build_logout_parser
+    from hermes_cli.subcommands.logs import build_logs_parser
+    from hermes_cli.subcommands.mcp import build_mcp_parser
+    from hermes_cli.subcommands.memory import build_memory_parser
+    from hermes_cli.subcommands.migrate import build_migrate_parser
+    from hermes_cli.subcommands.model import build_model_parser
+    from hermes_cli.subcommands.moa import build_moa_parser
+    from hermes_cli.subcommands.monitoring import build_monitoring_parser
+    from hermes_cli.subcommands.pairing import build_pairing_parser
+    from hermes_cli.subcommands.pause import build_pause_parser
+    from hermes_cli.subcommands.pets import build_pets_parser
+    from hermes_cli.subcommands.plugins import build_plugins_parser
+    from hermes_cli.subcommands.profile import build_profile_parser
+    from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+    from hermes_cli.subcommands.security import build_security_parser
+    from hermes_cli.subcommands.secrets import build_secrets_parser
+    from hermes_cli.subcommands.sessions import build_sessions_parser
+    from hermes_cli.subcommands.setup import build_setup_parser
+    from hermes_cli.subcommands.skin import build_skin_parser
+    from hermes_cli.subcommands.skills import build_skills_parser
+    from hermes_cli.subcommands.slack import build_slack_parser
+    from hermes_cli.subcommands.status import build_status_parser
+    from hermes_cli.subcommands.sync import build_sync_parser
+    from hermes_cli.subcommands.tools import build_tools_parser
+    from hermes_cli.subcommands.uninstall import build_uninstall_parser
+    from hermes_cli.subcommands.update import build_update_parser
+    from hermes_cli.subcommands.verify import build_verify_parser
+    from hermes_cli.subcommands.webhook import build_webhook_parser
+    from hermes_cli.subcommands.whatsapp import (
+        build_whatsapp_cloud_parser,
+        build_whatsapp_parser,
+    )
+    from hermes_cli.subcommands.worktree import build_worktree_parser
 
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
@@ -3203,7 +3205,7 @@ def _build_cli_parser():
     from hermes_cli.portal_cli import add_parser as _add_portal_parser
     _add_portal_parser(subparsers)
 
-    from hermes_cli.kanban import build_parser as _build_kanban_parser
+    from hermes_cli.kanban_parser import build_parser as _build_kanban_parser
     _build_kanban_parser(subparsers).set_defaults(func=cmd_kanban)
 
     from hermes_cli.projects_cmd import build_parser as _build_project_parser
@@ -3356,8 +3358,6 @@ def main():
     if _try_fast_chat_launch():
         return
 
-    parser, subparsers = _build_cli_parser()
-
     # NixOS container mode routes ALL invocations into the managed container.
     # MUST run before parse_args() so --help, unrecognised flags and every
     # subcommand are forwarded instead of intercepted by argparse on the host.
@@ -3368,7 +3368,15 @@ def main():
         _exec_in_container(container_info, sys.argv[1:])
         sys.exit(1)  # unreachable: execvp replaces the process or raises
 
-    args = _parse_cli_args(parser, subparsers, sys.argv[1:])
+    from hermes_cli._kanban_startup import parse_kanban_args
+
+    argv = _coalesce_session_name_args(sys.argv[1:])
+    args = parse_kanban_args(argv)
+    if args is None:
+        parser, subparsers = _build_cli_parser()
+        args = _parse_cli_args(parser, subparsers, sys.argv[1:])
+    else:
+        args.func = cmd_kanban
 
     if args.version:
         cmd_version(args)

@@ -8,6 +8,19 @@ description: "How hermes_cli is shaped: slash dispatch, config loaders, the skin
 
 Companion to `hermes_cli/AGENTS.md` (the rules) — this page holds the longer explanations.
 
+## Kanban CLI startup
+
+For an exact leading `kanban` command after profile selection, `hermes_cli._kanban_startup`
+uses the existing top-level and Kanban parsers without importing unrelated subcommand builders.
+`main()` applies the shared session-name coalescing and binds the real Kanban handler; normal
+startup validation, delegated-child guards, durable storage, board routing and handler exit codes
+still run through the common dispatch path.
+
+Container forwarding runs before parsing, including help and invalid arguments. Parse errors and
+other command forms fall back to the complete parser to preserve canonical error output and root
+help. Subcommand builders load when the full parser is needed; the existing fast `serve` path
+imports its own builder locally.
+
 ## Update pipeline
 
 The stage-by-stage contract (`plan → snapshot → apply → restart-per-kind → verify → report`) and the
