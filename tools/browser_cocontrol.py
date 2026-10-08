@@ -8,6 +8,13 @@ import socket
 import stat
 
 
+def cocontrol_enabled():
+    from hermes_cli.config import load_config_readonly
+    browser = load_config_readonly().get("browser", {})
+    config = browser.get("cocontrol") if isinstance(browser, dict) else None
+    return isinstance(config, dict) and config.get("enabled") is True
+
+
 def route_cocontrol(action, args, *, task_id=None, session_id=None):
     from hermes_cli.config import load_config_readonly
     config = load_config_readonly().get("browser", {}).get("cocontrol")

@@ -62,3 +62,19 @@ def test_authoritative_lane_rejects_wrong_identity_missing_socket_and_privileged
         result = routed_browser_handler("browser_click", {}, fallback=no_legacy,
                                         task_id="other-task", session_id="session")
         assert "error" in json.loads(result)
+
+
+def test_opt_in_advertises_regular_browser_tools_without_other_backend(monkeypatch):
+    configure(Path("/private/tmp/owned-cocontrol/agent.sock"))
+    from hermes_constants import get_hermes_home
+    path = get_hermes_home() / "config.yaml"
+    config = json.loads(path.read_text())
+    config["browser"]["backend"] = "browser-use"
+    path.write_text(json.dumps(config))
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    from tools import browser_tool_install
+    def missing(**kwargs):
+        raise FileNotFoundError("synthetic missing legacy CLI")
+    monkeypatch.setattr(browser_tool_install, "_find_agent_browser", missing)
+    assert not is_browser_use_cli_mode()
+    assert browser_tool_install.check_browser_requirements()

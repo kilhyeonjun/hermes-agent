@@ -206,6 +206,9 @@ def is_browser_use_cli_mode() -> bool:
     unset ``browser.backend`` ("") enables it whenever the CLI is runnable (installed binary or uvx);
     ``browser.backend: off`` keeps the built-in browser_* tools. Camofox always falls back to the built-in
     tools (Firefox, custom HTTP API, no CDP surface for the harness)."""
+    from tools.browser_cocontrol import cocontrol_enabled
+    if cocontrol_enabled():
+        return False
     if _camofox_active():
         return False
     backend = get_browser_backend()

@@ -297,6 +297,9 @@ def check_browser_requirements() -> bool:
     Local mode needs the ``agent-browser`` CLI plus a Chromium build (except Lightpanda-only text workflows);
     cloud mode needs the CLI plus provider credentials (the provider hosts its own Chromium).
     """
+    from tools.browser_cocontrol import cocontrol_enabled
+    if cocontrol_enabled():
+        return True
     _bt = _origin()
     # Browser Use CLI backend: browser_exec replaces the whole browser_* surface (incl. browser_cdp/browser_dialog check_fns).
     if _bt._is_browser_use_cli_mode():
