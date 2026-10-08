@@ -4510,7 +4510,8 @@ def _respawn_storm_backoff() -> None:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)
 
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
+def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
+                *, startup_timing=None):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
     _guard_official_docker_root_gateway()
@@ -4537,7 +4538,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
-    from gateway.run import start_gateway
+    if startup_timing is None:
+        from gateway.run import start_gateway
+    else:
+        with startup_timing.span("gateway.module_import"):
+            from gateway.run import start_gateway
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
     print("├─────────────────────────────────────────────────────────┤")
@@ -4569,7 +4574,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        if startup_timing is None:
+            success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        else:
+            success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity, startup_timing=startup_timing))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
@@ -5794,9 +5802,12 @@ def _cmd_run(args):
         return  # unreachable; execvp doesn't return
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
+    timing_kw = {}
+    if getattr(args, "_startup_timing", None) is not None:
+        timing_kw["startup_timing"] = args._startup_timing
     run_gateway(
         getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
-        replace=getattr(args, "replace", False), force=getattr(args, "force", False),
+        replace=getattr(args, "replace", False), force=getattr(args, "force", False), **timing_kw,
     )
 
 

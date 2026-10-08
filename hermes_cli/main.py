@@ -66,6 +66,7 @@ def _argv_is_gateway_run(argv: list) -> bool:
     return any(a == "gateway" and b == "run" for a, b in zip(argv, argv[1:]))
 
 
+_gateway_import_timing = None
 if _argv_is_gateway_run(sys.argv[1:]):
     try:
         from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
@@ -74,6 +75,12 @@ if _argv_is_gateway_run(sys.argv[1:]):
         del _arm_sw
     except Exception:
         pass
+    from hermes_startup_timing import StartupTiming
+    _gateway_trace = StartupTiming()
+    _gateway_import_span = _gateway_trace.span("cli.imports_after_watchdog")
+    _gateway_import_span.__enter__()
+    _gateway_import_timing = (_gateway_trace, _gateway_import_span)
+    del _gateway_trace, _gateway_import_span
 
 
 def _exit_after_oneshot(rc: object) -> None:
@@ -3308,6 +3315,12 @@ def _default_to_chat(args) -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    global _gateway_import_timing
+    startup_timing = None
+    early_timing, _gateway_import_timing = _gateway_import_timing, None
+    if early_timing is not None:
+        startup_timing, import_span = early_timing
+        import_span.__exit__(None, None, None)
     _set_process_title()
     _advertise_agent_env()
 
@@ -3378,6 +3391,11 @@ def main():
     else:
         args.func = cmd_kanban
 
+    if startup_timing is not None and args.command == "gateway" and getattr(args, "gateway_command", None) == "run":
+        args._startup_timing = startup_timing
+    else:
+        startup_timing = None
+
     if args.version:
         cmd_version(args)
         return
@@ -3390,7 +3408,11 @@ def main():
     # Plugin discovery + shell hooks once, gated so introspection commands
     # (hooks list, cron list, gateway status, ...) pay no discovery cost and
     # trigger no consent prompts for hooks the user is still inspecting.
-    _prepare_agent_startup(args)
+    if startup_timing is None:
+        _prepare_agent_startup(args)
+    else:
+        with startup_timing.span("cli.agent_startup"):
+            _prepare_agent_startup(args)
 
     if getattr(args, "oneshot", None):
         _run_oneshot_from_args(args)

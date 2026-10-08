@@ -262,6 +262,54 @@ The gateway runs as a long-lived process, managed via:
 
 **Profile-scoped vs global**: `start_gateway()` uses profile-scoped PID files. `hermes gateway stop` stops only the current profile's gateway. `hermes gateway stop --all` uses global `ps aux` scanning to kill all gateway processes (used during updates).
 
+## Startup Timing Diagnostics
+
+The native `hermes gateway run` path carries one startup trace from the existing
+watchdog boundary through CLI dispatch, runner construction and eager MCP discovery.
+`hermes_startup_timing.py` uses only the standard library and writes through the
+existing `gateway.startup_timing` logger and redacting/profile-aware handlers. It
+does not install handlers or introduce configuration, environment variables or tools.
+Direct calls without the optional internal trace retain their original call shapes
+and emit no timing records; lazy/reconnect/deferred MCP tasks retain no startup trace.
+
+Records have a `STARTUP_TIMING ` prefix followed by JSON. Fixed fields are
+`trace_id`, `span_id`, `pid`, `stage`, `phase`, `status` and `elapsed_ms`.
+End records add `duration_ms`; MCP spans add numeric `profile_slot` and, for
+individual servers, `server_slot`. Lock-wait ends add `lock_outcome`:
+`acquired`, `unavailable` (locking failed) or `exhausted` (bounded retry expired).
+Both unavailable and exhausted preserve the existing unguarded discovery policy.
+Phases are `begin`/`end`; statuses are `running`, `ok`, `error` or `cancelled`.
+There are no server/profile names, paths, arguments, configuration or error text
+in the JSON payload. Slots distinguish peers within this startup, not across boots.
+
+| Stages | Measured boundary |
+|--------|-------------------|
+| `cli.imports_after_watchdog` | Imports after the watchdog is armed, ending at entry to `main()` |
+| `cli.agent_startup` | The full existing `_prepare_agent_startup` call, including its scheduling work |
+| `gateway.module_import` | The CLI's `gateway.run` import call, possibly already cached |
+| `gateway.constructor` | The full `GatewayRunner` construction |
+| `gateway.config` | Configuration resolution; preloaded configurations can return immediately |
+| `gateway.runtime_settings`, `gateway.session_store`, `gateway.lifecycle_state`, `gateway.runtime_caches`, `gateway.startup_checks`, `gateway.session_db`, `gateway.registries` | The corresponding constructor initialization phases |
+| `mcp.discovery` | One profile's discovery call, including filtering and synchronous waits |
+| `mcp.sdk_import` | SDK ensure-call envelope: cached return, or mutex wait plus imports |
+| `mcp.lock_wait` | The existing cross-process lock acquisition/retry envelope |
+| `mcp.connection` | One server's existing connect/ready wait; cancellation and exceptions stay distinct |
+| `mcp.registration` | Tool registration after a successful connection |
+
+Elapsed and duration values use a monotonic clock. Up to128 early records are
+buffered until gateway logging is configured, then flushed once. Log header
+timestamps describe emission time; use JSON elapsed values to reconstruct early
+events. Buffer overflow drops excess early records. Fatal imports or hangs before
+logging configuration have no flushed trace; the existing watchdog remains the
+diagnostic source for that case. Missing ends are incomplete evidence.
+
+Nested stages and parallel server connections overlap: their durations cannot be
+added to obtain total startup time. A successful discovery envelope may include a
+failed server because the existing discovery policy handles per-server failures.
+The CLI preparation and SDK ensure stages are not pure plugin or cold-import costs.
+These records identify measured boundaries; they do not establish an optimization
+cause or replace positive gateway readiness signals.
+
 ## Related Docs
 
 - [Session Storage](./session-storage.md)

@@ -6,6 +6,7 @@ helpers) is read through ``_core`` so ``mock.patch("tools.mcp_tool.X")`` keeps w
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
@@ -197,14 +198,16 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
         return _core._servers.get(server_name)
 
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(name: str, config: dict, *, startup_timing=None,
+                                        profile_slot=0, server_slot=0) -> List[str]:
     """Connect one server, register its tools; return the registered names."""
     # The claim fires inside _connect_server while this frame is suspended (list, not nonlocal).
     claimed: List[_core.MCPServerTask] = []
     claim_token = _core._connect_server_claim.set(claimed.append)
     try:
-        server = await asyncio.wait_for(_connect_server(name, config),
-                                        timeout=config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
+        with (nullcontext() if startup_timing is None else startup_timing.span("mcp.connection", profile_slot=profile_slot, server_slot=server_slot)):
+            server = await asyncio.wait_for(_connect_server(name, config),
+                                            timeout=config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
     except BaseException:
         server = claimed[0] if claimed else None
         task = server._task if server is not None else None
@@ -222,7 +225,8 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _core._server_connecting.discard(name)
         _core._server_connect_errors.pop(name, None)
     _adopt_server(name, server)
-    registered_names = _registration._register_server_tools(name, server, config)
+    with (nullcontext() if startup_timing is None else startup_timing.span("mcp.registration", profile_slot=profile_slot, server_slot=server_slot)):
+        registered_names = _registration._register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
     logger.info("MCP server '%s' (%s): registered %d tool(s): %s", name,
                 "HTTP" if "url" in config else "stdio", len(registered_names), ", ".join(registered_names))
@@ -292,11 +296,15 @@ def _register_lazy_from_cache(new_servers: Dict[str, dict]) -> Tuple[Dict[str, d
     return eager_servers, lazy_registered, lazy_server_count
 
 
-async def _discover_all(new_servers: Dict[str, dict]) -> None:
+async def _discover_all(new_servers: Dict[str, dict], *, startup_timing=None, profile_slot=0) -> None:
     """Connect every candidate concurrently; record per-server outcome."""
-    results = await asyncio.gather(
-        *(_discover_and_register_server(name, cfg) for name, cfg in new_servers.items()),
-        return_exceptions=True)
+    if startup_timing is None:
+        connections = (_discover_and_register_server(name, cfg) for name, cfg in new_servers.items())
+    else:
+        connections = (_discover_and_register_server(
+            name, cfg, startup_timing=startup_timing, profile_slot=profile_slot, server_slot=slot)
+            for slot, (name, cfg) in enumerate(new_servers.items()))
+    results = await asyncio.gather(*connections, return_exceptions=True)
     for name, result in zip(new_servers, results):
         if isinstance(result, BaseException):
             command = new_servers.get(name, {}).get("command")
@@ -307,7 +315,7 @@ async def _discover_all(new_servers: Dict[str, dict]) -> None:
             _note_connect_success(name)
 
 
-def _run_discovery_pass(new_servers: Dict[str, dict]) -> None:
+def _run_discovery_pass(new_servers: Dict[str, dict], *, startup_timing=None, profile_slot=0) -> None:
     """Run ``_discover_all`` on the MCP loop with the interrupt flag parked; clean up
     ``_server_connecting`` when the pass dies early."""
     # Executor threads are reused: a prior session's stale interrupt must not cancel this pass.
@@ -316,7 +324,9 @@ def _run_discovery_pass(new_servers: Dict[str, dict]) -> None:
     if _was_interrupted:
         _set_interrupt(False)
     try:
-        _loop._run_on_mcp_loop(lambda: _discover_all(new_servers), timeout=120)
+        timing_kw = {} if startup_timing is None else {
+            "startup_timing": startup_timing, "profile_slot": profile_slot}
+        _loop._run_on_mcp_loop(lambda: _discover_all(new_servers, **timing_kw), timeout=120)
     except (TimeoutError, InterruptedError) as _e:
         # Stranded _server_connecting entries would block future reconnects.
         how = "timed out" if isinstance(_e, TimeoutError) else "interrupted"
@@ -353,7 +363,7 @@ def _log_summary(prefix: str, names, **lazy) -> None:
         logger.info(summary)
 
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(servers: Dict[str, dict], *, startup_timing=None, profile_slot=0) -> List[str]:
     """Connect ``{name: config}`` servers and register their tools; idempotent for connected
     names, ``enabled: false`` skipped without disconnecting. Returns every MCP tool name."""
     if not _core._ensure_mcp_sdk():
@@ -373,7 +383,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                         lazy_registered)
         return _registration._existing_tool_names()
     _loop._ensure_mcp_loop()
-    _run_discovery_pass(new_servers)
+    timing_kw = {} if startup_timing is None else {
+        "startup_timing": startup_timing, "profile_slot": profile_slot}
+    _run_discovery_pass(new_servers, **timing_kw)
     _log_summary("MCP: registered", new_servers, lazy_tools=lazy_registered, lazy_servers=lazy_server_count)
     return _registration._existing_tool_names()
 
@@ -401,7 +413,8 @@ def _acquire_discovery_lock_with_retry():
     return cookie
 
 
-def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[str]:
+def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None, *, startup_timing=None,
+                       profile_slot=0) -> List[str]:
     """Entry point: load config, connect servers, register tools. [] without the ``mcp``
     package; idempotent (only servers missing from a previous call are retried).
 
@@ -409,38 +422,46 @@ def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[st
     list simply don't match); ``None`` spawns every configured server. Used by
     ``hermes -z -t <toolsets>`` to skip cold-starting servers the caller doesn't need (10-60s
     each); it only affects which servers start, not which names ``-t`` validation can see."""
-    servers = _config._load_mcp_config()
-    if not servers:
-        logger.debug("No MCP servers configured")
-        return []
-    if allowed_mcp_names is not None:
-        allowed_set = {str(n) for n in allowed_mcp_names}
-        filtered = {name: cfg for name, cfg in servers.items() if name in allowed_set}
-        if len(filtered) != len(servers):
-            logger.debug("MCP discovery filter: spawning %d/%d configured server(s) per --toolsets filter "
-                         "(skipped: %s)", len(filtered), len(servers), ",".join(sorted(set(servers) - set(filtered))))
-        servers = filtered
+    with (nullcontext() if startup_timing is None else startup_timing.span("mcp.discovery", profile_slot=profile_slot)):
+        servers = _config._load_mcp_config()
         if not servers:
-            logger.debug("No MCP servers in --toolsets filter; skipping MCP load entirely")
+            logger.debug("No MCP servers configured")
             return []
-    # SDK import deferred to here so a config without servers — or a -t filter that keeps
-    # none — never pays it.
-    if not _core._ensure_mcp_sdk():
-        logger.debug("MCP SDK not available -- skipping MCP tool discovery")
-        return []
-    cookie = _acquire_discovery_lock_with_retry()
-    try:
-        with _core._lock:
-            connecting = set(_core._server_connecting)
-            new_server_names = [name for name, cfg in servers.items()
-                                if name not in _core._servers and name not in connecting and _enabled(cfg)]
-        tool_names = register_mcp_servers(servers)
-        if new_server_names:
-            _log_summary("  MCP:", new_server_names)
-        return tool_names
-    finally:
-        if cookie not in (None, _core._LOCK_UNAVAILABLE):
-            cookie.release()
+        if allowed_mcp_names is not None:
+            allowed_set = {str(n) for n in allowed_mcp_names}
+            filtered = {name: cfg for name, cfg in servers.items() if name in allowed_set}
+            if len(filtered) != len(servers):
+                logger.debug("MCP discovery filter: spawning %d/%d configured server(s) per --toolsets filter "
+                             "(skipped: %s)", len(filtered), len(servers), ",".join(sorted(set(servers) - set(filtered))))
+            servers = filtered
+            if not servers:
+                logger.debug("No MCP servers in --toolsets filter; skipping MCP load entirely")
+                return []
+        # SDK ensure may return cached, or include its import mutex and imports.
+        with (nullcontext() if startup_timing is None else startup_timing.span("mcp.sdk_import", profile_slot=profile_slot)):
+            sdk_available = _core._ensure_mcp_sdk()
+        if not sdk_available:
+            logger.debug("MCP SDK not available -- skipping MCP tool discovery")
+            return []
+        with (nullcontext() if startup_timing is None else startup_timing.span("mcp.lock_wait", profile_slot=profile_slot)) as lock_span:
+            cookie = _acquire_discovery_lock_with_retry()
+            if lock_span is not None:
+                lock_span.lock_outcome = ("exhausted" if cookie is None else
+                                          "unavailable" if cookie is _core._LOCK_UNAVAILABLE else "acquired")
+        try:
+            with _core._lock:
+                connecting = set(_core._server_connecting)
+                new_server_names = [name for name, cfg in servers.items()
+                                    if name not in _core._servers and name not in connecting and _enabled(cfg)]
+            timing_kw = {} if startup_timing is None else {
+                "startup_timing": startup_timing, "profile_slot": profile_slot}
+            tool_names = register_mcp_servers(servers, **timing_kw)
+            if new_server_names:
+                _log_summary("  MCP:", new_server_names)
+            return tool_names
+        finally:
+            if cookie not in (None, _core._LOCK_UNAVAILABLE):
+                cookie.release()
 
 
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:

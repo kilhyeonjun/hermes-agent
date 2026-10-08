@@ -1540,7 +1540,7 @@ def _current_max_iterations() -> int:
     return _resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
 
 
-from contextlib import asynccontextmanager as _asynccontextmanager, contextmanager as _contextmanager, suppress
+from contextlib import asynccontextmanager as _asynccontextmanager, contextmanager as _contextmanager, suppress, nullcontext
 
 
 class MultiplexConfigError(RuntimeError):
@@ -1710,7 +1710,7 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
         return cfg
 
 
-async def _discover_gateway_mcp_tools(config: object) -> None:
+async def _discover_gateway_mcp_tools(config: object, *, startup_timing=None) -> None:
     """Run startup MCP discovery for every profile this gateway serves: ``discover_mcp_tools`` reads
     ``mcp_servers`` from ``get_hermes_home()``'s config, so an unscoped call only connects the launch
     profile's servers (single-profile gateways keep the unscoped call).
@@ -1720,14 +1720,19 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     ``_run_in_executor_with_context``). See #95518.
     """
     from tools.mcp_tool_discovery import discover_mcp_tools
+    from functools import partial
     loop = asyncio.get_running_loop()
     if not getattr(config, "multiplex_profiles", False):
-        await loop.run_in_executor(None, discover_mcp_tools)
+        discovery = discover_mcp_tools if startup_timing is None else partial(
+            discover_mcp_tools, startup_timing=startup_timing, profile_slot=0)
+        await loop.run_in_executor(None, discovery)
         return
-    for profile_name, profile_home in _multiplex_profile_homes(config):
+    for profile_slot, (profile_name, profile_home) in enumerate(_multiplex_profile_homes(config)):
         try:
             with _profile_runtime_scope(Path(profile_home)):
-                await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                discovery = discover_mcp_tools if startup_timing is None else partial(
+                    discover_mcp_tools, startup_timing=startup_timing, profile_slot=profile_slot)
+                await loop.run_in_executor(None, copy_context().run, discovery)
         except Exception:
             logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
@@ -3319,12 +3324,13 @@ class GatewayRunner(
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(self, config: Optional[GatewayConfig] = None, *, startup_timing=None):
         global _gateway_runner_ref
         # With multiplex_profiles on, load under the default profile secret scope so bot tokens in its
         # .env resolve as secondary profiles' do; explicit config= injection (tests) is left untouched.
         # See #64674.
-        self.config = config if config is not None else load_gateway_config_for_runner()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.config")):
+            self.config = config if config is not None else load_gateway_config_for_runner()
         # Multiplexer flag flips agent.secret_scope.get_secret() to fail-closed on unscoped credential
         # reads, so a missed migration crashes loudly instead of leaking a cross-profile value.
         try:
@@ -3342,13 +3348,20 @@ class GatewayRunner(
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
-        self._init_runtime_settings()
-        self._init_session_store()
-        self._init_lifecycle_state()
-        self._init_runtime_caches()
-        self._init_startup_checks()
-        self._init_session_db()
-        self._init_registries_and_clocks()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.runtime_settings")):
+            self._init_runtime_settings()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.session_store")):
+            self._init_session_store()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.lifecycle_state")):
+            self._init_lifecycle_state()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.runtime_caches")):
+            self._init_runtime_caches()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.startup_checks")):
+            self._init_startup_checks()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.session_db")):
+            self._init_session_db()
+        with (nullcontext() if startup_timing is None else startup_timing.span("gateway.registries")):
+            self._init_registries_and_clocks()
 
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""
@@ -5155,7 +5168,8 @@ async def _start_gateway_shutdown_tail(
     return True
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0,
+                        *, startup_timing=None) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop deadlocks)."""
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
@@ -5177,7 +5191,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _start_gateway_configure_logging(verbosity)
 
-    runner = GatewayRunner(config)
+    if startup_timing is None:
+        runner = GatewayRunner(config)
+    else:
+        startup_timing.flush()
+        with startup_timing.span("gateway.constructor"):
+            runner = GatewayRunner(config, startup_timing=startup_timing)
     # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
     # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
     # See #82936.
@@ -5261,7 +5280,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
         # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
         # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
+        if startup_timing is None:
+            await _discover_gateway_mcp_tools(runner.config)
+        else:
+            await _discover_gateway_mcp_tools(runner.config, startup_timing=startup_timing)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
