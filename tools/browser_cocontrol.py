@@ -34,7 +34,8 @@ def route_cocontrol(action, args, *, task_id=None, session_id=None):
         if session_context_engaged() and (not context or session_id is not None and session_id != context):
             raise ValueError("wrong_context")
         actual_session = context or session_id
-        if isinstance(config.get("bindings"), dict):
+        multiple = isinstance(config.get("bindings"), dict)
+        if multiple:
             if not bound or session_id is not None and session_id != bound:
                 raise ValueError("unbound_or_wrong_context")
             actual_session = bound
@@ -50,6 +51,8 @@ def route_cocontrol(action, args, *, task_id=None, session_id=None):
             portal_session = actual_session
             if actual_session != config.get("session_id") or actual_task != config.get("task_id"):
                 raise ValueError("wrong_task")
+        if (multiple and "runtime" not in config) or (not multiple and "runtime" in config):
+            raise ValueError("isolated_runtime_requires_context_bindings")
         if not actual_session or not actual_task or not portal_session:
             raise ValueError("wrong_task")
         allowed = {"browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll",

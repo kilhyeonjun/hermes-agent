@@ -158,4 +158,7 @@ def test_new_bindings_require_actual_bound_context_even_before_global_latch(monk
                 assert 'error' in json.loads(routed_browser_handler('browser_snapshot',{},fallback=no_legacy))
                 with context.scoped_current_session_id('alpha'):
                     assert 'error' in json.loads(routed_browser_handler('browser_snapshot',{},fallback=no_legacy,session_id='beta'))
+                (home/'config.yaml').write_text(json.dumps({'browser':{'cocontrol':{'enabled':True,**binding}}}))
+                context.reset_session_vars()
+                assert 'error' in json.loads(routed_browser_handler('browser_snapshot',{},fallback=no_legacy,task_id='alpha',session_id='alpha'))
         finally:context.reset_session_vars();server.close()
