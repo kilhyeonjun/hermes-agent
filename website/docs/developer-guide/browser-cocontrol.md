@@ -23,3 +23,28 @@ The newline JSON protocol carries only `task_id`, `session_id`, `action` and `ar
 Initial allowed actions are `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_back`, `browser_press`, `browser_tabs` and `browser_tab_activate`. Other actions—including `browser_exec`, raw CDP, vision, console, images and automated dialog response—fail closed. Dedicated sessions should retain the ordinary browser toolset; arbitrary browser code is not supported on this lane. Existing extension-control routing remains available outside the opt-in.
 
 Use only a new approved task browser/profile. Do not configure a production profile to adopt another task's authenticated browser. Resume after takeover is an explicit user action in the external service, never a retry/fallback from Hermes. See `tools/browser_cocontrol.py`, `tools/browser_extension_router.py` and `tests/tools/test_browser_cocontrol.py` for the transport contract.
+
+## Parallel gateway bindings
+
+For isolated owner leaves, map actual gateway ContextVars to distinct private runtime/socket bindings:
+
+```yaml
+browser:
+  cocontrol:
+    enabled: true
+    bindings:
+      gateway-context-a:
+        task_id: portal-task-a
+        session_id: portal-session-a
+        socket: /absolute/private-a/agent.sock
+        runtime: /absolute/private-a/runtime
+      gateway-context-b:
+        task_id: portal-task-b
+        session_id: portal-session-b
+        socket: /absolute/private-b/agent.sock
+        runtime: /absolute/private-b/runtime
+```
+
+The new bindings mode requires a nonempty actual task-bound `HERMES_SESSION_ID`, independent of the process-level context latch. Explicit identity cannot override it. Cleared/unbound context or process-env-only identity is denied; no fallback. The private runtime marker must match the selected portal task/session/socket. Requests bind owner/claim nonce, random one-use ID, short expiry and HMAC; the leaf verifies them before its controller. Signature/key values are never logged. The legacy single configuration remains for an explicitly configured legacy service; isolated leaves require signed requests.
+
+Bindings do not mint native owner proof or let an unrelated gateway adopt a browser. Provision a fresh browser/leaf in its actual approved native owner session, then explicitly bind the dedicated opt-in gateway context to that session. Production/default profiles stay unchanged without the opt-in. Each task sees only its configured leaf, and user takeover/return applies independently.

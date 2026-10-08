@@ -155,6 +155,13 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def get_bound_session_env(name: str, default: str = "") -> str:
+    """Read only this task's bound identity; never fall back to process env."""
+    var = _VAR_MAP.get(name)
+    value = var.get() if var is not None else _UNSET
+    return value if isinstance(value, str) else default
+
+
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/
 # desktop bind HERMES_SESSION_SOURCE, so both are consulted).  Default-deny: an unrecognized
 # identity counts as messaging.  Mirrors LOCAL_SESSION_SOURCE_IDS in apps/desktop session-source.ts.
