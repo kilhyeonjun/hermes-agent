@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
+from tools.browser_extension_router import routed_browser_handler
 
 logger = logging.getLogger(__name__)
 
@@ -665,11 +666,13 @@ registry.register(
     name="browser_exec",
     toolset="browser-use",
     schema=BROWSER_EXEC_SCHEMA,
-    handler=lambda args, **kw: browser_exec(
+    handler=lambda args, **kw: routed_browser_handler(
+        "browser_exec", args, task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+            fallback=lambda: browser_exec(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
         local=bool(args.get("local", False)),
-    ),
+    )),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
     emoji="🌐",

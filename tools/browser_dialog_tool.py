@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from tools.browser_supervisor import SUPERVISOR_REGISTRY
 from tools.registry import registry
+from tools.browser_extension_router import routed_browser_handler
 
 BROWSER_DIALOG_SCHEMA: Dict[str, Any] = {
     "name": "browser_dialog",
@@ -102,8 +103,10 @@ registry.register(
     name="browser_dialog",
     toolset="browser-cdp",
     schema=BROWSER_DIALOG_SCHEMA,
-    handler=lambda args, **kw: browser_dialog(action=args.get("action", ""), prompt_text=args.get("prompt_text"),
-                                              dialog_id=args.get("dialog_id"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: routed_browser_handler(
+        "browser_dialog", args, task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+            fallback=lambda: browser_dialog(action=args.get("action", ""), prompt_text=args.get("prompt_text"),
+                                            dialog_id=args.get("dialog_id"), task_id=kw.get("task_id"))),
     check_fn=_browser_dialog_check,
     emoji="💬",
 )
