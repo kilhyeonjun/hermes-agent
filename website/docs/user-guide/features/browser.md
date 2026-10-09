@@ -36,6 +36,14 @@ Key capabilities:
 
 ## Setup
 
+### Externally managed browser tools
+
+An installed plugin can own browser execution and human assistance. Set `browser.backend: external` in that profile's `config.yaml`, enable the plugin, and grant its declared tool override capability through the normal plugin configuration.
+
+This mode disables the built-in browser requirement checks, command execution, and Python browser CLI before they select or start a local/CDP/cloud backend. A missing plugin, denied override capability, or failed plugin import leaves browser execution unavailable; it does not activate a different browser. The plugin owns its tool schemas, session isolation, authentication and cleanup. Restart the gateway after changing the profile configuration.
+
+Gateway plugins can read the current conversation's bound identity with `gateway.session_context.get_bound_session_env()`. This accessor reads the bound context only and never borrows a session ID from the process environment.
+
 :::tip Nous Subscribers
 If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, you can use browser automation through the **[Tool Gateway](tool-gateway.md)** without any separate API keys. New installs can run `hermes setup --portal` to log in and turn on every gateway tool at once; existing installs can pick **Nous Subscription** as the browser provider via `hermes model` or `hermes tools`.
 :::

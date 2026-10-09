@@ -486,6 +486,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
+    if get_browser_backend() == "external":
+        return tool_error("The configured external browser owner is required; legacy Python execution is disabled.",
+                          error_code="external_browser_required")
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 

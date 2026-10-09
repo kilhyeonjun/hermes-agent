@@ -560,6 +560,10 @@ def _run_browser_command(
     """Run one agent-browser CLI command against the task's session; returns its parsed JSON.
     ``timeout=None`` reads ``browser.command_timeout``; ``_engine_override`` forces an engine
     for this call only (Lightpanda fallback retries with Chrome without touching global state)."""
+    from tools.browser_use_cli import get_browser_backend
+    if get_browser_backend() == "external":
+        return {"success": False, "error_code": "external_browser_required",
+                "error": "The configured external browser owner is required; legacy fallback is disabled."}
     if timeout is None:
         timeout = _bt._safe_command_timeout()
     args = args or []
