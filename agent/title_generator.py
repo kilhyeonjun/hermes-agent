@@ -13,7 +13,7 @@ from contextlib import suppress
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
-from agent.context_compressor import LEGACY_SUMMARY_PREFIX
+from agent.compaction_markers import LEGACY_SUMMARY_PREFIX
 from agent.message_content import flatten_message_text
 
 logger = logging.getLogger(__name__)
