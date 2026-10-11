@@ -200,7 +200,8 @@ _CONFIG_LOCK = threading.RLock()
 # path -> last successfully loaded (expanded) config; served after a parse failure so a
 # mid-edit broken YAML never silently drops user overrides (e.g. approvals.deny rules).
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
-# path -> (user_mtime_ns, user_size, managed_mtime_ns, managed_size, merged, env_ref_snapshot).
+# path -> (user_mtime_ns, user_size, managed_mtime_ns, managed_size, merged,
+#          env_ref_snapshot, raw_defaults_snapshot_or_none).
 # load_config() returns a deepcopy of the cached value while the signature matches (skips
 # safe_load + merge + normalize + expand, ~13 ms). Writers use atomic_yaml_write (fresh inode
 # -> new mtime_ns) so no explicit invalidation is needed. The managed-file signature is folded
@@ -211,7 +212,9 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # _normalize_* + _expand_env_vars (~13 ms/call). save_config() + migrate_config() write via
 # atomic_yaml_write which produces a fresh inode, so stat() sees a new mtime_ns and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+_LOAD_CONFIG_CACHE: Dict[str, Tuple[
+    int, int, int, int, Dict[str, Any], Dict[str, Optional[str]], Optional[Dict[str, Any]],
+]] = {}
 # path -> (mtime_ns, size, raw yaml dict) for read_raw_config() (no defaults merged in).
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 
@@ -2137,7 +2140,7 @@ def apply_terminal_config_to_env(
 def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int, int, int]]]:
     """Return ``(user_sig, cache_sig)`` for ``_LOAD_CONFIG_CACHE``.
     The managed config file's (mtime, size) is folded in ((0, 0) = none) so editing it invalidates
-    the merged result. ``cache_sig`` is None only when neither file exists (nothing to cache on)."""
+    the merged result. ``cache_sig`` is None when neither file exists (defaults-only state)."""
     try:
         st = config_path.stat()
         user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
@@ -2174,7 +2177,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     if cache_sig is not None:
         # Cache under the corrupt file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse; fixing the file changes the signature and reloads normally.
-        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
+        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {}, None)
     return lkg_copy
 
 
@@ -2203,19 +2206,26 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         path_key = str(config_path)
 
         user_sig, cache_sig = _load_config_cache_sig(config_path)
+        defaults_only = cache_sig is None
+        if defaults_only:
+            # Absence is a cacheable state; stat checks still detect file creation.
+            cache_sig = (0, 0, 0, 0)
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if cached is not None and cached[:4] == cache_sig:
             # Signatures match, but the cached expansion is only valid if every ${VAR} it was
             # expanded against still has the same value — otherwise a load before
             # load_hermes_dotenv() pins unexpanded literals for the process lifetime.
             # Without this, a load_config() that ran before load_hermes_dotenv() pins unexpanded literals
             # (e.g. auxiliary.<task>.api_key) for the life of the process (#58514).
             env_snapshot = cached[5] if len(cached) > 5 else {}
-            if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
+            defaults_match = not defaults_only or (len(cached) > 6 and cached[6] == DEFAULT_CONFIG)
+            if defaults_match and all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        # Preserve in-process default changes without repeating normalization/expansion.
+        defaults_snapshot = copy.deepcopy(config) if defaults_only else None
 
         if user_sig is not None:
             try:
@@ -2238,20 +2248,17 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         normalized = _canonicalize_config(config)
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
-        if cache_sig is not None:
-            # The cache stores its own deepcopy so load_config() callers can mutate freely while
-            # load_config_readonly() callers all see the same stable object. The env snapshot
-            # records the values this expansion was made against so later loads detect drift.
-            cached_copy = copy.deepcopy(expanded)
-            env_snapshot = _env_ref_snapshot(normalized)
-            if managed_config:
-                _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
-            # Readonly path returns the same object later calls will see (identity invariant).
-            if not want_deepcopy:
-                return cached_copy
-        else:
-            _LOAD_CONFIG_CACHE.pop(path_key, None)
+        # The cache stores its own deepcopy so load_config() callers can mutate freely while
+        # load_config_readonly() callers all see the same stable object. The env snapshot
+        # records the values this expansion was made against so later loads detect drift.
+        cached_copy = copy.deepcopy(expanded)
+        env_snapshot = _env_ref_snapshot(normalized)
+        if managed_config:
+            _env_ref_snapshot(managed_config, env_snapshot)
+        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot, defaults_snapshot)
+        # Readonly path returns the same object later calls will see (identity invariant).
+        if not want_deepcopy:
+            return cached_copy
         # First-load result is a fresh dict (not aliased to the cache); safe to return directly.
         return expanded
 
