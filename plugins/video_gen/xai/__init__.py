@@ -19,8 +19,6 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-
 from agent.video_gen_provider import VideoGenProvider, error_response, success_response
 
 logger = logging.getLogger(__name__)
@@ -255,6 +253,8 @@ async def _mutate_xai_video_async(*, api_key: str, base_url: str, prompt: str, v
 async def _submit_xai_video_payload(api_key: str, base_url: str, endpoint: str, payload: Dict[str, Any], *, modality: str, operation: str,
                                     aspect_ratio: str, duration: int, resolution: Optional[str] = None) -> Dict[str, Any]:
     """POST ``payload`` to ``/videos/{endpoint}``, poll ``/videos/{request_id}`` to a terminal status, shape the response."""
+    import httpx
+
     prompt, resolved_model = payload["prompt"], payload["model"]
     try:
         from tools.xai_http import build_xai_storage_options, maybe_mark_xai_storage_notice_seen, read_xai_imagine_storage_config

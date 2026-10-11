@@ -10,8 +10,6 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-import httpx
-
 from plugins.web._common import BaseWebSearchProvider, keyless_extract, keyless_search, lazy_ensure, search_fail, search_ok, setup_schema
 from tools import managed_tool_gateway as _gateway
 from tools import tool_backend_helpers as _backend_helpers
@@ -109,6 +107,8 @@ class _KeylessFirecrawlClient:
         self.api_url = api_url.rstrip("/")
 
     def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        import httpx
+
         response = httpx.post(f"{self.api_url}{path}", json=payload, headers={"Content-Type": "application/json"}, timeout=60.0)
         response.raise_for_status()
         return response.json()

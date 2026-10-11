@@ -10,8 +10,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-
 from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, resolve_aspect_ratio, success_response
 from plugins.image_gen._common import (
     StaticImageGenProvider, catalog_rows, collect_source_images, error_factory,
@@ -65,6 +63,8 @@ def _base_url(creds: Dict[str, Any]) -> str:
 
 def _fetch_live_models() -> Dict[str, Dict[str, Any]]:
     """``{model_id: {"input_modalities", "aliases"}}`` from the live endpoint; raises on failure."""
+    import requests
+
     creds = resolve_xai_http_credentials()
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:

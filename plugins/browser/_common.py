@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import requests
+if TYPE_CHECKING:
+    import requests
 
 from agent.browser_provider import BrowserProvider
 
@@ -65,6 +66,8 @@ class CloudBrowserProvider(BrowserProvider):
         return None
 
     def _release(self, config: Dict[str, Any], session_id: str, timeout: int) -> requests.Response:
+        import requests
+
         kwargs: Dict[str, Any] = {"headers": self._release_headers(config), "timeout": timeout}
         body = self._release_body(config)
         if body is not None:
@@ -81,6 +84,8 @@ class CloudBrowserProvider(BrowserProvider):
     ) -> requests.Response:
         """POST the create request; network failures → RuntimeError unless the managed gateway
         caller needs the raw exception to retry."""
+        import requests
+
         try:
             return requests.post(url, headers=headers, json=payload, timeout=30)
         except requests.RequestException as exc:

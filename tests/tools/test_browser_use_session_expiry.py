@@ -1,5 +1,7 @@
 """Regression coverage for provider-authoritative cloud browser expiry."""
 
+import requests
+
 from unittest.mock import Mock
 
 import tools.browser_tool as browser_tool
@@ -36,7 +38,7 @@ def test_browser_use_preserves_provider_timeout(monkeypatch):
             "managed_mode": False,
         },
     )
-    monkeypatch.setattr(browser_use_provider.requests, "post", Mock(return_value=response))
+    monkeypatch.setattr(requests, "post", Mock(return_value=response))
 
     session = provider.create_session("task-1")
 

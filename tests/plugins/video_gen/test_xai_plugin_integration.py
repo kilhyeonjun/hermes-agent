@@ -7,6 +7,8 @@ because routing is the part most likely to break silently.
 
 from __future__ import annotations
 
+import httpx
+
 import asyncio
 import json
 from typing import Any, Dict, List, Optional
@@ -72,7 +74,7 @@ def xai_provider(monkeypatch):
         captured["client"] = _FakeAsyncClient()
         return captured["client"]
 
-    monkeypatch.setattr(xai_plugin.httpx, "AsyncClient", _client_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory)
 
     async def _no_sleep(*a, **k):
         return None

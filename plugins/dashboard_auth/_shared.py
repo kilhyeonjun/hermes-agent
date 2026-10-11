@@ -13,9 +13,10 @@ import logging
 import os
 import secrets
 import urllib.parse
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider, InvalidCodeError, LoginStart, ProviderError, RefreshExpiredError, Session,
@@ -139,6 +140,8 @@ def exchange_token(
     ``token_key`` or non-bearer ``token_type`` raises ``ProviderError``. Redirects are
     deliberately NOT followed: the body carries an auth code / refresh token.
     """
+    import httpx
+
     try:
         response = httpx.post(url, data=data, headers={**JSON_HEADERS, **(headers or {})}, timeout=TOKEN_ENDPOINT_TIMEOUT_SEC)
     except httpx.RequestError as exc:

@@ -13,6 +13,8 @@ the network.
 
 from __future__ import annotations
 
+import httpx
+
 import asyncio
 import json
 import types
@@ -96,7 +98,7 @@ def matrix_env(tmp_path, monkeypatch):
                 "model": payload.get("model", "grok-imagine-video"),
             })
     import plugins.video_gen.xai as xai_plugin
-    monkeypatch.setattr(xai_plugin.httpx, "AsyncClient", lambda: _Client())
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: _Client())
     async def _no_sleep(*a, **k): return None
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 

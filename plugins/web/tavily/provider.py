@@ -11,8 +11,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-import httpx
-
 from plugins.web._common import (
     SEARCH_LIMIT_CAP, BaseWebSearchProvider, document, extract_fail, http_status_detail, provider_env, run_extract,
     run_search, search_fail, search_ok, setup_schema, title_hit, use_keyless,
@@ -39,6 +37,8 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any], *, api_key: Optional
     pass ``""`` to force the keyless header even when a key exists
     (``web.provider_tier.tavily: free``). Non-2xx raises ValueError with the body so
     Tavily's rate-limit/upgrade text reaches the model."""
+    import httpx
+
     if api_key is None:
         api_key = provider_env("TAVILY_API_KEY")
     base_url = provider_env("TAVILY_BASE_URL") or "https://api.tavily.com"

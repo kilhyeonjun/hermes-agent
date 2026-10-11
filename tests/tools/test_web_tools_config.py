@@ -8,6 +8,8 @@ Coverage:
   check_web_api_key() — unified availability check across all web backends.
 """
 
+import httpx
+
 import importlib
 import json
 import os
@@ -149,7 +151,7 @@ class TestFirecrawlClientConfig:
             captured["timeout"] = timeout
             return _Response()
 
-        monkeypatch.setattr(firecrawl_provider.httpx, "post", _fake_post)
+        monkeypatch.setattr(httpx, "post", _fake_post)
 
         client = firecrawl_provider._KeylessFirecrawlClient()
         result = client.search(query="firecrawl", limit=1)
@@ -180,7 +182,7 @@ class TestFirecrawlClientConfig:
             captured["timeout"] = timeout
             return _Response()
 
-        monkeypatch.setattr(firecrawl_provider.httpx, "post", _fake_post)
+        monkeypatch.setattr(httpx, "post", _fake_post)
 
         client = firecrawl_provider._KeylessFirecrawlClient()
         result = client.scrape(url="https://example.com", formats=["markdown"])
@@ -858,7 +860,7 @@ class TestSiblingProvidersEnvResolution:
             "hermes_cli.config.get_env_value",
             side_effect=lambda k: "tvly-from-dotenv" if k == "TAVILY_API_KEY" else None,
         ), patch(
-            "plugins.web.tavily.provider.httpx.post", return_value=mock_response
+            "httpx.post", return_value=mock_response
         ) as mock_post:
             from plugins.web.tavily.provider import _tavily_request
 

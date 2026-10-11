@@ -6,10 +6,11 @@ endpoint paths live with their tool handlers in ``tools.py``.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
+if TYPE_CHECKING:
+    import httpx
 
-import httpx
+from urllib.parse import urlparse
 
 from hermes_cli.auth import AuthError, resolve_spotify_runtime_credentials
 
@@ -47,6 +48,8 @@ class SpotifyClient:
         self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None,
         allow_retry_on_401: bool = True, empty_response: Optional[Dict[str, Any]] = None,
     ) -> Any:
+        import httpx
+
         response = httpx.request(
             method, f"{self.base_url}{path}",
             headers={"Authorization": f"Bearer {self._runtime['access_token']}", "Content-Type": "application/json"},

@@ -17,8 +17,6 @@ import time
 import urllib.parse
 from typing import Any, Dict, Optional
 
-import httpx
-
 from hermes_cli.dashboard_auth import LoginStart, ProviderError, Session
 from plugins.dashboard_auth._shared import (
     JSON_HEADERS,
@@ -101,6 +99,8 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
     def revoke_session(self, *, refresh_token: str) -> None:
         # Best-effort RFC 7009 revocation when the IDP advertises an endpoint.
         # Must never raise — logout is client-side cookie clearing regardless.
+        import httpx
+
         if not refresh_token:
             return None
         try:
@@ -184,6 +184,8 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         return disco
 
     def _fetch_discovery(self) -> Dict[str, Any]:
+        import httpx
+
         url = f"{self._issuer}/.well-known/openid-configuration"
         try:
             # follow_redirects=True: many IDPs answer discovery with a 3xx (Authentik

@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-import httpx
-
 from agent.web_search_provider import WebSearchProvider
 
 SEARCH_LIMIT_CAP = 20  # every vendor here caps max_results at 20 server-side
@@ -143,6 +141,8 @@ def http_get_json(
 ) -> tuple[Any, Optional[Dict[str, Any]]]:
     """GET ``url`` and parse JSON → ``(data, None)`` or ``(None, failure_dict)``.
     ``reach_target`` overrides the "Could not reach ..." subject (SearXNG includes its URL)."""
+    import httpx
+
     try:
         resp = httpx.get(url, params=params, headers=headers, timeout=timeout)
         resp.raise_for_status()

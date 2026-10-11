@@ -14,8 +14,6 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import requests
-
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, resolve_aspect_ratio, save_url_image, success_response
 from plugins.image_gen._common import (
@@ -184,6 +182,8 @@ def _poll_krea_job(
     result; without it (best-effort Enhance) failures only log. ``kind`` ∈ ``http`` (detail =
     status) / ``timeout`` / ``invalid_json`` / ``deadline`` (detail = last status seen).
     """
+    import requests
+
     job_url = f"{base_url}/jobs/{job_id}"
     headers = _headers(auth_token, managed=False, json_body=False)
     interval = _POLL_INITIAL_INTERVAL
@@ -261,6 +261,8 @@ def _enhance_image(
 ) -> Optional[str]:
     """Krea Enhance on ``image_url`` → enhanced URL, or ``None`` on any failure (best-effort: an
     upscale failure must never destroy an already-successful generation)."""
+    import requests
+
     # The prompt guides detail; default ai_strength (0.4) adds detail without redrawing.
     payload = {"image_url": image_url, "image_scaling_factor": _ENHANCE_SCALE_FACTOR, "prompt": prompt}
     try:

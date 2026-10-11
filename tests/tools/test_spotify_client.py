@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import httpx
+
 import json
 
 import pytest
@@ -56,7 +58,7 @@ def test_spotify_client_retries_once_after_401(monkeypatch: pytest.MonkeyPatch) 
             return _FakeResponse(401, {"error": {"message": "expired token"}})
         return _FakeResponse(200, {"devices": [{"id": "dev-1"}]})
 
-    monkeypatch.setattr(spotify_mod.httpx, "request", fake_request)
+    monkeypatch.setattr(httpx, "request", fake_request)
 
     client = spotify_mod.SpotifyClient()
     payload = client.request("GET", "/me/player/devices")
@@ -86,7 +88,7 @@ def test_get_currently_playing_returns_explanatory_empty_payload(monkeypatch: py
     def fake_request(method, url, headers=None, params=None, json=None, timeout=None):
         return _FakeResponse(204, None, text="", headers={"content-type": "application/json"})
 
-    monkeypatch.setattr(spotify_mod.httpx, "request", fake_request)
+    monkeypatch.setattr(httpx, "request", fake_request)
 
     client = spotify_mod.SpotifyClient()
     payload = client.get_currently_playing()

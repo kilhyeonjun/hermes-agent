@@ -151,7 +151,7 @@ class TestConfig:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"data": [{"b64_json": "dGVzdA=="}]}
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post:
+        with patch("requests.post", return_value=mock_resp) as mock_post:
             with patch("plugins.image_gen._common.save_b64_image", return_value="/tmp/out.png"):
                 provider = XAIImageGenProvider()
                 result = provider.generate(prompt="test", model="grok-imagine-image-quality")
@@ -264,7 +264,7 @@ class TestGenerate:
             "data": [{"b64_json": "dGVzdC1pbWFnZS1kYXRh"}],  # base64 "test-image-data"
         }
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp):
+        with patch("requests.post", return_value=mock_resp):
             with patch("plugins.image_gen._common.save_b64_image", return_value="/tmp/test.png"):
                 provider = XAIImageGenProvider()
                 result = provider.generate(prompt="A cat playing piano")
@@ -293,7 +293,7 @@ class TestGenerate:
             "data": [{"url": "https://imgen.x.ai/xai-tmp-imgen-already-404.jpeg"}],
         }
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp), \
+        with patch("requests.post", return_value=mock_resp), \
              patch(
                  "plugins.image_gen._common.save_url_image",
                  side_effect=req_lib.HTTPError("404 from CDN"),
@@ -316,7 +316,7 @@ class TestGenerate:
         mock_resp.json.return_value = {"error": {"message": "Invalid API key"}}
         mock_resp.raise_for_status.side_effect = req_lib.HTTPError(response=mock_resp)
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp):
+        with patch("requests.post", return_value=mock_resp):
             provider = XAIImageGenProvider()
             result = provider.generate(prompt="test")
 
@@ -329,7 +329,7 @@ class TestGenerate:
 
         from plugins.image_gen.xai import XAIImageGenProvider
 
-        with patch("plugins.image_gen.xai.requests.post", side_effect=req_lib.Timeout()):
+        with patch("requests.post", side_effect=req_lib.Timeout()):
             provider = XAIImageGenProvider()
             result = provider.generate(prompt="test")
 
@@ -344,7 +344,7 @@ class TestGenerate:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"data": []}
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp):
+        with patch("requests.post", return_value=mock_resp):
             provider = XAIImageGenProvider()
             result = provider.generate(prompt="test")
 
@@ -361,7 +361,7 @@ class TestGenerate:
             "data": [{"url": "https://xai.image/test.png"}],
         }
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post:
+        with patch("requests.post", return_value=mock_resp) as mock_post:
             provider = XAIImageGenProvider()
             provider.generate(prompt="test")
 
@@ -383,7 +383,7 @@ class TestGenerate:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"data": [{"url": "https://xai.image/test.png"}]}
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post:
+        with patch("requests.post", return_value=mock_resp) as mock_post:
             provider = XAIImageGenProvider()
             provider.generate(prompt="test")
 
@@ -400,7 +400,7 @@ class TestGenerate:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"data": [{"url": "https://xai.image/edited.png"}]}
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post, \
+        with patch("requests.post", return_value=mock_resp) as mock_post, \
              patch("plugins.image_gen._common.save_url_image", return_value="/tmp/edited.png"):
             provider = XAIImageGenProvider()
             result = provider.generate(
@@ -421,7 +421,7 @@ class TestGenerate:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"data": [{"url": "https://xai.image/edited.png"}]}
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post, \
+        with patch("requests.post", return_value=mock_resp) as mock_post, \
              patch("plugins.image_gen._common.save_url_image", return_value="/tmp/edited.png"):
             provider = XAIImageGenProvider()
             result = provider.generate(
@@ -446,7 +446,7 @@ class TestGenerate:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"data": [{"b64_json": "dGVzdA=="}]}
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post, \
+        with patch("requests.post", return_value=mock_resp) as mock_post, \
              patch("plugins.image_gen._common.save_b64_image", return_value="/tmp/test.png"):
             provider = XAIImageGenProvider()
             provider.generate(prompt="test")
@@ -474,7 +474,7 @@ class TestGenerate:
             }],
         }
 
-        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp), \
+        with patch("requests.post", return_value=mock_resp), \
              patch("plugins.image_gen._common.save_url_image") as mock_save_url:
             provider = XAIImageGenProvider()
             result = provider.generate(prompt="A cat playing piano")

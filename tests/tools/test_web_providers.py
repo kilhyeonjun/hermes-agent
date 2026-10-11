@@ -8,6 +8,8 @@ Covers:
 """
 from __future__ import annotations
 
+import httpx
+
 import json
 from typing import Any, Dict, List
 
@@ -259,7 +261,7 @@ class TestUnconfiguredErrorEnvelopeParity:
             calls["url"] = url
             return _FakeResponse()
 
-        monkeypatch.setattr(fc.httpx, "post", _fake_post)
+        monkeypatch.setattr(httpx, "post", _fake_post)
 
         result = json.loads(web_tools.web_search_tool("hello world", limit=3))
         assert result.get("success") is True, result

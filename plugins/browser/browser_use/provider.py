@@ -8,9 +8,10 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import requests
+if TYPE_CHECKING:
+    import requests
 
 from agent.secret_scope import get_secret
 from plugins.browser._common import CloudBrowserProvider

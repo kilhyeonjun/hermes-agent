@@ -161,7 +161,6 @@ def register(ctx) -> None:
 # The whole block is removed by reverting the commit that added it.
 import base64  # noqa: F401,E402
 import hashlib  # noqa: F401,E402
-import httpx  # noqa: F401,E402
 import os  # noqa: F401,E402
 import secrets  # noqa: F401,E402
 import urllib.parse  # noqa: F401,E402
@@ -176,6 +175,9 @@ _PLUGIN_COMPAT_LAZY = {
 
 
 def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    if name == "httpx":
+        import importlib
+        return importlib.import_module(name)
     target = _PLUGIN_COMPAT_LAZY.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -38,7 +38,7 @@ to the public equivalent or the new module. Test monkeypatch seams are likewise 
 |---|---|---|
 | moved | 0 | name now defined in `new location`; re-exported from the old module |
 | moved-lazy | 1148 | same, resolved lazily via `__getattr__` to avoid an import cycle |
-| import | 592 | a third-party/stdlib name the old module used to expose; original import restored |
+| import | 592 | a third-party/stdlib name the old module used to expose; module imports may resolve on first attribute access |
 | restored-def | 290 | public name that was deleted as unused; its pre-decomposition definition is restored verbatim |
 | restored-helper | 41 | private helper restored only because a restored-def above depends on it |
 | restored-import | 17 | import re-added only because a restored-def above depends on it |

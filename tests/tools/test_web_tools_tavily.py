@@ -36,7 +36,7 @@ class TestTavilyRequest:
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TAVILY_API_KEY", None)
-            with patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response) as mock_post:
+            with patch("httpx.post", return_value=mock_response) as mock_post:
                 from plugins.web.tavily.provider import _tavily_request
                 _tavily_request("search", {"query": "test"})
 
@@ -55,7 +55,7 @@ class TestTavilyRequest:
         mock_response = _ok_response()
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test-key"}):
-            with patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response) as mock_post:
+            with patch("httpx.post", return_value=mock_response) as mock_post:
                 from plugins.web.tavily.provider import _tavily_request
                 _tavily_request("search", {"query": "hello"})
 
@@ -80,7 +80,7 @@ class TestTavilyRequest:
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TAVILY_API_KEY", None)
-            with patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response):
+            with patch("httpx.post", return_value=mock_response):
                 from plugins.web.tavily.provider import _tavily_request
                 with pytest.raises(ValueError, match="Rate limit hit"):
                     _tavily_request("search", {"query": "test"})
@@ -247,7 +247,7 @@ class TestWebSearchTavily:
 
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
-             patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response), \
+             patch("httpx.post", return_value=mock_response), \
              patch("tools.interrupt.is_interrupted", return_value=False):
             from tools.web_tools import web_search_tool
             result = json.loads(web_search_tool("test query", limit=3))
@@ -262,7 +262,7 @@ class TestWebSearchTavily:
         })
 
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
-             patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response) as mock_post, \
+             patch("httpx.post", return_value=mock_response) as mock_post, \
              patch("tools.interrupt.is_interrupted", return_value=False):
             os.environ.pop("TAVILY_API_KEY", None)
             from tools.web_tools import web_search_tool
@@ -305,7 +305,7 @@ class TestWebExtractTavily:
 
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
-             patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response), \
+             patch("httpx.post", return_value=mock_response), \
              patch("tools.web_tools.async_is_safe_url", _allow_ssrf):
             from tools.web_tools import web_extract_tool
             result = json.loads(asyncio.get_event_loop().run_until_complete(

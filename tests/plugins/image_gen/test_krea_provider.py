@@ -156,8 +156,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job("https://krea.cdn/result.png"))
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll) as mock_get, \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll) as mock_get, \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/krea_krea-2-medium_test.png"),
@@ -189,8 +189,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job())
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -208,8 +208,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job())
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -227,8 +227,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job())
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -246,8 +246,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job())
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -278,8 +278,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job())
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -307,8 +307,8 @@ class TestGenerate:
         submit = _submit_response()
         poll = _poll_response(_completed_job())
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit), \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit), \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -341,7 +341,7 @@ class TestGenerateErrors:
             side_effect=req_lib.HTTPError(response=resp)
         )
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=resp):
+        with patch("requests.post", return_value=resp):
             result = KreaImageGenProvider().generate(prompt="test")
 
         assert result["success"] is False
@@ -361,9 +361,9 @@ class TestGenerateErrors:
         }
 
         submit = _submit_response()
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit), \
+        with patch("requests.post", return_value=submit), \
              patch(
-                 "plugins.image_gen.krea.requests.get",
+                 "requests.get",
                  return_value=_poll_response(failed),
              ), \
              patch("plugins.image_gen.krea.time.sleep"):
@@ -384,9 +384,9 @@ class TestGenerateErrors:
             "result": {"urls": []},
         }
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=_submit_response()), \
+        with patch("requests.post", return_value=_submit_response()), \
              patch(
-                 "plugins.image_gen.krea.requests.get",
+                 "requests.get",
                  return_value=_poll_response(completed_empty),
              ), \
              patch("plugins.image_gen.krea.time.sleep"):
@@ -404,8 +404,8 @@ class TestGenerateErrors:
         submit = _submit_response()
         poll = _poll_response(_completed_job(url))
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit), \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit), \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  side_effect=req_lib.HTTPError("404"),
@@ -430,9 +430,9 @@ class TestGenerateErrors:
             "result": {"urls": ["https://krea.cdn/done.png"]},
         }
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=_submit_response()), \
+        with patch("requests.post", return_value=_submit_response()), \
              patch(
-                 "plugins.image_gen.krea.requests.get",
+                 "requests.get",
                  return_value=_poll_response(oddball),
              ), \
              patch(
@@ -466,8 +466,8 @@ class TestPollRetryPolicy:
 
         bad_poll = self._http_error_response(401)
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=_submit_response()), \
-             patch("plugins.image_gen.krea.requests.get", return_value=bad_poll) as mock_get, \
+        with patch("requests.post", return_value=_submit_response()), \
+             patch("requests.get", return_value=bad_poll) as mock_get, \
              patch("plugins.image_gen.krea.time.sleep"):
             result = KreaImageGenProvider().generate(prompt="test")
 
@@ -508,8 +508,8 @@ class TestManagedGateway:
 
         submit = _submit_response()
         poll = _poll_response(_completed_job())
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll) as mock_get, \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll) as mock_get, \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -546,7 +546,7 @@ class TestManagedGateway:
         resp.headers["Content-Type"] = "application/json"
         resp.raise_for_status = MagicMock(side_effect=req_lib.HTTPError(response=resp))
 
-        with patch("plugins.image_gen.krea.requests.post", return_value=resp):
+        with patch("requests.post", return_value=resp):
             result = KreaImageGenProvider().generate(prompt="test")
 
         assert result["success"] is False
@@ -568,8 +568,8 @@ class TestExplicitModelOverride:
 
         submit = _submit_response()
         poll = _poll_response(_completed_job())
-        with patch("plugins.image_gen.krea.requests.post", return_value=submit) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", return_value=poll), \
+        with patch("requests.post", return_value=submit) as mock_post, \
+             patch("requests.get", return_value=poll), \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  return_value=Path("/tmp/x.png"),
@@ -609,8 +609,8 @@ class TestUpscalePass:
         if model is not None:
             kwargs["model"] = model
 
-        with patch("plugins.image_gen.krea.requests.post", side_effect=posts) as mock_post, \
-             patch("plugins.image_gen.krea.requests.get", side_effect=gets) as mock_get, \
+        with patch("requests.post", side_effect=posts) as mock_post, \
+             patch("requests.get", side_effect=gets) as mock_get, \
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  side_effect=lambda url, prefix: Path(f"/tmp/{url.rsplit('/', 1)[-1]}"),
